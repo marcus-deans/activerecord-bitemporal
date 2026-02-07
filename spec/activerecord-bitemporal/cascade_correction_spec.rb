@@ -44,6 +44,28 @@ RSpec.describe "Cascade Correction (#correct method)" do
       .order(:transaction_from, :valid_from)
   end
 
+  # Timeline invariant helpers for validating bitemporal consistency
+  # Returns true if no valid time periods overlap in the current timeline
+  def no_overlaps?(timeline)
+    return true if timeline.size <= 1
+    timeline.each_cons(2).all? do |(_, valid_to_a, _), (valid_from_b, _, _)|
+      valid_to_a <= valid_from_b
+    end
+  end
+
+  # Returns true if there are no gaps in the current timeline
+  def no_gaps?(timeline)
+    return true if timeline.size <= 1
+    timeline.each_cons(2).all? do |(_, valid_to_a, _), (valid_from_b, _, _)|
+      valid_to_a == valid_from_b
+    end
+  end
+
+  # Returns true if timeline is contiguous (no gaps) and non-overlapping
+  def valid_timeline?(timeline)
+    no_overlaps?(timeline) && no_gaps?(timeline)
+  end
+
   # ==========================================================================
   # Test Category 1: Bounded Corrections (explicit valid_to)
   # ==========================================================================
@@ -565,6 +587,149 @@ RSpec.describe "Cascade Correction (#correct method)" do
         expect(correction.emp_code).to eq("E001")  # Key assertion!
       end
     end
+
+    # Test 3.4: Zero-width correction window
+    # -------------------------------------------------------------------------
+    # When valid_from equals valid_to, this creates a zero-width period which
+    # is invalid. The system should reject this with a clear error.
+    # -------------------------------------------------------------------------
+    context "valid_from equals valid_to (zero-width correction)" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+        end
+      end
+
+      it "raises ArgumentError for zero-width correction" do
+        employee = Employee.find(@employee.id)
+
+        expect {
+          employee.correct(valid_from: _02_01, valid_to: _02_01, name: "X")
+        }.to raise_error(ArgumentError)
+      end
+    end
+
+    # Test 3.5: Long timeline stress test
+    # -------------------------------------------------------------------------
+    # Test correction on a timeline with many records to verify algorithm
+    # correctness at scale. Correction should properly trim and preserve
+    # records across a 10-record timeline.
+    # -------------------------------------------------------------------------
+    context "correction on 10-record timeline" do
+      let(:dates) do
+        (1..12).map { |m| "2020/#{m.to_s.rjust(2, '0')}/01".in_time_zone }
+      end
+
+      before do
+        # Create timeline: A(Jan), B(Feb), C(Mar), D(Apr), E(May), F(Jun),
+        #                  G(Jul), H(Aug), I(Sep), J(Oct-∞)
+        Timecop.freeze("2020/12/01") do
+          ActiveRecord::Bitemporal.valid_at(dates[0]) { @employee = Employee.create!(name: "A") }
+          ("B".."J").each_with_index do |name, idx|
+            ActiveRecord::Bitemporal.valid_at(dates[idx + 1]) { @employee.update!(name: name) }
+          end
+        end
+      end
+
+      # before: A    B    C    D    E    F    G    H    I    J
+      #         |----|----|----|----|----|----|----|----|----|---->
+      #         Jan  Feb  Mar  Apr  May  Jun  Jul  Aug  Sep  Oct
+      #
+      # correct(valid_from: Mar 15, valid_to: Jul 15, name: "X")
+      #                       ↓
+      # after:  A    B    C  X                G    H    I    J
+      #         |----|----|--|----------------|----|----|----|--->
+      #         Jan  Feb  Mar               Jul   Aug  Sep  Oct
+      #                    15               15
+      it "correctly handles cascade across many records" do
+        employee = Employee.find(@employee.id)
+        mar_15 = "2020/03/15".in_time_zone
+        jul_15 = "2020/07/15".in_time_zone
+
+        Timecop.freeze("2020/12/06") do
+          employee.correct(valid_from: mar_15, valid_to: jul_15, name: "X")
+        end
+
+        timeline = current_timeline(employee)
+
+        # Verify timeline structure
+        expect(timeline).to eq([
+          [dates[0], dates[1], "A"],         # Jan-Feb: preserved
+          [dates[1], dates[2], "B"],         # Feb-Mar: preserved
+          [dates[2], mar_15, "C"],           # Mar-Mar15: trimmed
+          [mar_15, jul_15, "X"],             # Mar15-Jul15: CORRECTION
+          [jul_15, dates[7], "G"],           # Jul15-Aug: trimmed
+          [dates[7], dates[8], "H"],         # Aug-Sep: preserved
+          [dates[8], dates[9], "I"],         # Sep-Oct: preserved
+          [dates[9], infinity, "J"]          # Oct-∞: preserved (CASCADE)
+        ])
+
+        # Also verify timeline invariants
+        expect(valid_timeline?(timeline)).to be true
+      end
+    end
+
+    # Test 3.6: Correction with NULL attribute inheritance
+    # -------------------------------------------------------------------------
+    # When the containing record has NULL for non-corrected attributes,
+    # the correction should preserve NULL, not accidentally inherit a value.
+    # -------------------------------------------------------------------------
+    context "containing record has NULL attribute" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) {
+            @employee = Employee.create!(name: "A", emp_code: nil)
+          }
+        end
+      end
+
+      it "preserves NULL in non-corrected attributes" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.correct(valid_from: _02_01, name: "X")
+        end
+
+        correction = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .find { |r| r.valid_from == _02_01 }
+
+        expect(correction.name).to eq("X")
+        expect(correction.emp_code).to be_nil  # Should preserve NULL
+      end
+    end
+
+    # Test 3.7: Sequential corrections without reload
+    # -------------------------------------------------------------------------
+    # Multiple corrections on the same instance without reloading between them.
+    # Tests that the instance state doesn't become stale.
+    # -------------------------------------------------------------------------
+    context "multiple corrections on same instance without reload" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+        end
+      end
+
+      it "handles corrections without reloading between them" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.correct(valid_from: _02_01, valid_to: _03_01, name: "X")
+          # Intentionally NOT reloading employee here
+          employee.correct(valid_from: _04_01, valid_to: _05_01, name: "Y")
+        end
+
+        expect(current_timeline(employee)).to eq([
+          [_01_01, _02_01, "A"],
+          [_02_01, _03_01, "X"],
+          [_03_01, _04_01, "A"],
+          [_04_01, _05_01, "Y"],
+          [_05_01, infinity, "A"]
+        ])
+      end
+    end
   end
 
   # ==========================================================================
@@ -727,6 +892,57 @@ RSpec.describe "Cascade Correction (#correct method)" do
         expect(current_timeline(employee)).to eq(original_timeline)
       end
     end
+
+    # Test 5.4: Correction on soft-deleted entity
+    # -------------------------------------------------------------------------
+    # After an entity is destroyed (soft-delete), corrections on historical
+    # periods should still work since we're correcting past valid time.
+    # -------------------------------------------------------------------------
+    context "entity has been destroyed (soft-deleted)" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+        end
+        # Destroy at May - entity is now soft-deleted
+        Timecop.freeze("2020/10/03") do
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.destroy }
+        end
+      end
+
+      # Timeline after destroy:
+      # A (Jan-Mar), B (Mar-May) - then destroyed at May
+      #
+      # Correction: fix Feb-Apr period to X
+      # Expected: A (Jan-Feb), X (Feb-Apr), B (Apr-May) - still destroyed at May
+      it "can still correct historical periods" do
+        # Note: Employee.find won't find destroyed records by default,
+        # so we need to use within_deleted or find via ignore_valid_datetime
+        employee = Employee.ignore_valid_datetime.within_deleted
+          .where(bitemporal_id: @employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .first
+
+        Timecop.freeze("2020/10/06") do
+          expect {
+            employee.correct(valid_from: _02_01, valid_to: _04_01, name: "X")
+          }.not_to raise_error
+        end
+
+        # Verify correction was applied to historical period
+        timeline = Employee.ignore_valid_datetime.within_deleted
+          .where(bitemporal_id: @employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .order(:valid_from)
+          .pluck(:valid_from, :valid_to, :name)
+
+        expect(timeline).to eq([
+          [_01_01, _02_01, "A"],   # Trimmed
+          [_02_01, _04_01, "X"],   # CORRECTION
+          [_04_01, _05_01, "B"]    # Trimmed, still ends at May (destroyed)
+        ])
+      end
+    end
   end
 
   # ==========================================================================
@@ -765,6 +981,125 @@ RSpec.describe "Cascade Correction (#correct method)" do
 
         # Employee2 should be unchanged
         expect(current_timeline(@employee2)).to eq(employee2_timeline_before)
+      end
+    end
+
+    # Test 6.2: Concurrent corrections on same entity
+    # -------------------------------------------------------------------------
+    # Two threads attempting to correct the same entity simultaneously.
+    # The locking mechanism should serialize the operations to prevent
+    # data corruption. Both should succeed, producing a consistent timeline.
+    # -------------------------------------------------------------------------
+    context "two threads correct same entity simultaneously", use_truncation: true do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+        end
+      end
+
+      it "serializes via locking - both succeed with consistent timeline" do
+        employee_id = @employee.bitemporal_id
+        results = []
+        errors = []
+
+        threads = 2.times.map do |i|
+          Thread.new do
+            # Each thread corrects a different time period to avoid conflict
+            valid_from = i == 0 ? _02_01 : _03_01
+            valid_to = i == 0 ? _03_01 : _04_01
+            Employee.find(employee_id).correct(
+              valid_from: valid_from,
+              valid_to: valid_to,
+              name: "Thread#{i}"
+            )
+            results << i
+          rescue => e
+            errors << e
+          end
+        end
+
+        threads.each(&:join)
+
+        # Both threads should succeed (no errors)
+        expect(errors).to be_empty
+
+        # Final timeline should be consistent (no overlaps, no gaps)
+        timeline = current_timeline(@employee)
+        expect(valid_timeline?(timeline)).to be true
+
+        # Should have both corrections in the timeline
+        names = timeline.map { |_, _, name| name }
+        expect(names).to include("Thread0", "Thread1")
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Test Category 7: Timestamp Behavior
+  # ==========================================================================
+
+  describe "timestamp behavior" do
+
+    # Test 7.1: created_at behavior on correction records
+    # -------------------------------------------------------------------------
+    # Correction records should get new created_at timestamps (the time
+    # of correction), not inherit from the source record.
+    # -------------------------------------------------------------------------
+    context "created_at on correction records" do
+      before do
+        @creation_time = "2020/10/01".in_time_zone
+        Timecop.freeze(@creation_time) do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+        end
+      end
+
+      it "sets new created_at on correction records" do
+        employee = Employee.find(@employee.id)
+        correction_time = "2020/10/06 15:30:00".in_time_zone
+
+        Timecop.freeze(correction_time) do
+          employee.correct(valid_from: _02_01, name: "X")
+        end
+
+        correction_record = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .find { |r| r.name == "X" }
+
+        # Correction record should have correction_time as created_at
+        expect(correction_record.created_at).to eq(correction_time)
+      end
+    end
+
+    # Test 7.2: updated_at behavior on correction records
+    # -------------------------------------------------------------------------
+    # All new records created during correction should have updated_at
+    # set to the correction time.
+    # -------------------------------------------------------------------------
+    context "updated_at on correction records" do
+      before do
+        @creation_time = "2020/10/01".in_time_zone
+        Timecop.freeze(@creation_time) do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+        end
+      end
+
+      it "sets updated_at to correction time" do
+        employee = Employee.find(@employee.id)
+        correction_time = "2020/10/06 15:30:00".in_time_zone
+
+        Timecop.freeze(correction_time) do
+          employee.correct(valid_from: _02_01, valid_to: _03_01, name: "X")
+        end
+
+        # All current timeline records should have updated_at = correction_time
+        current_records = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+
+        current_records.each do |record|
+          expect(record.updated_at).to eq(correction_time)
+        end
       end
     end
   end
