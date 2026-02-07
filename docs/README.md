@@ -246,6 +246,131 @@ end
 
 ---
 
+## Correcting Historical Data
+
+The `correct` method allows you to fix historical data while **preserving the cascade of subsequent changes**. This is the key difference from `force_update`, which overwrites without preserving future changes.
+
+### When to Use `correct`
+
+Use `correct` when you discover an error in past data but want to keep all subsequent changes intact:
+
+```ruby
+# Example: Employee's department was recorded wrong for February
+# Timeline has: HR (Jan) → Engineering (Mar) → Management (May)
+# Reality was:  HR (Jan) → Temp Assignment (Feb-Mar) → Engineering (Mar) → Management (May)
+
+employee.correct(
+  valid_from: Date.new(2024, 2, 1),
+  valid_to: Date.new(2024, 3, 1),
+  department: "Temp Assignment"
+)
+# Result: HR (Jan-Feb) → Temp Assignment (Feb-Mar) → Engineering (Mar-May) → Management (May-∞)
+# The March and May changes are PRESERVED
+```
+
+### Bounded Correction (with `valid_to`)
+
+When you specify both `valid_from` and `valid_to`, the correction applies only to that period:
+
+```ruby
+# Before:
+#   A              B              C
+#   |--------------|--------------|----------->
+#   Jan           Mar            May
+
+employee.correct(valid_from: feb_1, valid_to: apr_1, name: "X")
+
+# After:
+#   A    X              B    C
+#   |----|--------------|----|--->
+#   Jan  Feb           Apr  May
+```
+
+**What happens:**
+1. Record A is trimmed to end at Feb 1
+2. The correction "X" is inserted for [Feb 1, Apr 1)
+3. Record B is trimmed to start at Apr 1 (was Mar, now Apr)
+4. Record C is **preserved unchanged** (CASCADE)
+
+### Unbounded Correction (without `valid_to`)
+
+When you omit `valid_to`, the correction extends only to the next change point, fully preserving all future changes:
+
+```ruby
+# Before:
+#   A              B              C
+#   |--------------|--------------|----------->
+#   Jan           Mar            May
+
+employee.correct(valid_from: feb_1, name: "X")  # No valid_to!
+
+# After:
+#   A    X         B              C
+#   |----|---------|--------------|----------->
+#   Jan  Feb      Mar            May
+```
+
+**What happens:**
+1. Record A is trimmed to end at Feb 1
+2. The correction "X" is inserted for [Feb 1, Mar 1) — ends at the next change point
+3. Records B and C are **fully preserved** (no trimming)
+
+This is the safest option when you only need to correct a specific error without affecting the entire future timeline.
+
+### Comparison: `update` vs `force_update` vs `correct`
+
+| Method | Purpose | Preserves Future Changes | Creates New Period |
+|--------|---------|--------------------------|-------------------|
+| `update` | Record a change happening now | N/A (operates at current time) | Yes |
+| `force_update` | Fix data error, overwrite timeline | ❌ No | Replaces existing |
+| `correct` | Fix historical error | ✅ Yes (CASCADE) | Yes |
+
+### Example: Correcting a Salary Error
+
+```ruby
+# Scenario: Employee's salary was recorded as $50k in January,
+# but it should have been $55k. They got a raise to $60k in March.
+
+# Current timeline:
+#   $50k (Jan-Mar) → $60k (Mar-∞)
+
+# With force_update - LOSES the March raise:
+employee.force_update { |e| e.update!(salary: 55_000) }
+# Result: $55k (Jan-∞)  ← March raise is GONE!
+
+# With correct - PRESERVES the March raise:
+employee.correct(valid_from: jan_1, salary: 55_000)
+# Result: $55k (Jan-Mar) → $60k (Mar-∞)  ← March raise preserved!
+```
+
+### Error Handling
+
+The `correct` method validates inputs and raises errors for invalid operations:
+
+```ruby
+# valid_from must be within the timeline
+employee.correct(valid_from: Date.new(1900, 1, 1), name: "X")
+# => ArgumentError: valid_from must be within the record's valid period
+
+# valid_to must be after valid_from
+employee.correct(valid_from: mar_1, valid_to: jan_1, name: "X")
+# => ArgumentError: valid_to must be after valid_from
+```
+
+### Transaction Safety
+
+All corrections are wrapped in a database transaction. If any part of the correction fails, the entire operation is rolled back:
+
+```ruby
+begin
+  employee.correct(valid_from: feb_1, name: "X")
+rescue ActiveRecord::RecordInvalid
+  # Database is unchanged - no partial corrections
+end
+```
+
+---
+
 ## Deleting Records
 
 Deletion works similarly to updates - it creates historical records:
