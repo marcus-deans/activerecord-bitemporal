@@ -654,7 +654,13 @@ position.valid_at(5.days.ago) { |p| p.update!(rate: 300) }
 # Error: Bitemporal has already been taken
 ```
 
-**Why:** The gem doesn't support cascading historical corrections (see IMPLEMENTATION.md for details).
+**Why:** `valid_at { update }` can only split the current valid record, not cascade changes to future records.
+
+**Solution:** Use `#correct` for retroactive corrections that need to preserve future changes:
+
+```ruby
+position.correct(valid_from: 5.days.ago, rate: 300)
+```
 
 ### 2. Using `update_columns`
 
@@ -706,7 +712,6 @@ end
 ### ❌ Not Ideal For
 
 - Simple append-only logs (use PaperTrail or Audited)
-- Frequent historical corrections that cascade across time
 - Performance-critical queries (bitemporal queries are complex)
 - Models where overlapping validity periods are required
 
@@ -715,7 +720,8 @@ end
 ## Additional Resources
 
 - [Official Repository](https://github.com/kufu/activerecord-bitemporal)
-- [IMPLEMENTATION.md](./IMPLEMENTATION.md) - Deep dive into internal mechanics
+- [ARCHITECTURE.md](./ARCHITECTURE.md) - Deep dive into internal mechanics
+- [BITEMPORAL_CONCEPTS.md](./BITEMPORAL_CONCEPTS.md) - Comprehensive bitemporal theory
 - [Bitemporal Data Theory](https://en.wikipedia.org/wiki/Bitemporal_Modeling)
 
 ---
