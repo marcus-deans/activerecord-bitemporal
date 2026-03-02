@@ -1,6 +1,6 @@
-# `shift_genesis` — Gem Implementation Plan
+# `shift_genesis` — Conceptual Design & Implementation Plan
 
-Implementation plan for adding `shift_genesis(new_valid_from:)` to the `activerecord-bitemporal` gem (`marcus-deans/activerecord-bitemporal`).
+Design and implementation plan for adding `shift_genesis(new_valid_from:)` to the `activerecord-bitemporal` gem (`marcus-deans/activerecord-bitemporal`).
 
 ---
 
@@ -18,6 +18,8 @@ The gem provides four timeline operations:
 | Destroy | `destroy` | End the timeline |
 | **Shift genesis** | **missing** | **Change when the timeline started** |
 
+Every operation either works *within* the timeline's boundaries (update, correct) or at its trailing edge (destroy). There is no operation that modifies the **leading edge** — the point at which the entity began to exist.
+
 ### Why `correct()` can't fill this gap
 
 `correct()` requires a "containing record" at the target `valid_from` — a record whose `[valid_from, valid_to)` spans the requested date (`bitemporal.rb:468-477`). If no such record exists (because the date is before the timeline started), it raises `RecordNotFound`.
@@ -33,15 +35,212 @@ if containing_record.nil?
 end
 ```
 
-This is an intentional safety check — `correct()` answers *"what should the value have been at time T?"* and T must fall within the existing timeline. Genesis shift answers a different question: *"when should the entity's existence have started?"*
+This is an intentional safety check, not an oversight. `correct()` and `shift_genesis` answer fundamentally different questions:
+
+| | `correct()` | `shift_genesis()` |
+|---|---|---|
+| **Question** | *"What should the value have been at time T?"* | *"When should this entity's existence have started?"* |
+| **Precondition** | T must fall within the existing timeline | Entity must exist (have current-knowledge records) |
+| **Changes** | Attribute values within the timeline | The temporal boundary of existence itself |
+| **Invariant** | Timeline boundaries stay fixed | Attributes stay fixed |
+
+They are orthogonal operations. `correct()` operates **within** the timeline; `shift_genesis` operates **on** the timeline's boundary.
 
 ### Conceptual validity
 
-This is a textbook bitemporal operation. In Snodgrass's bitemporal theory, a genesis backdate represents: *"We now know (transaction time = now) that this entity was valid starting at an earlier date (valid time = earlier) than we originally recorded."* The transaction-time audit trail preserves the original understanding.
+This is a textbook bitemporal operation. In Snodgrass's bitemporal theory, a genesis shift represents a correction to our knowledge about *when an entity existed*, not *what its attributes were*:
+
+- **Backward shift**: *"We now know (transaction time = now) that this entity was valid starting at an earlier date (valid time = earlier) than we originally recorded."*
+- **Forward shift**: *"We now know (transaction time = now) that this entity was not valid as early as we originally recorded."*
+
+In both cases, the transaction-time audit trail preserves the original understanding. No information is lost from the database — only the "current knowledge" view changes.
 
 ---
 
-## 2. Method signature and behavior contract
+## 2. Theoretical foundation
+
+### 2.1 Classification in Snodgrass's taxonomy
+
+Snodgrass (and later Date/Darwen/Lorentzos) classify temporal operations along two axes — *what changes* (values vs. temporal boundaries) and *scope* (current vs. retroactive). Mapping the gem's operations:
+
+| Operation | Value change? | Temporal change? | Retroactive? |
+|-----------|:---:|:---:|:---:|
+| `update` | Yes | Yes (splits at now) | No |
+| `valid_at { update }` | Yes | Yes (splits at past point) | Yes |
+| `force_update` | Yes | No (preserves boundaries) | No |
+| `correct` | Yes | Partially (shifts boundaries of affected period) | Yes |
+| **`shift_genesis`** | **No** | **Yes (shifts existence boundary)** | **Yes** |
+
+`shift_genesis` occupies a unique cell: it is the only operation that is **purely temporal** with **no value change**. This further validates it as a distinct operation, not a variant of `correct()`.
+
+### 2.2 Entity lifecycle boundaries
+
+In bitemporal theory, an entity has a **lifecycle** defined by its valid-time extent:
+
+```
+        genesis                                    terminus
+           |                                          |
+           v                                          v
+    -------[========================================]-------
+           ^                                        ^
+      min(valid_from)                          max(valid_to)
+      across current-knowledge records         across current-knowledge records
+```
+
+The lifecycle has two boundaries:
+- **Genesis**: When the entity began to exist — `min(valid_from)` across current-knowledge records
+- **Terminus**: When the entity ceases to exist — `max(valid_to)` across current-knowledge records (infinity if ongoing)
+
+`correct()` operates **within** the lifecycle. It modifies values or internal segment boundaries, but cannot change the genesis or terminus. `shift_genesis` operates **on** the genesis boundary itself.
+
+There is a natural theoretical companion — `shift_terminus` — that would handle the other end:
+
+| Boundary operation | Meaning |
+|---|---|
+| `shift_genesis` backward | "Entity existed earlier than we thought" |
+| `shift_genesis` forward | "Entity didn't exist as early as we thought" |
+| `shift_terminus` backward (hypothetical) | "Entity ended earlier than we thought" |
+| `shift_terminus` forward (hypothetical) | "Entity lasted longer than we thought" |
+
+This plan addresses only genesis. Terminus shifting is a separate concern (`destroy` partially covers the "end earlier" case).
+
+### 2.3 SQL:2011 relationship
+
+SQL:2011 defines `UPDATE FOR PORTION OF` and `DELETE FOR PORTION OF` as operations on **single records** that split them at period boundaries. These are **local operations** — they don't cascade.
+
+`shift_genesis` cannot be expressed as a single `FOR PORTION OF` operation:
+- **Backward shift** = expanding a period's start. `FOR PORTION OF` can only **narrow** a period, not expand it.
+- **Forward shift** = removing a temporal portion across potentially multiple records. `FOR PORTION OF` operates on one record at a time.
+
+This is the same gap that `correct()` fills — the gem provides **entity-level** cascade semantics that the SQL standard doesn't. `shift_genesis` is another entity-level operation built from the same primitives (lock, close, insert).
+
+### 2.4 Backward vs. forward asymmetry
+
+Backward and forward shifts are **not symmetric** in their consequences:
+
+| | Backward shift | Forward shift |
+|---|---|---|
+| **Information effect** | Additive — entity existed longer | Subtractive — entity existed less |
+| **Current knowledge** | Everything preserved + extended | Segments can be erased |
+| **Change points** | All preserved | Some may be lost |
+| **Reversibility** | Trivially reversible (shift forward again) | Reversible only via audit trail |
+| **Risk profile** | Low | Higher |
+
+This asymmetry is inherent to the semantics, not an implementation artifact. The backward case adds existence; the forward case removes it.
+
+### 2.5 Forward shift and "retroactive non-existence"
+
+The forward shift case deserves special theoretical attention. When you shift genesis forward, you're asserting **retroactive non-existence**: *"the entity did not exist during the removed period."*
+
+```
+Before:  [Mar 1, Apr 1) = {dept: Engineering}
+         [Apr 1, Jun 1) = {dept: Marketing}    ← dept transfer at Apr 1
+         [Jun 1, ∞)     = {dept: Management}   ← promotion at Jun 1
+
+Shift genesis to May 1:
+         [May 1, Jun 1) = {dept: Marketing}
+         [Jun 1, ∞)     = {dept: Management}
+```
+
+Three things are erased from **current knowledge**:
+1. The entity's existence during [Mar 1, Apr 1) in Engineering
+2. The entity's existence during [Apr 1, May 1) in Marketing
+3. The **fact that a department transfer occurred at Apr 1**
+
+All three are **preserved in the audit trail** via transaction time — `transaction_at(before_shift).valid_at(Mar 15)` still returns the original data. Nothing is permanently lost.
+
+This is semantically correct: if the entity truly didn't exist before May 1, then the Apr 1 transfer is meaningless — there was no entity to transfer. But it may not be what users *intend*. A user might think "change the start date" without realizing they're also erasing the record of a department transfer. This is why the gem should faithfully execute the temporal operation while the **consumer layer** is responsible for warning users about lost change points.
+
+This is also distinct from a retroactive delete. A retroactive delete could create **gaps** (entity exists, then doesn't, then does again). A genesis shift by definition produces a **contiguous** timeline — it just starts later.
+
+### 2.6 Attribute inheritance on backward shift
+
+When shifting genesis backward, the new genesis record inherits all attribute values from the old genesis record. This is an implicit assertion: *"not only did the entity exist earlier, but it had the same attributes it had at the originally recorded start."*
+
+```
+Original: [Mar 1, ∞) rate=$20/hr
+Shift to Jan 1: [Jan 1, ∞) rate=$20/hr  ← was it really $20 in January?
+```
+
+The design makes `shift_genesis` **purely temporal** — it only answers *when*, not *what*. If attributes differ in the new period, that's a two-step operation:
+
+```ruby
+record.shift_genesis(new_valid_from: jan_1)           # extend existence
+record.correct(valid_from: jan_1, rate_cents: 1500)   # fix January rate
+```
+
+This two-step approach is theoretically cleaner than bundling attribute changes into the genesis shift. It separates the two concerns:
+1. "When did the entity start existing?" → `shift_genesis`
+2. "What were its attributes at that time?" → `correct`
+
+This aligns with the principle of **orthogonal temporal operations** — each operation should change one concern at a time.
+
+### 2.7 Composability with other operations
+
+An important property: `shift_genesis` composes cleanly with all existing operations because it only touches the genesis boundary.
+
+**`shift_genesis` then `correct()`**: Works naturally. The genesis extends the timeline, then `correct()` can operate within the newly extended range.
+
+**`correct()` then `shift_genesis`**: Also works. Existing corrections are untouched by a backward shift (only genesis changes). For a forward shift, corrections in the truncated range are "lost" from current knowledge (preserved in transaction history).
+
+**Multiple `shift_genesis` calls**: Each creates a new transaction-time entry. The final state reflects the last shift. Audit trail shows the progression.
+
+**`shift_genesis` then `update`/`destroy`**: No interaction. These operate at the current moment, regardless of when the genesis was.
+
+The operation is commutative with `correct()` for the backward case: `shift_genesis(jan_1) → correct(feb_1)` produces the same current-knowledge timeline as `correct(feb_1) → shift_genesis(jan_1)` (assuming the correction's `valid_from` falls within the extended range in both orderings). For the forward case, ordering matters — a forward shift can erase corrections in the truncated range.
+
+---
+
+## 3. Design decisions
+
+### 3.1 Untouched segments remain physically as-is
+
+**Decision**: Only close and replace records that actually change. Segments unaffected by the shift (those after genesis in backward shifts, those at or after `new_valid_from` in forward shifts) keep their original physical rows.
+
+**Alternative considered**: Close and re-create ALL current-knowledge segments (matching `correct()`'s cascade pattern where all affected records get new `transaction_from`).
+
+**Why `correct()` re-creates unchanged cascade records**: `correct()` uses `find_affected_records_for_correction(valid_from)` which fetches all records with `valid_to > correction_valid_from` — everything from the correction point onward. ALL of these are then closed (`records_to_close = affected_records.dup`) and re-created. Records fully after the correction's `valid_to` are re-created with identical attributes and validity periods — only `transaction_from` changes. This is a **side effect of `correct()`'s broad fetch pattern**, not a design principle. Notably, `correct()` itself leaves records entirely *before* the correction point untouched.
+
+**Why "leave untouched" is correct for `shift_genesis`**: The underlying principle in `correct()` is: *close what you affect, leave what you don't.* For `shift_genesis`:
+- Backward shift: only the genesis record's `valid_from` changes. Other segments' validity periods, attributes, and temporal meaning are all unchanged.
+- Forward shift: only segments before `new_valid_from` are affected. Segments at or after the boundary are unchanged.
+
+**Proof that transaction-time queries remain correct**:
+
+```
+Backward shift from Mar 1 to Jan 1, at time T3:
+
+Physical state:
+  Row 1: A, valid[Mar, Jun), tx[T1, T3]  ← closed genesis
+  Row 2: B, valid[Jun, ∞),   tx[T2, ∞]  ← UNTOUCHED (tx_from = T2)
+  Row 3: A, valid[Jan, Jun), tx[T3, ∞]  ← new genesis
+
+Query: transaction_at(T2.5) — "what did we believe between T2 and T3?"
+  Row 1: tx_from=T1 ≤ T2.5, tx_to=T3 > T2.5 ✓  → A valid[Mar, Jun)
+  Row 2: tx_from=T2 ≤ T2.5, tx_to=∞ > T2.5  ✓  → B valid[Jun, ∞)
+  Row 3: tx_from=T3 > T2.5                   ✗
+  Result: A[Mar, Jun), B[Jun, ∞) — the pre-shift timeline ✅
+
+Query: transaction_at(T3.5) — "what do we believe now?"
+  Row 1: tx_to=T3 ≤ T3.5                    ✗
+  Row 2: tx_from=T2 ≤ T3.5, tx_to=∞ > T3.5  ✓  → B valid[Jun, ∞)
+  Row 3: tx_from=T3 ≤ T3.5, tx_to=∞ > T3.5  ✓  → A valid[Jan, Jun)
+  Result: A[Jan, Jun), B[Jun, ∞) — the post-shift timeline ✅
+```
+
+Both queries return the correct timeline. Row 2 (untouched) appears in both views correctly because its `transaction_to` is still ∞ — the genesis shift doesn't change the fact that B was valid from Jun onward.
+
+### 3.2 Forward shift must leave a non-empty timeline
+
+**Decision**: If `new_valid_from >= last_segment.valid_to`, raise `ArgumentError` before any DB writes.
+
+**Rationale**: Shifting genesis past all segments would erase the entity from current knowledge entirely — zero remaining records. This is semantically equivalent to "the entity never existed," which is destroy's territory, not genesis shift's. `shift_genesis` should maintain the entity's existence, just with a different start.
+
+**Note**: When the last segment has `valid_to = ∞` (the common case for ongoing entities), this condition is impossible to satisfy, so infinite timelines can never be fully erased by forward shift. This constraint only applies to bounded timelines.
+
+---
+
+## 4. Method signature and behavior contract
 
 ### Signature
 
@@ -77,6 +276,7 @@ Return `true` without changes.
 
 `true` on success. Raises on failure (matching `correct()`'s behavior):
 - `ActiveRecord::RecordNotFound` if the entity is destroyed (no current-knowledge records)
+- `ArgumentError` if the shift would erase all segments (`new_valid_from >= last_segment.valid_to`)
 
 ### What the method does NOT do
 
@@ -86,7 +286,7 @@ Return `true` without changes.
 
 ---
 
-## 3. Internal mechanics
+## 5. Internal mechanics
 
 ### Template: how `correct()` structures its internals
 
@@ -202,7 +402,7 @@ This is identical to `find_affected_records_for_correction` (bitemporal.rb:519-5
 
 ---
 
-## 4. Edge cases
+## 6. Edge cases
 
 ### Edge 1: Single-segment timeline
 ```
@@ -301,9 +501,77 @@ Correct(Feb 1, name: B):
 ```
 After backdate, `correct()` works within the extended range because the genesis now spans `[Jan 1, ∞)`.
 
+### Edge 14: Forward shift would erase everything
+```
+Before:  [Mar 1, Apr 1) = A, [Apr 1, Jun 1) = B
+Shift to Jun 1:
+```
+All segments have `valid_to <= Jun 1`. No segment would survive.
+Check: `new_valid_from (Jun 1) >= last_segment.valid_to (Jun 1)` → `ArgumentError`.
+Evaluated before any DB writes — clean early return.
+
+Note: when the last segment has `valid_to = ∞`, this is impossible to trigger. Only applies to bounded timelines.
+
+### Edge 15: correct() then backward shift
+```
+Start:    [Mar 1, ∞) = {name: A}
+correct(Apr 1, name: B):
+          [Mar 1, Apr 1) = {name: A}, [Apr 1, ∞) = {name: B}
+Shift to Jan 1:
+          [Jan 1, Apr 1) = {name: A}    ← genesis extended
+          [Apr 1, ∞) = {name: B}        ← untouched
+```
+The correction is preserved. Genesis just extends backward.
+
+### Edge 16: Forward shift then correct outside new range
+```
+Start:    [Mar 1, Jun 1) = A, [Jun 1, ∞) = B
+Shift to May 1: [May 1, Jun 1) = A, [Jun 1, ∞) = B
+correct(valid_from: Apr 1, name: X):
+→ RecordNotFound — Apr 1 is before the new genesis
+```
+Correct behavior — the timeline no longer extends to Apr 1.
+
+### Edge 17: Forward shift to intermediate segment boundary
+```
+Before:  [Mar 1, Apr 1) = A, [Apr 1, Jun 1) = B, [Jun 1, ∞) = C
+Shift to Apr 1:
+After:   [Apr 1, Jun 1) = B, [Jun 1, ∞) = C
+```
+A closed (entirely before). B starts exactly at Apr 1 → untouched, becomes new genesis. C also untouched.
+
+### Edge 18: Forward shift to last segment boundary
+```
+Before:  [Mar 1, Apr 1) = A, [Apr 1, Jun 1) = B, [Jun 1, ∞) = C
+Shift to Jun 1:
+After:   [Jun 1, ∞) = C
+```
+A and B closed (entirely before). C starts exactly at Jun 1 → untouched, becomes genesis.
+
+### Edge 19: Bounded timeline backward shift
+```
+Before:  [Mar 1, Jun 1) = A       ← ends at Jun 1, not infinity
+Shift to Jan 1:
+After:   [Jan 1, Jun 1) = A       ← valid_to preserved at Jun 1
+```
+Works identically to the unbounded case. `valid_to` is preserved regardless of whether it's finite or infinite.
+
+### Edge case classification completeness
+
+For forward shift, the four segment categories are exhaustive given the `valid_from < valid_to` invariant:
+
+| Category | Condition | Action |
+|----------|-----------|--------|
+| Entirely before | `valid_to <= new_valid_from` | Close, no replacement |
+| Spans boundary | `valid_from < new_valid_from < valid_to` | Close + trimmed replacement |
+| Starts exactly | `valid_from == new_valid_from` | Untouched, stop |
+| Entirely after | `valid_from > new_valid_from` | Untouched, stop |
+
+These are mutually exclusive and exhaustive. No segment can fall outside these categories.
+
 ---
 
-## 5. Forward shift mechanics — detailed
+## 7. Forward shift mechanics — detailed
 
 ### Segment classification
 
@@ -335,17 +603,25 @@ Result:
   [Jun 1, ∞) = {ce: vision}           ← unchanged
 ```
 
-### The "lost" changes
+### The "lost" changes and retroactive non-existence
 
-Segments closed during a forward shift are preserved in the transaction-time audit trail:
-- **Valid-time queries**: `batch_valid_as_of(time: Mar 15, ...)` → nil (entity doesn't exist at that time anymore)
-- **Audit queries**: `transaction_at(before_shift).valid_at(Mar 15)` → returns the original genesis
+Forward shifts assert **retroactive non-existence**: the entity did not exist during the removed period. This has three categories of information loss from current knowledge:
 
-This is correct bitemporal behavior. The consumer (domain layer) should warn users about lost change points before proceeding.
+1. **Entity existence** in the removed period — queries at those times now return nil
+2. **Attribute values** that held during the removed period — no longer accessible via `valid_at`
+3. **Change points** that fell within the removed period — the historical fact that a transition occurred is no longer represented in current knowledge
+
+All three are **preserved in the audit trail** via transaction time:
+- `transaction_at(before_shift).valid_at(Mar 15)` → returns the original data
+- Nothing is permanently lost from the database
+
+This is correct bitemporal behavior. The **consumer layer** (not the gem) should warn users about lost change points before proceeding. The gem should faithfully execute the temporal operation without gatekeeping.
+
+**Distinction from retroactive delete**: A retroactive delete could create **gaps** in the timeline (entity exists, then doesn't, then does again). A genesis shift by definition produces a **contiguous** timeline starting at the new genesis — no gaps.
 
 ---
 
-## 6. Physical row traces
+## 8. Physical row traces
 
 ### Backward shift — single segment
 
@@ -419,7 +695,7 @@ Row 2 is not closed/reopened because it already starts at the correct date.
 
 ---
 
-## 7. Scope interaction proof
+## 9. Scope interaction proof
 
 ### The two default scopes
 
@@ -484,7 +760,7 @@ Using the physical rows from section 6 (Rows 1,2 closed, Row 3 current).
 
 ---
 
-## 8. `.dup` mechanics
+## 10. `.dup` mechanics
 
 ### The gem's dup refinement
 
@@ -544,7 +820,7 @@ The gem registers `after_initialize { self.bitemporal_id ||= SecureRandom.uuid }
 
 ---
 
-## 9. Test plan
+## 11. Test plan
 
 ### Spec file
 
@@ -567,10 +843,11 @@ The gem registers `after_initialize { self.bitemporal_id ||= SecureRandom.uuid }
 5. Forward to exact segment boundary → covering segment untouched, earlier segments closed
 6. Verify `self` instance is updated after shift
 
-**Category 3: No-op and errors (3 tests)**
+**Category 3: No-op and errors (4 tests)**
 1. Shift to current genesis date → returns true, no DB changes
 2. Soft-deleted entity → raises RecordNotFound
-3. Attributes are NOT changed (shift is purely temporal)
+3. Shift past all segments (bounded timeline) → raises ArgumentError
+4. Attributes are NOT changed (shift is purely temporal)
 
 **Category 4: Audit trail (2 tests)**
 1. After backward shift: `transaction_at(before_shift).valid_at(pre_genesis_date)` returns nil
@@ -583,13 +860,14 @@ The gem registers `after_initialize { self.bitemporal_id ||= SecureRandom.uuid }
 **Category 6: Concurrency (1 test)**
 1. Concurrent shifts on same entity → one succeeds, other blocks then succeeds with updated state
 
-**Category 7: Interaction with correct() (2 tests)**
+**Category 7: Interaction with correct() (3 tests)**
 1. Backdate then correct within extended range → works
 2. Correct then backdate → genesis extends, correction untouched
+3. Forward shift then correct outside new range → raises RecordNotFound
 
 ---
 
-## 10. Relationship to domain layer
+## 12. Relationship to domain layer
 
 ### What the gem provides
 
