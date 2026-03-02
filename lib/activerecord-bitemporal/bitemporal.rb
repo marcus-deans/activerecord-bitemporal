@@ -300,7 +300,15 @@ module ActiveRecord
           end
         end
 
-        # Shift Genesis: Move the start of an entity's timeline forward or backward
+        # Shift Genesis: Move when an entity's timeline begins (purely temporal)
+        #
+        # Unlike correct(), this changes *when* the entity existed, not *what* its attributes were.
+        #   - Backward: Extends the first segment earlier (entity "existed sooner")
+        #   - Forward: Trims/removes segments before the new start (entity "started later")
+        #   - No-op: Returns true without DB changes if new_valid_from equals current genesis
+        #
+        # Raises ActiveRecord::RecordNotFound if no current-knowledge records exist.
+        # Raises ArgumentError if new_valid_from would erase all segments (>= last valid_to).
         #
         # @param new_valid_from [Time, Date, String] The new start date for the entity's timeline
         # @return [Boolean] true if successful
@@ -594,10 +602,14 @@ module ActiveRecord
           end
 
           # 7. CLOSE old records FIRST (critical ordering)
-          records_to_close.each { |r| r.update_transaction_to(current_time) }
+          records_to_close.each do |record|
+            record.update_transaction_to(current_time)
+          end
 
           # 8. Insert new records
-          new_records.each { |r| r.save_without_bitemporal_callbacks!(validate: false) }
+          new_records.each do |record|
+            record.save_without_bitemporal_callbacks!(validate: false)
+          end
 
           # 9. Validate post-hoc (reuse existing)
           validate_cascade_correction_timeline!
