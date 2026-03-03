@@ -395,36 +395,45 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
       end
     end
 
-    # Test 2.5: Forward to intermediate boundary
-    context "forward to intermediate segment boundary" do
+    # Test 2.5: Forward shift preserves non-name attributes on trimmed segment
+    context "forward shift preserves all attributes on trimmed segment" do
       before do
         Timecop.freeze("2020/10/01") do
-          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
-          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
-          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
+          ActiveRecord::Bitemporal.valid_at(_01_01) {
+            @employee = Employee.create!(name: "Alice", emp_code: "E001")
+          }
+          ActiveRecord::Bitemporal.valid_at(_05_01) {
+            @employee.update!(name: "Bob", emp_code: "E002")
+          }
         end
       end
 
-      # before: A             B             C
-      #         |-------------|-------------|----------->
-      #         Jan          Mar           May
+      # before: Alice/E001              Bob/E002
+      #         |------------------------|----------->
+      #         Jan                     May
       #
       # shift_genesis(new_valid_from: Mar)
       #                  ↓
-      # after:  B             C
+      # after:  Alice/E001    Bob/E002
       #         |-------------|----------->
       #         Mar          May
-      it "A closed, B untouched becomes genesis" do
+      it "trimmed segment retains all original attributes" do
         employee = Employee.find(@employee.id)
 
         Timecop.freeze("2020/10/06") do
           employee.shift_genesis(new_valid_from: _03_01)
         end
 
-        expect(current_timeline(employee)).to eq([
-          [_03_01, _05_01, "B"],
-          [_05_01, infinity, "C"]
-        ])
+        genesis_record = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .order(:valid_from)
+          .first
+
+        expect(genesis_record.name).to eq("Alice")
+        expect(genesis_record.emp_code).to eq("E001")
+        expect(genesis_record.valid_from).to eq(_03_01)
+        expect(genesis_record.valid_to).to eq(_05_01)
       end
     end
 
@@ -505,9 +514,13 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
       end
 
-      it "returns true, no DB changes" do
+      it "returns true, no DB changes, same physical records" do
         employee = Employee.find(@employee.id)
         records_before = all_records(employee).count
+        ids_before = Employee.ignore_valid_datetime
+          .within_deleted
+          .where(bitemporal_id: employee.bitemporal_id)
+          .pluck(:id).sort
 
         Timecop.freeze("2020/10/06") do
           result = employee.shift_genesis(new_valid_from: _03_01)
@@ -515,6 +528,13 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
 
         expect(all_records(employee).count).to eq(records_before)
+
+        ids_after = Employee.ignore_valid_datetime
+          .within_deleted
+          .where(bitemporal_id: employee.bitemporal_id)
+          .pluck(:id).sort
+        expect(ids_after).to eq(ids_before)
+
         expect(current_timeline(employee)).to eq([
           [_03_01, infinity, "A"]
         ])
@@ -840,9 +860,10 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
           [_01_01, infinity, "A"]
         ])
 
-        # Should have historical records from each shift
+        # Should have exactly 3 total records:
+        # 1 original (closed at T1) + 1 from first shift (closed at T2) + 1 current from second shift
         total_records = all_records(employee).count
-        expect(total_records).to be >= 3  # original + 2 shifts = at least 3 closed + 1 current
+        expect(total_records).to eq(3)
       end
     end
   end
@@ -929,6 +950,170 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
 
         # self should now point at B (which starts at Mar and is the current record)
         expect(employee.valid_from).to eq(_03_01)
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Category 9: Transaction & Record Accounting
+  # ==========================================================================
+
+  describe "transaction & record accounting" do
+
+    # Test 9.1: Backward shift closes exactly 1 record, creates 1 new
+    context "backward shift record accounting" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "B") }
+        end
+      end
+
+      it "closes exactly 1 record, creates 1 new, leaves untouched records alone" do
+        employee = Employee.find(@employee.id)
+        shift_time = "2020/10/06".in_time_zone
+
+        Timecop.freeze(shift_time) do
+          employee.shift_genesis(new_valid_from: _01_01)
+        end
+
+        # Exactly 1 record closed at shift_time (the old genesis A)
+        closed_by_shift = Employee.ignore_valid_datetime
+          .within_deleted
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: shift_time)
+        expect(closed_by_shift.count).to eq(1)
+        expect(closed_by_shift.first.name).to eq("A")
+
+        # Current records: new A has transaction_from = shift_time, B is untouched
+        current_records = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .order(:valid_from)
+
+        new_a = current_records.find { |r| r.name == "A" }
+        old_b = current_records.find { |r| r.name == "B" }
+
+        expect(new_a.transaction_from).to eq(shift_time)
+        expect(old_b.transaction_from).not_to eq(shift_time)  # B untouched
+      end
+    end
+
+    # Test 9.2: Transaction rollback on failure
+    context "rollback on failure" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee = Employee.create!(name: "A") }
+        end
+      end
+
+      it "rolls back all changes on failure" do
+        employee = Employee.find(@employee.id)
+        original_timeline = current_timeline(employee)
+
+        # Force a failure by making save_without_bitemporal_callbacks! raise
+        call_count = 0
+        allow_any_instance_of(Employee).to receive(:save_without_bitemporal_callbacks!).and_wrap_original do |method, *args, **kwargs|
+          call_count += 1
+          if call_count >= 1
+            raise ActiveRecord::RecordInvalid.new(Employee.new)
+          end
+          method.call(*args, **kwargs)
+        end
+
+        expect {
+          employee.shift_genesis(new_valid_from: _01_01)
+        }.to raise_error(ActiveRecord::RecordInvalid)
+
+        # Timeline should be unchanged (transaction rolled back)
+        expect(current_timeline(employee)).to eq(original_timeline)
+      end
+    end
+
+    # Test 9.3: Multi-entity isolation
+    context "multi-entity isolation" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee1 = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee2 = Employee.create!(name: "B") }
+        end
+      end
+
+      it "only affects the targeted entity" do
+        employee1 = Employee.find(@employee1.id)
+        employee2_timeline_before = current_timeline(@employee2)
+
+        Timecop.freeze("2020/10/06") do
+          employee1.shift_genesis(new_valid_from: _01_01)
+        end
+
+        # Employee1 should be shifted
+        expect(current_timeline(employee1)).to eq([
+          [_01_01, infinity, "A"]
+        ])
+
+        # Employee2 should be unchanged
+        expect(current_timeline(@employee2)).to eq(employee2_timeline_before)
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Category 10: Timestamp Behavior
+  # ==========================================================================
+
+  describe "timestamp behavior" do
+
+    # Test 10.1: created_at on shift records
+    context "created_at on shift records" do
+      before do
+        @creation_time = "2020/10/01 12:00:00".in_time_zone
+        Timecop.freeze(@creation_time) do
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee = Employee.create!(name: "A") }
+        end
+      end
+
+      it "sets created_at to shift time, not inherited from original" do
+        employee = Employee.find(@employee.id)
+        @shift_time = "2020/10/06 15:30:00".in_time_zone
+
+        Timecop.freeze(@shift_time) do
+          employee.shift_genesis(new_valid_from: _01_01)
+        end
+
+        new_record = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .first
+
+        expect(new_record.created_at).to eq(@shift_time)
+      end
+    end
+
+    # Test 10.2: updated_at on shift records
+    context "updated_at on shift records" do
+      before do
+        @creation_time = "2020/10/01 12:00:00".in_time_zone
+        Timecop.freeze(@creation_time) do
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee = Employee.create!(name: "A") }
+        end
+      end
+
+      it "sets updated_at to shift time on all current records" do
+        employee = Employee.find(@employee.id)
+        @shift_time = "2020/10/06 15:30:00".in_time_zone
+
+        Timecop.freeze(@shift_time) do
+          employee.shift_genesis(new_valid_from: _01_01)
+        end
+
+        current_records = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+
+        current_records.each do |record|
+          expect(record.updated_at).to eq(@shift_time)
+        end
       end
     end
   end
