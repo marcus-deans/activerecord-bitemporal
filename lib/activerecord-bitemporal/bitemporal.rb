@@ -300,6 +300,23 @@ module ActiveRecord
           end
         end
 
+        # Shift Genesis: Move when an entity's timeline begins (purely temporal)
+        #
+        # Unlike correct(), this changes *when* the entity existed, not *what* its attributes were.
+        #   - Backward: Extends the first segment earlier (entity "existed sooner")
+        #   - Forward: Trims/removes segments before the new start (entity "started later")
+        #   - No-op: Returns true without DB changes if new_valid_from equals current genesis
+        #
+        # Raises ActiveRecord::RecordNotFound if no current-knowledge records exist.
+        # Raises ArgumentError if new_valid_from would erase all segments (>= last valid_to).
+        #
+        # @param new_valid_from [Time, Date, String] The new start date for the entity's timeline
+        # @return [Boolean] true if successful
+        def shift_genesis(new_valid_from:)
+          new_valid_from = new_valid_from.in_time_zone if new_valid_from.respond_to?(:in_time_zone)
+          _shift_genesis_record(new_valid_from: new_valid_from)
+        end
+
         def correcting?
           bitemporal_option[:correcting].present?
         end
@@ -543,6 +560,126 @@ module ActiveRecord
 
           true
         end
+      end
+
+      # Shift Genesis: Main implementation
+      def _shift_genesis_record(new_valid_from:)
+        current_time = Time.current
+
+        ActiveRecord::Base.transaction(requires_new: true) do
+          # 1. Lock all records for this entity
+          self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
+
+          # 2. Fetch all current-knowledge segments
+          segments = find_all_current_knowledge_segments
+
+          # 3. Guard: entity must exist
+          if segments.empty?
+            raise ActiveRecord::RecordNotFound.new(
+              "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
+              "(no current-knowledge records)",
+              self.class, "bitemporal_id", bitemporal_id
+            )
+          end
+
+          genesis = segments.first
+
+          # 4. No-op: same date
+          return true if new_valid_from == genesis[valid_from_key]
+
+          # 5. Guard: forward shift must not erase all segments
+          if new_valid_from >= segments.last[valid_to_key]
+            raise ArgumentError,
+              "shift_genesis would erase all segments: new_valid_from (#{new_valid_from}) " \
+              ">= last segment valid_to (#{segments.last[valid_to_key]})"
+          end
+
+          # 6. Build records to close and new records
+          records_to_close, new_records = if new_valid_from < genesis[valid_from_key]
+            build_genesis_backward_shift(genesis, new_valid_from, current_time)
+          else
+            build_genesis_forward_shift(segments, new_valid_from, current_time)
+          end
+
+          # 7. CLOSE old records FIRST (critical ordering)
+          records_to_close.each do |record|
+            record.update_transaction_to(current_time)
+          end
+
+          # 8. Insert new records
+          new_records.each do |record|
+            record.save_without_bitemporal_callbacks!(validate: false)
+          end
+
+          # 9. Validate post-hoc (reuse existing)
+          validate_cascade_correction_timeline!
+
+          # 10. Update self to point at the currently-valid record
+          all_current = find_all_current_knowledge_segments
+          current_record = all_current.find { |r|
+            r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
+          } || all_current.last
+
+          @_swapped_id = current_record.swapped_id
+          self[valid_from_key] = current_record[valid_from_key]
+          self[valid_to_key] = current_record[valid_to_key]
+          self.transaction_from = current_record.transaction_from
+          self.transaction_to = current_record.transaction_to
+
+          true
+        end
+      end
+
+      def find_all_current_knowledge_segments
+        self.class
+          .where(bitemporal_id: bitemporal_id)
+          .ignore_valid_datetime
+          .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+          .order(valid_from_key => :asc)
+          .to_a
+          .each { |record|
+            record.id = record.swapped_id
+            record.clear_changes_information
+          }
+      end
+
+      def build_genesis_backward_shift(genesis, new_valid_from, current_time)
+        new_genesis = genesis.dup
+        new_genesis.id = nil
+        new_genesis[valid_from_key] = new_valid_from
+        new_genesis.transaction_from = current_time
+        new_genesis.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
+
+        [[genesis], [new_genesis]]
+      end
+
+      def build_genesis_forward_shift(segments, new_valid_from, current_time)
+        records_to_close = []
+        new_records = []
+
+        segments.each do |segment|
+          if segment[valid_to_key] <= new_valid_from
+            # Entirely before — close, no replacement
+            records_to_close << segment
+
+          elsif segment[valid_from_key] < new_valid_from
+            # Spans the boundary — close + trimmed replacement
+            records_to_close << segment
+
+            trimmed = segment.dup
+            trimmed.id = nil
+            trimmed[valid_from_key] = new_valid_from
+            trimmed.transaction_from = current_time
+            trimmed.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
+            new_records << trimmed
+
+          else
+            # valid_from >= new_valid_from — untouched, stop
+            break
+          end
+        end
+
+        [records_to_close, new_records]
       end
 
       def find_affected_records_for_correction(correction_valid_from)
