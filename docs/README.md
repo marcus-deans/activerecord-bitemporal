@@ -317,13 +317,14 @@ employee.correct(valid_from: feb_1, name: "X")  # No valid_to!
 
 This is the safest option when you only need to correct a specific error without affecting the entire future timeline.
 
-### Comparison: `update` vs `force_update` vs `correct`
+### Comparison: `update` vs `force_update` vs `correct` vs `shift_genesis`
 
-| Method | Purpose | Preserves Future Changes | Creates New Period |
+| Method | Purpose | Preserves Future Changes | Changes Attributes |
 |--------|---------|--------------------------|-------------------|
 | `update` | Record a change happening now | N/A (operates at current time) | Yes |
-| `force_update` | Fix data error, overwrite timeline | ❌ No | Replaces existing |
+| `force_update` | Fix data error, overwrite timeline | ❌ No | Yes |
 | `correct` | Fix historical error | ✅ Yes (CASCADE) | Yes |
+| `shift_genesis` | Change when entity's timeline begins | ✅ Yes (untouched) | No (purely temporal) |
 
 ### Example: Correcting a Salary Error
 
@@ -367,6 +368,114 @@ begin
 rescue ActiveRecord::RecordInvalid
   # Database is unchanged - no partial corrections
 end
+```
+
+---
+
+## Shifting the Timeline Start
+
+The `shift_genesis` method changes *when* an entity's timeline begins, without changing *what* its attributes are. This is a purely temporal operation.
+
+### When to Use `shift_genesis`
+
+Use `shift_genesis` when you need to change an entity's start date but the data itself is correct:
+
+```ruby
+# Scenario: An employee was created with a start date of March 1,
+# but they actually started on January 1.
+
+# correct() won't work here — there's no record before March to correct:
+employee.correct(valid_from: jan_1, name: "Alice")
+# => ActiveRecord::RecordNotFound (no record exists at jan_1)
+
+# shift_genesis solves this:
+employee.shift_genesis(new_valid_from: jan_1)
+# Timeline extended: Alice now starts from January 1
+```
+
+### Backward Shift (Extending Earlier)
+
+Move the start date earlier to extend the timeline into the past:
+
+```ruby
+# Before:
+#   Alice           Bob
+#   |---------------|----------->
+#   Mar            May
+#
+employee.shift_genesis(new_valid_from: jan_1)
+#
+# After:
+#   Alice                     Bob
+#   |-------------------------|----------->
+#   Jan                      May
+```
+
+Only the first segment's `valid_from` changes. All subsequent segments (Bob) remain untouched — their attributes, boundaries, and even their physical database rows are preserved.
+
+### Forward Shift (Trimming Start)
+
+Move the start date forward to remove early history:
+
+```ruby
+# Before:
+#   Alice           Bob            Carol
+#   |---------------|--------------|----------->
+#   Jan            Mar            May
+#
+employee.shift_genesis(new_valid_from: apr_1)
+#
+# After:
+#   Bob    Carol
+#   |----- |----------->
+#   Apr    May
+```
+
+Segments entirely before the new start are removed. A segment that spans the new start date is trimmed. Segments after the new start are untouched.
+
+### Composing with `correct`
+
+`shift_genesis` and `correct` work together naturally. A common pattern is to backdate first, then correct within the extended range:
+
+```ruby
+# Employee was created starting March, but actually started in January
+# with a different role that changed in February.
+employee.shift_genesis(new_valid_from: jan_1)
+employee.correct(valid_from: jan_1, valid_to: feb_1, role: "Intern")
+# Result: Intern (Jan-Feb) → Original role (Feb-Mar) → ...
+```
+
+### Error Handling
+
+```ruby
+# Shifting to the same date is a no-op (returns true, no DB changes)
+employee.shift_genesis(new_valid_from: current_genesis_date)
+
+# Cannot erase the entire timeline
+employee.shift_genesis(new_valid_from: far_future_date)
+# => ArgumentError: shift_genesis would erase all segments
+
+# Entity must have current-knowledge records
+employee.shift_genesis(new_valid_from: jan_1)
+# => ActiveRecord::RecordNotFound (if entity has been fully deleted)
+```
+
+### Audit Trail
+
+Like all bitemporal operations, `shift_genesis` preserves full transaction history. You can query what the timeline looked like before the shift using `transaction_at`:
+
+```ruby
+# After shifting genesis from March to January:
+ActiveRecord::Bitemporal.transaction_at(before_shift_time) do
+  ActiveRecord::Bitemporal.valid_at(feb_1) do
+    Employee.find_at_time(feb_1, employee.id)
+    # => nil (before the shift, no record existed in February)
+  end
+end
+
+# Current knowledge now includes February:
+Employee.find_at_time(feb_1, employee.id)
+# => #<Employee name: "Alice">
 ```
 
 ---
@@ -737,6 +846,8 @@ Position.create(rate: 100, valid_from: 1.week.ago)  # Historical
 position.update(rate: 200)                    # Standard update (temporal change)
 position.valid_at(3.days.ago) { |p| p.update!(rate: 200) }  # Backdated change
 position.force_update { |p| p.update(rate: 200) }  # Correction (not temporal)
+position.correct(valid_from: feb_1, name: "X")    # Retroactive correction (preserves cascade)
+position.shift_genesis(new_valid_from: jan_1)      # Change when timeline begins
 
 # Queries
 Position.all                                  # Current records only
