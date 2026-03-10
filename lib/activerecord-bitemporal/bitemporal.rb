@@ -498,6 +498,45 @@ module ActiveRecord
 
       private
 
+      BITEMPORAL_INFRASTRUCTURE_COLUMNS = %w[id type created_at updated_at bitemporal_id transaction_from transaction_to deleted_at].freeze
+
+      def bitemporal_business_attributes(record)
+        excluded = BITEMPORAL_INFRASTRUCTURE_COLUMNS + [valid_from_key, valid_to_key]
+        record.attributes.except(*excluded)
+      end
+
+      def coalesce_adjacent_segments!(current_time)
+        segments = find_all_current_knowledge_segments
+        return if segments.size < 2
+
+        segments.drop(1).reduce([segments.first]) do |acc, segment|
+          if acc.last[valid_to_key] == segment[valid_from_key] &&
+             bitemporal_business_attributes(acc.last) == bitemporal_business_attributes(segment)
+            earlier = acc.last
+
+            # Create merged record spanning both ranges
+            merged = earlier.dup
+            merged.id = nil
+            merged[valid_to_key] = segment[valid_to_key]
+            merged.transaction_from = current_time
+            merged.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
+            merged.save_without_bitemporal_callbacks!(validate: false)
+
+            # Close both originals
+            earlier.update_transaction_to(current_time)
+            segment.update_transaction_to(current_time)
+
+            # Replace last accumulated with merged for chain handling
+            merged.id = merged.swapped_id
+            merged.clear_changes_information
+            acc[-1] = merged
+            acc
+          else
+            acc << segment
+          end
+        end
+      end
+
       # Cascade Correction: Main implementation
       def _correct_record(valid_from:, valid_to:, attributes:)
         current_time = Time.current
@@ -543,6 +582,9 @@ module ActiveRecord
           new_timeline.each do |record|
             record.save_without_bitemporal_callbacks!(validate: false)
           end
+
+          # 5.5. Coalesce adjacent identical segments
+          coalesce_adjacent_segments!(current_time)
 
           # 6. Validate the new timeline (post-hoc)
           validate_cascade_correction_timeline!
@@ -612,6 +654,9 @@ module ActiveRecord
           new_records.each do |record|
             record.save_without_bitemporal_callbacks!(validate: false)
           end
+
+          # 8.5. Coalesce adjacent identical segments
+          coalesce_adjacent_segments!(current_time)
 
           # 9. Validate post-hoc (reuse existing)
           validate_cascade_correction_timeline!
