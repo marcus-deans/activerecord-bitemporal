@@ -548,9 +548,11 @@ module ActiveRecord
           validate_cascade_correction_timeline!
 
           # 7. Update self to point to the "current" record in the new timeline
-          current_record = new_timeline.find { |r|
+          # Query DB since untouched segments (fully after correction) aren't in new_timeline
+          all_current = find_all_current_knowledge_segments
+          current_record = all_current.find { |r|
             r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
-          } || new_timeline.last
+          } || all_current.last
 
           @_swapped_id = current_record.swapped_id
           self[valid_from_key] = current_record[valid_from_key]
@@ -731,11 +733,13 @@ module ActiveRecord
       end
 
       def bitemporal_build_cascade_correction_records(affected_records:, valid_from:, valid_to:, attributes:, current_time:)
-        records_to_close = affected_records.dup
         new_timeline = []
 
         # Sort by valid_from to process in order
         sorted_records = affected_records.sort_by { |r| r[valid_from_key] }
+
+        # Only close records that overlap the correction range [valid_from, valid_to)
+        records_to_close = sorted_records.select { |r| r[valid_from_key] < valid_to }
 
         # 1. BEFORE: If first affected record starts before valid_from, create trimmed version
         first_record = sorted_records.first
@@ -767,18 +771,18 @@ module ActiveRecord
           sorted_records.each do |record|
             next unless record[valid_to_key] > valid_to
 
-            after_record = record.dup
-            after_record.id = nil
-            after_record.transaction_from = current_time
-            after_record.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
-
             if record[valid_from_key] < valid_to
-              # Partially overlapped - trim start to valid_to (CASCADE!)
+              # Partially overlapped — trim start to valid_to
+              after_record = record.dup
+              after_record.id = nil
               after_record[valid_from_key] = valid_to
+              after_record.transaction_from = current_time
+              after_record.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
+              new_timeline << after_record
+            else
+              # Fully after correction — untouched, stop
+              break
             end
-            # else: Fully after - preserve as-is (valid_from unchanged)
-
-            new_timeline << after_record
           end
         end
 
