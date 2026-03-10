@@ -1260,4 +1260,248 @@ RSpec.describe "Cascade Correction (#correct method)" do
       end
     end
   end
+
+  # ==========================================================================
+  # Category 9: Seam Coalescing
+  # ==========================================================================
+  #
+  # correct() can produce "cosmetic seams" — adjacent segments with identical
+  # business attributes split at a boundary. Coalescing merges them into a
+  # single segment.
+  # ==========================================================================
+  describe "Category 9: Seam Coalescing" do
+
+    # Test 9.1: Cancel pattern coalesces into single segment
+    # -------------------------------------------------------------------------
+    # Setup: A[Jan-Mar, "X"], B[Mar-∞, "Y"]
+    # Action: correct(Mar, name: "X")
+    # Without coalescing: A[Jan-Mar, "X"], C[Mar-∞, "X"] — cosmetic seam
+    # With coalescing: merged[Jan-∞, "X"] — one segment
+    # -------------------------------------------------------------------------
+    context "cancel pattern coalesces into single segment" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "X") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "Y") }
+        end
+      end
+
+      it "merges adjacent identical segments into one" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.correct(valid_from: _03_01, name: "X")
+        end
+
+        timeline = current_timeline(employee)
+
+        expect(timeline.size).to eq(1)
+        expect(timeline).to eq([
+          [_01_01, infinity, "X"]
+        ])
+      end
+    end
+
+    # Test 9.2: Bounded correction with chain coalescing (triple merge)
+    # -------------------------------------------------------------------------
+    # Setup: A[Jan-Mar, "X"], B[Mar-May, "Y"], C[May-∞, "X"]
+    # Action: correct(Mar, May, name: "X")
+    # Without coalescing: A[Jan-Mar], X[Mar-May], C[May-∞] — all "X"
+    # With coalescing: merged[Jan-∞, "X"] — triple merge
+    # -------------------------------------------------------------------------
+    context "bounded correction with chain coalescing (triple merge)" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "X") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "Y") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "X") }
+        end
+      end
+
+      it "merges three identical adjacent segments into one" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.correct(valid_from: _03_01, valid_to: _05_01, name: "X")
+        end
+
+        timeline = current_timeline(employee)
+
+        expect(timeline.size).to eq(1)
+        expect(timeline).to eq([
+          [_01_01, infinity, "X"]
+        ])
+      end
+    end
+
+    # Test 9.3: Left boundary no-op correction coalesces
+    # -------------------------------------------------------------------------
+    # Setup: A[Jan-Mar, "X"], B[Mar-∞, "Y"]
+    # Action: correct(Feb, Mar, name: "X")
+    # Without coalescing: A'[Jan-Feb, "X"], X[Feb-Mar, "X"], B[Mar-∞, "Y"]
+    # With coalescing: merged[Jan-Mar, "X"], B[Mar-∞, "Y"]
+    # -------------------------------------------------------------------------
+    context "left boundary no-op correction coalesces" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "X") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "Y") }
+        end
+      end
+
+      it "merges seam between split halves with same attributes" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.correct(valid_from: _02_01, valid_to: _03_01, name: "X")
+        end
+
+        timeline = current_timeline(employee)
+
+        expect(timeline.size).to eq(2)
+        expect(timeline).to eq([
+          [_01_01, _03_01, "X"],
+          [_03_01, infinity, "Y"]
+        ])
+      end
+    end
+
+    # Test 9.4: Different attributes — no coalescing (control)
+    # -------------------------------------------------------------------------
+    # Setup: A[Jan-Mar, "X"], B[Mar-∞, "Y"]
+    # Action: correct(Mar, name: "Z")
+    # Result: A[Jan-Mar, "X"], Z[Mar-∞, "Z"] — different, no merge
+    # -------------------------------------------------------------------------
+    context "different attributes — no coalescing" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "X") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "Y") }
+        end
+      end
+
+      it "does not merge segments with different attributes" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.correct(valid_from: _03_01, name: "Z")
+        end
+
+        timeline = current_timeline(employee)
+
+        expect(timeline.size).to eq(2)
+        expect(timeline).to eq([
+          [_01_01, _03_01, "X"],
+          [_03_01, infinity, "Z"]
+        ])
+      end
+    end
+
+    # Test 9.5: Audit trail preserved after coalescing
+    # -------------------------------------------------------------------------
+    # Setup: A[Jan-Mar, "X"], B[Mar-∞, "Y"]
+    # Action: correct(Mar, name: "X") at T1
+    # Assert:
+    #   - At transaction_at(before T1): see A[Jan-Mar] and B[Mar-∞] (original state)
+    #   - At transaction_at(T1): see merged[Jan-∞, "X"] (post-coalesce)
+    # -------------------------------------------------------------------------
+    context "audit trail preserved after coalescing" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "X") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "Y") }
+        end
+      end
+
+      it "preserves historical view before correction" do
+        employee = Employee.find(@employee.id)
+        before_correction = "2020/10/05".in_time_zone
+        correction_time = "2020/10/06".in_time_zone
+
+        Timecop.freeze(correction_time) do
+          employee.correct(valid_from: _03_01, name: "X")
+        end
+
+        # Historical view: before correction, see original A and B
+        ActiveRecord::Bitemporal.transaction_at(before_correction) do
+          old_at_jan = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.find(employee.id) }
+          expect(old_at_jan.name).to eq("X")
+
+          old_at_mar = ActiveRecord::Bitemporal.valid_at(_03_01) { Employee.find(employee.id) }
+          expect(old_at_mar.name).to eq("Y")
+        end
+
+        # Current view: after correction, see merged single segment
+        ActiveRecord::Bitemporal.transaction_at(correction_time) do
+          new_at_jan = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.find(employee.id) }
+          expect(new_at_jan.name).to eq("X")
+
+          new_at_mar = ActiveRecord::Bitemporal.valid_at(_03_01) { Employee.find(employee.id) }
+          expect(new_at_mar.name).to eq("X")
+        end
+      end
+    end
+
+    # Test 9.6: NULL attributes coalesce correctly
+    # -------------------------------------------------------------------------
+    # Adjacent records with matching nil values should be coalesced.
+    # -------------------------------------------------------------------------
+    context "NULL attributes coalesce correctly" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "X", emp_code: nil) }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "Y", emp_code: nil) }
+        end
+      end
+
+      it "coalesces records with matching nil values" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.correct(valid_from: _03_01, name: "X")
+        end
+
+        timeline = current_timeline(employee)
+
+        expect(timeline.size).to eq(1)
+        expect(timeline).to eq([
+          [_01_01, infinity, "X"]
+        ])
+      end
+    end
+
+    # Test 9.7: Single-column difference prevents coalescing
+    # -------------------------------------------------------------------------
+    # Adjacent records identical except one column (emp_code).
+    # -------------------------------------------------------------------------
+    context "single-column difference prevents coalescing" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "X", emp_code: "E001") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "Y", emp_code: "E002") }
+        end
+      end
+
+      it "does not coalesce when emp_code differs" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.correct(valid_from: _03_01, name: "X", emp_code: "E002")
+        end
+
+        timeline = current_timeline(employee)
+
+        # name matches ("X" and "X") but emp_code differs ("E001" vs "E002")
+        expect(timeline.size).to eq(2)
+
+        records = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .order(:valid_from)
+
+        expect(records.first.emp_code).to eq("E001")
+        expect(records.last.emp_code).to eq("E002")
+      end
+    end
+  end
 end
