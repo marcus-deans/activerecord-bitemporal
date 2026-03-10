@@ -1503,5 +1503,72 @@ RSpec.describe "Cascade Correction (#correct method)" do
         expect(records.last.emp_code).to eq("E002")
       end
     end
+
+    # Test 9.8: Non-adjacent identical segments are NOT coalesced
+    # -------------------------------------------------------------------------
+    # Setup: A[Jan-Mar, "X"], B[Mar-May, "Y"], C[May-∞, "X"]
+    # Action: correct(Mar, May, name: "Z")
+    # Result: A[Jan-Mar, "X"], Z[Mar-May, "Z"], C[May-∞, "X"]
+    # A and C have identical attributes but are separated by Z — no coalescing.
+    # -------------------------------------------------------------------------
+    context "non-adjacent identical segments are not coalesced" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "X") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "Y") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "X") }
+        end
+      end
+
+      it "keeps three segments when middle differs" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.correct(valid_from: _03_01, valid_to: _05_01, name: "Z")
+        end
+
+        timeline = current_timeline(employee)
+
+        expect(timeline.size).to eq(3)
+        expect(timeline).to eq([
+          [_01_01, _03_01, "X"],
+          [_03_01, _05_01, "Z"],
+          [_05_01, infinity, "X"]
+        ])
+      end
+    end
+
+    # Test 9.9: self state is correct after coalescing
+    # -------------------------------------------------------------------------
+    # Setup: A[Jan-Mar, "X"], B[Mar-∞, "Y"]
+    # Action: correct(Mar, name: "X") — coalesces A and correction into one
+    # Assert: employee (self) points to the merged record
+    # -------------------------------------------------------------------------
+    context "self state is correct after coalescing" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "X") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "Y") }
+        end
+      end
+
+      it "updates self to point to the merged record" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.correct(valid_from: _03_01, name: "X")
+        end
+
+        # self's temporal fields should reflect the merged single-segment state
+        expect(employee[Employee.valid_from_key]).to eq(_01_01)
+        expect(employee[Employee.valid_to_key]).to eq(infinity)
+
+        # After reload, business attributes match the merged record
+        employee.reload
+        expect(employee.name).to eq("X")
+        expect(employee[Employee.valid_from_key]).to eq(_01_01)
+        expect(employee[Employee.valid_to_key]).to eq(infinity)
+      end
+    end
   end
 end
