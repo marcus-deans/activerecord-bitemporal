@@ -128,23 +128,27 @@ RSpec.describe "Cascade Correction (#correct method)" do
         end
 
         # Records that were current before correction should now be closed at correction_time
-        # NOTE: Need within_deleted to see records with closed transaction_to
-        # Filter to records that were created before correction (transaction_from < correction_time)
-        # and closed at correction time (transaction_to = correction_time)
+        # Only records overlapping the correction range [Feb, Apr) are closed: A and B
+        # C (May-∞) is fully after the correction and untouched
         closed_by_correction = Employee.ignore_valid_datetime
           .within_deleted
           .where(bitemporal_id: employee.bitemporal_id)
           .where(transaction_to: correction_time)
 
-        # Should have closed exactly 3 records (the A, B, C records from setup)
-        expect(closed_by_correction.count).to eq(3)
+        expect(closed_by_correction.count).to eq(2)
 
-        # New records should have transaction_from = correction_time
         current_records = Employee.ignore_valid_datetime
           .where(bitemporal_id: employee.bitemporal_id)
           .where(transaction_to: tt_infinity)
+          .order(:valid_from)
 
-        expect(current_records.pluck(:transaction_from).uniq).to eq([correction_time])
+        # Modified records have transaction_from = correction_time
+        modified = current_records.select { |r| r.name != "C" }
+        modified.each { |r| expect(r.transaction_from).to eq(correction_time) }
+
+        # Untouched record C retains original transaction_from
+        untouched_c = current_records.find { |r| r.name == "C" }
+        expect(untouched_c.transaction_from).not_to eq(correction_time)
       end
     end
 
@@ -1093,6 +1097,7 @@ RSpec.describe "Cascade Correction (#correct method)" do
         end
 
         # All current timeline records should have updated_at = correction_time
+        # (single-record scenario: all segments are newly created)
         current_records = Employee.ignore_valid_datetime
           .where(bitemporal_id: employee.bitemporal_id)
           .where(transaction_to: tt_infinity)
@@ -1100,6 +1105,158 @@ RSpec.describe "Cascade Correction (#correct method)" do
         current_records.each do |record|
           expect(record.updated_at).to eq(correction_time)
         end
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Test Category 8: Surgical Record Accounting
+  # ==========================================================================
+  # Verify that `correct` only closes and recreates records that overlap the
+  # correction range. Records fully after the correction are left untouched.
+  # ==========================================================================
+
+  describe "surgical record accounting" do
+    # Test 8.1: Bounded correction — only overlapping records are closed
+    # -------------------------------------------------------------------------
+    # Setup: A[Jan-Mar], B[Mar-May], C[May-∞]
+    # Action: correct(valid_from: Feb, valid_to: Apr, name: "X")
+    # A and B overlap [Feb, Apr) and are closed. C is fully after and untouched.
+    # -------------------------------------------------------------------------
+    context "bounded correction only closes overlapping records" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
+        end
+      end
+
+      it "closes only A and B, leaves C untouched" do
+        employee = Employee.find(@employee.id)
+        correction_time = "2020/10/06".in_time_zone
+
+        Timecop.freeze(correction_time) do
+          employee.correct(valid_from: _02_01, valid_to: _04_01, name: "X")
+        end
+
+        closed_by_correction = Employee.ignore_valid_datetime
+          .within_deleted
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: correction_time)
+
+        expect(closed_by_correction.count).to eq(2)
+
+        current_records = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .order(:valid_from)
+
+        # A'[Jan-Feb], X[Feb-Apr], B'[Apr-May] have transaction_from = correction_time
+        modified = current_records.select { |r| r.name != "C" }
+        modified.each { |r| expect(r.transaction_from).to eq(correction_time) }
+
+        # C retains original transaction_from (untouched)
+        untouched_c = current_records.find { |r| r.name == "C" }
+        expect(untouched_c.transaction_from).not_to eq(correction_time)
+      end
+    end
+
+    # Test 8.2: Unbounded correction — only containing record is closed
+    # -------------------------------------------------------------------------
+    # Setup: A[Jan-Mar], B[Mar-May], C[May-∞]
+    # Action: correct(valid_from: Feb, name: "X") (no valid_to)
+    # Unbounded correction ends at A's valid_to (Mar). Only A is closed.
+    # -------------------------------------------------------------------------
+    context "unbounded correction only closes containing record" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
+        end
+      end
+
+      it "closes only A, leaves B and C untouched" do
+        employee = Employee.find(@employee.id)
+        correction_time = "2020/10/06".in_time_zone
+
+        Timecop.freeze(correction_time) do
+          employee.correct(valid_from: _02_01, name: "X")
+        end
+
+        closed_by_correction = Employee.ignore_valid_datetime
+          .within_deleted
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: correction_time)
+
+        expect(closed_by_correction.count).to eq(1)
+
+        current_records = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .order(:valid_from)
+
+        # A'[Jan-Feb] and X[Feb-Mar] have transaction_from = correction_time
+        modified = current_records.select { |r| r.transaction_from == correction_time }
+        expect(modified.map(&:name)).to match_array(["A", "X"])
+
+        # B and C retain original transaction_from (untouched)
+        untouched = current_records.select { |r| r.transaction_from != correction_time }
+        expect(untouched.map(&:name)).to match_array(["B", "C"])
+      end
+    end
+
+    # Test 8.3: Consumed middle record — closed without replacement
+    # -------------------------------------------------------------------------
+    # Setup: A[Jan-Feb], B[Feb-Apr], C[Apr-∞]
+    # Action: correct(valid_from: Feb, valid_to: Apr, name: "X")
+    # B is exactly consumed by the correction. A and C are untouched.
+    # -------------------------------------------------------------------------
+    context "consumed middle record is closed without replacement" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A", valid_to: _02_01) }
+          Employee.create!(
+            bitemporal_id: @employee.bitemporal_id,
+            name: "B",
+            valid_from: _02_01,
+            valid_to: _04_01
+          )
+          Employee.create!(
+            bitemporal_id: @employee.bitemporal_id,
+            name: "C",
+            valid_from: _04_01
+          )
+        end
+      end
+
+      it "closes only B, leaves A and C untouched" do
+        employee = Employee.find(@employee.id)
+        correction_time = "2020/10/06".in_time_zone
+
+        Timecop.freeze(correction_time) do
+          employee.correct(valid_from: _02_01, valid_to: _04_01, name: "X")
+        end
+
+        closed_by_correction = Employee.ignore_valid_datetime
+          .within_deleted
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: correction_time)
+
+        expect(closed_by_correction.count).to eq(1)
+
+        current_records = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .order(:valid_from)
+
+        # X[Feb-Apr] has transaction_from = correction_time
+        expect(current_records.find { |r| r.name == "X" }.transaction_from).to eq(correction_time)
+
+        # A and C retain original transaction_from (untouched)
+        untouched = current_records.select { |r| ["A", "C"].include?(r.name) }
+        untouched.each { |r| expect(r.transaction_from).not_to eq(correction_time) }
       end
     end
   end
