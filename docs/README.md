@@ -325,6 +325,7 @@ This is the safest option when you only need to correct a specific error without
 | `force_update` | Fix data error, overwrite timeline | ❌ No | Yes |
 | `correct` | Fix historical error | ✅ Yes (CASCADE) | Yes |
 | `shift_genesis` | Change when entity's timeline begins | ✅ Yes (untouched) | No (purely temporal) |
+| `terminate` | End entity's timeline at a specific date | ✅ Yes (before termination point) | No (purely temporal) |
 
 ### Example: Correcting a Salary Error
 
@@ -476,6 +477,177 @@ end
 # Current knowledge now includes February:
 Employee.find_at_time(feb_1, employee.id)
 # => #<Employee name: "Alice">
+```
+
+---
+
+## Terminating a Timeline
+
+The `terminate` method sets a finite end date on an entity's valid-time timeline. Unlike `destroy` (which operates on **transaction time** to mark a record as "no longer current knowledge"), `terminate` operates on **valid time** to say "this entity stopped being valid at this date."
+
+### When to Use `terminate`
+
+Use `terminate` when an entity has a real-world end date, but you want to preserve the full history for auditing and time-travel queries:
+
+```ruby
+# Scenario: An employee's contract ends on March 1.
+# Their timeline has: HR (Jan) → Engineering (Feb) → ...
+#
+# destroy() would mark the record as deleted in transaction time,
+# losing the ability to query "what department were they in on Feb 15?"
+#
+# terminate() preserves the full history up to the end date:
+employee.terminate(termination_time: Date.new(2024, 3, 1))
+# Timeline is now: HR (Jan-Feb) → Engineering (Feb-Mar)
+# Queries for dates before March still work perfectly.
+```
+
+### Terminate vs Destroy
+
+| Aspect | `terminate` | `destroy` |
+|--------|------------|-----------|
+| **Time dimension** | Valid time (`valid_to`) | Transaction time (`transaction_to`) |
+| **Meaning** | "Entity stopped being valid at date X" | "We no longer know about this entity" |
+| **Historical queries** | ✅ `find_at_time` still works for dates before termination | ❌ Record is logically deleted |
+| **Reversible?** | ✅ `cancel_termination` restores full pre-termination timeline | Requires manual recreation |
+| **What changes** | Last segment's `valid_to` is set to termination date; segments after are removed | Record's `transaction_to` is set to deletion time |
+
+### Basic Termination
+
+```ruby
+# Before:
+#   Alice           Bob            Carol
+#   |---------------|--------------|----------->
+#   Jan            Mar            May            ∞
+
+employee.terminate(termination_time: apr_1)
+
+# After:
+#   Alice           Bob
+#   |---------------|------|
+#   Jan            Mar    Apr
+```
+
+**What happens:**
+1. Segments entirely before the termination point are **untouched** (Alice)
+2. A segment spanning the termination point is **truncated** (Bob's `valid_to` set to Apr)
+3. Segments entirely after the termination point are **removed** (Carol)
+4. All changes are wrapped in a transaction with row-level locking
+
+### Cancel Termination
+
+`cancel_termination` fully reverses a termination by searching backward through transaction history to find the pre-termination state and restoring it:
+
+```ruby
+# Before (terminated):
+#   Alice           Bob
+#   |---------------|------|
+#   Jan            Mar    Apr
+
+employee.cancel_termination
+
+# After (restored):
+#   Alice           Bob            Carol
+#   |---------------|--------------|----------->
+#   Jan            Mar            May            ∞
+```
+
+This recovers **all** segments that were removed during termination, including segments that were entirely past the termination point. The recovery uses the transaction history — no data is ever lost.
+
+Cancel is a no-op if the entity is not currently terminated (returns `true`, no DB changes).
+
+### Checking Termination Status
+
+The `terminated?` predicate checks whether the entity's last segment has a finite `valid_to`:
+
+```ruby
+employee.terminated?
+# => false (timeline extends to infinity)
+
+employee.terminate(termination_time: mar_1)
+employee.terminated?
+# => true (timeline ends at March)
+
+employee.cancel_termination
+employee.terminated?
+# => false (timeline restored to infinity)
+```
+
+This queries the current timeline regardless of which segment `self` points to — it always checks the **last** segment.
+
+### Composing with Other Operations
+
+Terminate composes naturally with `correct` and `shift_genesis`:
+
+```ruby
+# Correct within a terminated range — works normally:
+employee.terminate(termination_time: may_1)
+employee.correct(valid_from: feb_1, valid_to: mar_1, name: "X")
+# Result: A (Jan-Feb) → X (Feb-Mar) → B (Mar-May)
+
+# Shift genesis backward — preserves termination date:
+employee.terminate(termination_time: may_1)
+employee.shift_genesis(new_valid_from: earlier_date)
+# Result: Timeline starts earlier, still ends at May
+
+# Correct beyond termination — raises error:
+employee.terminate(termination_time: mar_1)
+employee.correct(valid_from: may_1, name: "X")
+# => ActiveRecord::RecordNotFound (no record exists at May)
+```
+
+### Re-Termination
+
+You can re-terminate at an **earlier** point without canceling first:
+
+```ruby
+# Currently terminated at May
+employee.terminate(termination_time: mar_1)  # Further truncates to March
+```
+
+To re-terminate at a **later** point, you must cancel first then re-terminate:
+
+```ruby
+employee.cancel_termination
+employee.terminate(termination_time: jul_1)
+```
+
+### Error Handling
+
+```ruby
+# Termination time must be after the first segment's start
+employee.terminate(termination_time: Date.new(1900, 1, 1))
+# => ArgumentError: termination_time must be greater than first valid_from
+
+# Cannot extend past current termination (use cancel_termination first)
+employee.terminate(termination_time: later_date)
+# => ArgumentError: termination_time exceeds last segment's valid_to
+
+# Entity must have current-knowledge records
+Employee.new(bitemporal_id: 99999).terminate(termination_time: mar_1)
+# => ActiveRecord::RecordNotFound
+
+# Already terminated at the same time — no-op (returns true)
+employee.terminate(termination_time: mar_1)  # first time
+employee.terminate(termination_time: mar_1)  # no-op, returns true
+```
+
+### Audit Trail
+
+Like all bitemporal operations, termination preserves full transaction history:
+
+```ruby
+# After terminating at March:
+ActiveRecord::Bitemporal.transaction_at(before_termination_time) do
+  ActiveRecord::Bitemporal.valid_at(may_1) do
+    Employee.find(employee.id)
+    # => #<Employee name: "Carol"> (before termination, May was valid)
+  end
+end
+
+# Current knowledge sees the terminated state:
+Employee.find_at_time(may_1, employee.id)
+# => nil (after termination, May is no longer valid)
 ```
 
 ---
@@ -848,6 +1020,9 @@ position.valid_at(3.days.ago) { |p| p.update!(rate: 200) }  # Backdated change
 position.force_update { |p| p.update(rate: 200) }  # Correction (not temporal)
 position.correct(valid_from: feb_1, name: "X")    # Retroactive correction (preserves cascade)
 position.shift_genesis(new_valid_from: jan_1)      # Change when timeline begins
+position.terminate(termination_time: mar_1)        # End timeline at specific date
+position.cancel_termination                        # Reverse termination (full history recovery)
+position.terminated?                               # Check if timeline has finite end
 
 # Queries
 Position.all                                  # Current records only
