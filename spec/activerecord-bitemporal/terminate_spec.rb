@@ -45,7 +45,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
   end
 
   # Find an employee by bitemporal_id, even if terminated (ignores valid time scoping)
-  def find_employee(record)
+  def find_ignoring_valid_time(record)
     Employee.ignore_valid_datetime
       .where(bitemporal_id: record.bitemporal_id)
       .where(transaction_to: tt_infinity)
@@ -299,12 +299,12 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _03_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _03_01)
         end
       end
 
       it "raises ArgumentError for extending past termination" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
 
         expect {
           Timecop.freeze("2020/10/06") do
@@ -321,12 +321,12 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _03_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _03_01)
         end
       end
 
       it "returns true without DB changes" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
         records_before = all_records(employee).count
 
         Timecop.freeze("2020/10/06") do
@@ -354,7 +354,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _05_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _05_01)
         end
       end
 
@@ -369,7 +369,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
       #         |----|
       #         Jan  Feb
       it "further truncates the already-terminated timeline" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
 
         Timecop.freeze("2020/10/06") do
           employee.terminate(termination_time: _02_01)
@@ -388,12 +388,12 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _03_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _03_01)
         end
       end
 
       it "raises ArgumentError" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
 
         expect {
           Timecop.freeze("2020/10/06") do
@@ -417,7 +417,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _03_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _03_01)
         end
       end
 
@@ -432,7 +432,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
       #         |----------------------------------------->
       #         Jan                                       ∞
       it "restores timeline to infinity" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
 
         Timecop.freeze("2020/10/06") do
           result = employee.cancel_termination
@@ -454,7 +454,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _02_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _02_01)
         end
       end
 
@@ -469,7 +469,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
       #         |-------------|-------------|----------->
       #         Jan          Mar           May          ∞
       it "recovers all removed segments from transaction history" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
 
         Timecop.freeze("2020/10/06") do
           employee.cancel_termination
@@ -599,12 +599,12 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
         end
         @t1 = "2020/10/02".in_time_zone
         Timecop.freeze(@t1) do
-          find_employee(@employee).terminate(termination_time: _03_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _03_01)
         end
       end
 
       it "after cancel, current knowledge extends to infinity again" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
         @t2 = "2020/10/06".in_time_zone
 
         Timecop.freeze(@t2) do
@@ -631,52 +631,48 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
   end
 
   # ==========================================================================
-  # Category 6: Coalescing
+  # Category 6: Timeline Integrity
   # ==========================================================================
 
-  describe "coalescing" do
+  describe "timeline integrity" do
 
-    # Test 6.1: Termination at boundary removes differentiating segment
-    context "termination causes adjacent identical segments to merge" do
+    # Test 6.1: After terminate: no overlaps, no gaps
+    context "after termination" do
       before do
         Timecop.freeze("2020/10/01") do
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
           ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
-          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
         end
       end
 
-      # before: A             B             A
-      #         |-------------|-------------|----------->
-      #         Jan          Mar           May          ∞
-      #
-      # terminate(termination_time: Mar) → removes B and A(May)
-      it "leaves single segment when termination removes all others" do
+      it "maintains no overlaps and no gaps in surviving timeline" do
         employee = Employee.find(@employee.id)
 
         Timecop.freeze("2020/10/06") do
-          employee.terminate(termination_time: _03_01)
+          employee.terminate(termination_time: _04_01)
         end
 
-        expect(current_timeline(employee)).to eq([
-          [_01_01, _03_01, "A"]
-        ])
+        timeline = current_timeline(employee)
+        expect(valid_timeline?(timeline)).to be true
       end
     end
 
-    # Test 6.2: Cancel termination triggers coalesce
-    context "cancel termination restores and coalesces" do
+    # Test 6.2: After cancel: no overlaps, no gaps
+    context "after cancel" do
       before do
         Timecop.freeze("2020/10/01") do
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _03_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _02_01)
         end
       end
 
-      it "restored timeline is valid after cancel" do
-        employee = find_employee(@employee)
+      it "maintains no overlaps and no gaps in restored timeline" do
+        employee = find_ignoring_valid_time(@employee)
 
         Timecop.freeze("2020/10/06") do
           employee.cancel_termination
@@ -684,6 +680,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
 
         timeline = current_timeline(employee)
         expect(valid_timeline?(timeline)).to be true
+        expect(timeline.size).to eq(3)
         expect(timeline.last[1]).to eq(infinity)
       end
     end
@@ -703,7 +700,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _05_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _05_01)
         end
       end
 
@@ -717,7 +714,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
       #         |----|----|------|
       #         Jan Feb  Mar   May
       it "works within surviving range" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
 
         Timecop.freeze("2020/10/06") do
           employee.correct(valid_from: _02_01, valid_to: _03_01, name: "X")
@@ -738,12 +735,12 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _03_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _03_01)
         end
       end
 
       it "raises RecordNotFound for correction past termination" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
 
         expect {
           Timecop.freeze("2020/10/06") do
@@ -760,7 +757,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_03_01) { @employee = Employee.create!(name: "A") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _05_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _05_01)
         end
       end
 
@@ -774,7 +771,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
       #         |----------------|
       #         Jan             May
       it "extends genesis while preserving termination date" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
 
         Timecop.freeze("2020/10/06") do
           employee.shift_genesis(new_valid_from: _01_01)
@@ -793,12 +790,12 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _03_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _03_01)
         end
       end
 
       it "raises ArgumentError (would erase all segments)" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
 
         expect {
           Timecop.freeze("2020/10/06") do
@@ -845,12 +842,12 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _02_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _02_01)
         end
       end
 
       it "self points to currently-valid segment after cancel" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
 
         Timecop.freeze("2020/10/06") do
           employee.cancel_termination
@@ -890,12 +887,12 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _03_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _03_01)
         end
       end
 
       it "returns true" do
-        employee = find_employee(@employee)
+        employee = find_ignoring_valid_time(@employee)
         expect(employee.terminated?).to be true
       end
     end
@@ -907,10 +904,10 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _03_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _03_01)
         end
         Timecop.freeze("2020/10/03") do
-          find_employee(@employee).cancel_termination
+          find_ignoring_valid_time(@employee).cancel_termination
         end
       end
 
@@ -938,48 +935,52 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
   end
 
   # ==========================================================================
-  # Category 10: Timeline Integrity
+  # Category 10: Coalescing
   # ==========================================================================
 
-  describe "timeline integrity" do
+  describe "coalescing" do
 
-    # Test 10.1: After terminate: no overlaps, no gaps
-    context "after termination" do
+    # Test 10.1: Termination at boundary removes differentiating segment
+    context "termination causes adjacent identical segments to merge" do
       before do
         Timecop.freeze("2020/10/01") do
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
           ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
-          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "A") }
         end
       end
 
-      it "maintains no overlaps and no gaps in surviving timeline" do
+      # before: A             B             A
+      #         |-------------|-------------|----------->
+      #         Jan          Mar           May          ∞
+      #
+      # terminate(termination_time: Mar) → removes B and A(May)
+      it "leaves single segment when termination removes all others" do
         employee = Employee.find(@employee.id)
 
         Timecop.freeze("2020/10/06") do
-          employee.terminate(termination_time: _04_01)
+          employee.terminate(termination_time: _03_01)
         end
 
-        timeline = current_timeline(employee)
-        expect(valid_timeline?(timeline)).to be true
+        expect(current_timeline(employee)).to eq([
+          [_01_01, _03_01, "A"]
+        ])
       end
     end
 
-    # Test 10.2: After cancel: no overlaps, no gaps
-    context "after cancel" do
+    # Test 10.2: Cancel termination triggers coalesce
+    context "cancel termination restores and coalesces" do
       before do
         Timecop.freeze("2020/10/01") do
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
-          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
-          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
         end
         Timecop.freeze("2020/10/02") do
-          find_employee(@employee).terminate(termination_time: _02_01)
+          find_ignoring_valid_time(@employee).terminate(termination_time: _03_01)
         end
       end
 
-      it "maintains no overlaps and no gaps in restored timeline" do
-        employee = find_employee(@employee)
+      it "restored timeline is valid after cancel" do
+        employee = find_ignoring_valid_time(@employee)
 
         Timecop.freeze("2020/10/06") do
           employee.cancel_termination
@@ -987,8 +988,217 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
 
         timeline = current_timeline(employee)
         expect(valid_timeline?(timeline)).to be true
-        expect(timeline.size).to eq(3)
         expect(timeline.last[1]).to eq(infinity)
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Category 11: Concurrency
+  # ==========================================================================
+
+  describe "concurrency" do
+
+    # Test 11.1: Two threads terminate same entity at same time
+    context "two threads terminate same entity simultaneously", use_truncation: true do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+        end
+      end
+
+      it "both succeed via locking serialization" do
+        employee_id = @employee.bitemporal_id
+        errors = []
+
+        threads = 2.times.map do
+          Thread.new do
+            # Both threads terminate at the same point — the second thread
+            # will see the already-terminated state and no-op.
+            Employee.find(employee_id).terminate(termination_time: _05_01)
+          rescue => e
+            errors << e
+          end
+        end
+
+        threads.each(&:join)
+
+        expect(errors).to be_empty
+
+        # Timeline should be consistent
+        timeline = current_timeline(@employee)
+        expect(valid_timeline?(timeline)).to be true
+        expect(timeline.last[1]).to eq(_05_01)
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Category 12: Transaction & Record Accounting
+  # ==========================================================================
+
+  describe "transaction & record accounting" do
+
+    # Test 12.1: Termination closes only affected records, creates truncated copy
+    context "termination record accounting" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
+        end
+      end
+
+      it "closes affected records, leaves earlier untouched" do
+        employee = Employee.find(@employee.id)
+        termination_time = "2020/10/06".in_time_zone
+
+        Timecop.freeze(termination_time) do
+          employee.terminate(termination_time: _04_01)
+        end
+
+        # Records closed at termination_time: B (spans termination) and C (fully after)
+        closed_by_termination = Employee.ignore_valid_datetime
+          .within_deleted
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: termination_time)
+        expect(closed_by_termination.count).to eq(2)
+        closed_names = closed_by_termination.pluck(:name).sort
+        expect(closed_names).to eq(["B", "C"])
+
+        # A record should be untouched (transaction_from unchanged)
+        a_record = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .where(name: "A").first
+        expect(a_record.transaction_from).not_to eq(termination_time)
+      end
+    end
+
+    # Test 12.2: Transaction rollback on failure
+    context "rollback on failure" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+        end
+      end
+
+      it "rolls back all changes on failure" do
+        employee = Employee.find(@employee.id)
+        original_timeline = current_timeline(employee)
+
+        # Force a failure by making save_without_bitemporal_callbacks! raise
+        call_count = 0
+        allow_any_instance_of(Employee).to receive(:save_without_bitemporal_callbacks!).and_wrap_original do |method, *args, **kwargs|
+          call_count += 1
+          if call_count >= 1
+            raise ActiveRecord::RecordInvalid.new(Employee.new)
+          end
+          method.call(*args, **kwargs)
+        end
+
+        expect {
+          employee.terminate(termination_time: _02_01)
+        }.to raise_error(ActiveRecord::RecordInvalid)
+
+        # Timeline should be unchanged (transaction rolled back)
+        expect(current_timeline(employee)).to eq(original_timeline)
+      end
+    end
+
+    # Test 12.3: Multi-entity isolation
+    context "multi-entity isolation" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee1 = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee2 = Employee.create!(name: "B") }
+        end
+      end
+
+      it "only affects the targeted entity" do
+        employee1 = Employee.find(@employee1.id)
+        employee2_timeline_before = current_timeline(@employee2)
+
+        Timecop.freeze("2020/10/06") do
+          employee1.terminate(termination_time: _03_01)
+        end
+
+        # Employee1 should be terminated
+        expect(current_timeline(employee1)).to eq([
+          [_01_01, _03_01, "A"]
+        ])
+
+        # Employee2 should be unchanged
+        expect(current_timeline(@employee2)).to eq(employee2_timeline_before)
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Category 13: Timestamp Behavior
+  # ==========================================================================
+
+  describe "timestamp behavior" do
+
+    # Test 13.1: created_at on termination records
+    context "created_at on termination records" do
+      before do
+        @creation_time = "2020/10/01 12:00:00".in_time_zone
+        Timecop.freeze(@creation_time) do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+        end
+      end
+
+      it "sets created_at to termination time on truncated record" do
+        employee = Employee.find(@employee.id)
+        @termination_time = "2020/10/06 15:30:00".in_time_zone
+
+        Timecop.freeze(@termination_time) do
+          employee.terminate(termination_time: _03_01)
+        end
+
+        # The truncated record (new copy with valid_to = Mar) should have
+        # created_at = termination_time
+        truncated_record = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .where(valid_to: _03_01)
+          .first
+
+        expect(truncated_record.created_at).to eq(@termination_time)
+      end
+    end
+
+    # Test 13.2: updated_at on cancel records
+    context "updated_at on cancel records" do
+      before do
+        @creation_time = "2020/10/01 12:00:00".in_time_zone
+        Timecop.freeze(@creation_time) do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+        end
+        @termination_time = "2020/10/02 12:00:00".in_time_zone
+        Timecop.freeze(@termination_time) do
+          find_ignoring_valid_time(@employee).terminate(termination_time: _03_01)
+        end
+      end
+
+      it "sets updated_at to cancel time on restored records" do
+        employee = find_ignoring_valid_time(@employee)
+        @cancel_time = "2020/10/06 15:30:00".in_time_zone
+
+        Timecop.freeze(@cancel_time) do
+          employee.cancel_termination
+        end
+
+        current_records = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+
+        current_records.each do |record|
+          expect(record.updated_at).to eq(@cancel_time)
+        end
       end
     end
   end
