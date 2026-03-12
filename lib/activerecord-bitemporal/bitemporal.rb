@@ -813,39 +813,32 @@ module ActiveRecord
           # 6. No-op: already terminated at this exact time
           return true if termination_time == last_segment[valid_to_key]
 
-          # 7. Guard: re-termination later requires cancel first
-          if last_segment[valid_to_key] < ActiveRecord::Bitemporal::DEFAULT_VALID_TO &&
-             termination_time > last_segment[valid_to_key]
-            raise ArgumentError,
-              "cannot re-terminate later (#{termination_time} > current termination " \
-              "#{last_segment[valid_to_key]}). Use cancel_termination first, then re-terminate."
-          end
-
-          # 8. Build records to close and new records
+          # 7. Build records to close and new records
           records_to_close, new_records = build_termination_records(segments, termination_time, current_time)
 
-          # 9. Close old records FIRST (critical ordering)
+          # 8. Close old records FIRST (critical ordering)
           records_to_close.each do |record|
             record.update_transaction_to(current_time)
           end
 
-          # 10. Insert new records
+          # 9. Insert new records
           new_records.each do |record|
             record.save_without_bitemporal_callbacks!(validate: false)
           end
 
-          # 11. Coalesce adjacent identical segments
+          # 10. Coalesce adjacent identical segments
           coalesce_adjacent_segments!(current_time)
 
-          # 12. Validate post-hoc
+          # 11. Validate post-hoc
           validate_cascade_correction_timeline!
 
-          # 13. Update self to point at the currently-valid or last record
+          # 12. Update self to point at the currently-valid or last record
           all_current = find_all_current_knowledge_segments
           current_record = all_current.find { |r|
             r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
           } || all_current.last
 
+          @_swapped_id_previously_was = swapped_id
           @_swapped_id = current_record.swapped_id
           self[valid_from_key] = current_record[valid_from_key]
           self[valid_to_key] = current_record[valid_to_key]
@@ -915,6 +908,7 @@ module ActiveRecord
             r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
           } || all_current.last
 
+          @_swapped_id_previously_was = swapped_id
           @_swapped_id = current_record.swapped_id
           self[valid_from_key] = current_record[valid_from_key]
           self[valid_to_key] = current_record[valid_to_key]
