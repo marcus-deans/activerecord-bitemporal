@@ -317,6 +317,51 @@ module ActiveRecord
           _shift_genesis_record(new_valid_from: new_valid_from)
         end
 
+        # Terminate: Set a finite end date for the entity's timeline (right edge)
+        #
+        # Unlike destroy (which operates on transaction time), this truncates the
+        # valid-time timeline. Segments beyond termination_time are removed; a
+        # segment spanning the boundary is truncated.
+        #
+        # Raises ActiveRecord::RecordNotFound if no current-knowledge records exist.
+        # Raises ArgumentError if termination_time <= first valid_from or > last valid_to.
+        # Re-terminating earlier works; re-terminating later requires cancel_termination first.
+        #
+        # @param termination_time [Time, Date, String] When the entity stops being valid
+        # @return [Boolean] true if successful
+        def terminate(termination_time:)
+          termination_time = termination_time.in_time_zone if termination_time.respond_to?(:in_time_zone)
+          _terminate_record(termination_time: termination_time)
+        end
+
+        # Cancel Termination: Full reversal via transaction history
+        #
+        # Restores the complete pre-termination timeline by searching backward
+        # through transaction history. Recovers ALL segments that were removed
+        # during termination.
+        #
+        # No-op if entity is not currently terminated.
+        # Raises ActiveRecord::RecordNotFound if no current-knowledge records exist.
+        #
+        # @return [Boolean] true if successful
+        def cancel_termination
+          _cancel_termination_record
+        end
+
+        # Predicate: Is this entity's timeline terminated (finite end)?
+        #
+        # @return [Boolean] true if last segment's valid_to < DEFAULT_VALID_TO
+        def terminated?
+          last_segment = self.class
+            .where(bitemporal_id: bitemporal_id)
+            .ignore_valid_datetime
+            .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+            .order(valid_from_key => :desc)
+            .first
+          return false if last_segment.nil?
+          last_segment[valid_to_key] < ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+        end
+
         def correcting?
           bitemporal_option[:correcting].present?
         end
@@ -726,6 +771,215 @@ module ActiveRecord
         end
 
         [records_to_close, new_records]
+      end
+
+      # Terminate: Main implementation
+      def _terminate_record(termination_time:)
+        current_time = Time.current
+
+        ActiveRecord::Base.transaction(requires_new: true) do
+          # 1. Lock all records for this entity
+          self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
+
+          # 2. Fetch all current-knowledge segments
+          segments = find_all_current_knowledge_segments
+
+          # 3. Guard: entity must exist
+          if segments.empty?
+            raise ActiveRecord::RecordNotFound.new(
+              "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
+              "(no current-knowledge records)",
+              self.class, "bitemporal_id", bitemporal_id
+            )
+          end
+
+          first_segment = segments.first
+          last_segment = segments.last
+
+          # 4. Guard: termination_time must be after timeline start
+          if termination_time <= first_segment[valid_from_key]
+            raise ArgumentError,
+              "termination_time (#{termination_time}) must be greater than " \
+              "first segment valid_from (#{first_segment[valid_from_key]})"
+          end
+
+          # 5. Guard: termination_time must not exceed timeline end
+          if termination_time > last_segment[valid_to_key]
+            raise ArgumentError,
+              "termination_time (#{termination_time}) exceeds last segment " \
+              "valid_to (#{last_segment[valid_to_key]})"
+          end
+
+          # 6. No-op: already terminated at this exact time
+          return true if termination_time == last_segment[valid_to_key]
+
+          # 7. Guard: re-termination later requires cancel first
+          if last_segment[valid_to_key] < ActiveRecord::Bitemporal::DEFAULT_VALID_TO &&
+             termination_time > last_segment[valid_to_key]
+            raise ArgumentError,
+              "cannot re-terminate later (#{termination_time} > current termination " \
+              "#{last_segment[valid_to_key]}). Use cancel_termination first, then re-terminate."
+          end
+
+          # 8. Build records to close and new records
+          records_to_close, new_records = build_termination_records(segments, termination_time, current_time)
+
+          # 9. Close old records FIRST (critical ordering)
+          records_to_close.each do |record|
+            record.update_transaction_to(current_time)
+          end
+
+          # 10. Insert new records
+          new_records.each do |record|
+            record.save_without_bitemporal_callbacks!(validate: false)
+          end
+
+          # 11. Coalesce adjacent identical segments
+          coalesce_adjacent_segments!(current_time)
+
+          # 12. Validate post-hoc
+          validate_cascade_correction_timeline!
+
+          # 13. Update self to point at the currently-valid or last record
+          all_current = find_all_current_knowledge_segments
+          current_record = all_current.find { |r|
+            r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
+          } || all_current.last
+
+          @_swapped_id = current_record.swapped_id
+          self[valid_from_key] = current_record[valid_from_key]
+          self[valid_to_key] = current_record[valid_to_key]
+          self.transaction_from = current_record.transaction_from
+          self.transaction_to = current_record.transaction_to
+
+          true
+        end
+      end
+
+      # Cancel Termination: Main implementation
+      def _cancel_termination_record
+        current_time = Time.current
+
+        ActiveRecord::Base.transaction(requires_new: true) do
+          # 1. Lock all records for this entity
+          self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
+
+          # 2. Fetch all current-knowledge segments
+          segments = find_all_current_knowledge_segments
+
+          # 3. Guard: entity must exist
+          if segments.empty?
+            raise ActiveRecord::RecordNotFound.new(
+              "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
+              "(no current-knowledge records)",
+              self.class, "bitemporal_id", bitemporal_id
+            )
+          end
+
+          # 4. No-op: not terminated (last segment extends to infinity)
+          return true if segments.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+
+          # 5. Find pre-termination state via transaction history
+          pre_termination_state = find_pre_termination_state
+          if pre_termination_state.nil?
+            raise "Cannot determine pre-termination state for #{self.class} " \
+                  "with bitemporal_id=#{bitemporal_id}"
+          end
+
+          # 6. Close ALL current segments
+          segments.each do |record|
+            record.update_transaction_to(current_time)
+          end
+
+          # 7. Recreate pre-termination segments with new transaction_from
+          #    Must clear deleted_at because historical records have it set (via update_transaction_to),
+          #    and bitemporal_assign_initialize_value would use it to overwrite transaction_to during save.
+          pre_termination_state.each do |old_record|
+            new_record = old_record.dup
+            new_record.id = nil
+            new_record.transaction_from = current_time
+            new_record.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
+            new_record.deleted_at = nil if new_record.class.column_names.include?("deleted_at")
+            new_record.save_without_bitemporal_callbacks!(validate: false)
+          end
+
+          # 8. Coalesce adjacent identical segments
+          coalesce_adjacent_segments!(current_time)
+
+          # 9. Validate post-hoc
+          validate_cascade_correction_timeline!
+
+          # 10. Update self to point at the currently-valid or last record
+          all_current = find_all_current_knowledge_segments
+          current_record = all_current.find { |r|
+            r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
+          } || all_current.last
+
+          @_swapped_id = current_record.swapped_id
+          self[valid_from_key] = current_record[valid_from_key]
+          self[valid_to_key] = current_record[valid_to_key]
+          self.transaction_from = current_record.transaction_from
+          self.transaction_to = current_record.transaction_to
+
+          true
+        end
+      end
+
+      def build_termination_records(segments, termination_time, current_time)
+        records_to_close = []
+        new_records = []
+
+        segments.each do |segment|
+          if segment[valid_to_key] <= termination_time
+            # Entirely before termination — UNTOUCHED
+            next
+          elsif segment[valid_from_key] < termination_time
+            # Spans boundary — CLOSE + truncated copy
+            records_to_close << segment
+
+            truncated = segment.dup
+            truncated.id = nil
+            truncated[valid_to_key] = termination_time
+            truncated.transaction_from = current_time
+            truncated.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
+            new_records << truncated
+          else
+            # segment.valid_from >= termination_time — entirely after — CLOSE, no replacement
+            records_to_close << segment
+          end
+        end
+
+        [records_to_close, new_records]
+      end
+
+      def find_pre_termination_state
+        change_points = self.class
+          .where(bitemporal_id: bitemporal_id)
+          .ignore_valid_datetime
+          .within_deleted
+          .where.not(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+          .distinct.pluck(:transaction_to)
+          .sort.reverse
+
+        change_points.each do |cp|
+          state = self.class
+            .where(bitemporal_id: bitemporal_id)
+            .ignore_valid_datetime
+            .within_deleted
+            .where(self.class.arel_table[:transaction_from].lt(cp))
+            .where(self.class.arel_table[:transaction_to].gteq(cp))
+            .order(valid_from_key => :asc)
+            .to_a
+            .each { |r|
+              r.id = r.swapped_id
+              r.clear_changes_information
+            }
+
+          next if state.empty?
+          return state if state.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+        end
+
+        nil
       end
 
       def find_affected_records_for_correction(correction_valid_from)
