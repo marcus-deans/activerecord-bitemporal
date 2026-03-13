@@ -6,4 +6,6 @@ module ActiveRecord::Bitemporal
   class ValidDatetimeRangeError < BitemporalError; end
 
   class PreTerminationStateNotFoundError < BitemporalError; end
+
+  class PreShiftGenesisStateNotFoundError < BitemporalError; end
 end
