@@ -614,6 +614,26 @@ module ActiveRecord
           # 2. Determine effective valid_to (for unbounded corrections)
           effective_valid_to = valid_to || determine_correction_end(valid_from, affected_records)
 
+          # Guard: correction must not extend past the entity's timeline end
+          #
+          # A terminated (or shift-genesis-truncated) entity has a finite valid_to on
+          # its last segment. Allowing a bounded correction to specify a valid_to
+          # beyond that point would silently "un-terminate" the entity — extending
+          # its lifetime without going through cancel_termination.
+          #
+          #   Timeline:  |---A---|---B---|  (terminated at T)
+          #   Correction:        |---X-------->|  ← valid_to past T — REJECTED
+          #
+          # Unbounded corrections (no explicit valid_to) are safe — they inherit the
+          # containing record's valid_to, which already respects the timeline boundary.
+          all_segments = find_all_current_knowledge_segments
+          timeline_end = all_segments.last[valid_to_key]
+          if effective_valid_to > timeline_end
+            raise ActiveRecord::Bitemporal::ValidDatetimeRangeError,
+              "correction valid_to (#{effective_valid_to}) exceeds timeline end " \
+              "(#{timeline_end}). Cancel termination first to extend the timeline."
+          end
+
           # 3. Build the new timeline
           records_to_close, new_timeline = bitemporal_build_cascade_correction_records(
             affected_records: affected_records,
@@ -646,6 +666,7 @@ module ActiveRecord
             r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
           } || all_current.last
 
+          @_swapped_id_previously_was = swapped_id
           @_swapped_id = current_record.swapped_id
           self[valid_from_key] = current_record[valid_from_key]
           self[valid_to_key] = current_record[valid_to_key]
@@ -717,6 +738,7 @@ module ActiveRecord
             r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
           } || all_current.last
 
+          @_swapped_id_previously_was = swapped_id
           @_swapped_id = current_record.swapped_id
           self[valid_from_key] = current_record[valid_from_key]
           self[valid_to_key] = current_record[valid_to_key]
