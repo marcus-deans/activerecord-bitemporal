@@ -317,15 +317,15 @@ employee.correct(valid_from: feb_1, name: "X")  # No valid_to!
 
 This is the safest option when you only need to correct a specific error without affecting the entire future timeline.
 
-### Comparison: `update` vs `force_update` vs `correct` vs `shift_genesis`
+### Comparison: `update` vs `force_update` vs `correct` vs `shift_genesis` vs `terminate`
 
-| Method | Purpose | Preserves Future Changes | Changes Attributes |
-|--------|---------|--------------------------|-------------------|
-| `update` | Record a change happening now | N/A (operates at current time) | Yes |
-| `force_update` | Fix data error, overwrite timeline | ❌ No | Yes |
-| `correct` | Fix historical error | ✅ Yes (CASCADE) | Yes |
-| `shift_genesis` | Change when entity's timeline begins | ✅ Yes (untouched) | No (purely temporal) |
-| `terminate` | End entity's timeline at a specific date | ✅ Yes (before termination point) | No (purely temporal) |
+| Method | Purpose | Preserves Future Changes | Changes Attributes | Undo Method |
+|--------|---------|--------------------------|-------------------|-------------|
+| `update` | Record a change happening now | N/A (operates at current time) | Yes | — |
+| `force_update` | Fix data error, overwrite timeline | ❌ No | Yes | — |
+| `correct` | Fix historical error | ✅ Yes (CASCADE) | Yes | — |
+| `shift_genesis` | Change when entity's timeline begins | ✅ Yes (untouched) | No (purely temporal) | `cancel_shift_genesis` |
+| `terminate` | End entity's timeline at a specific date | ✅ Yes (before termination point) | No (purely temporal) | `cancel_termination` |
 
 ### Example: Correcting a Salary Error
 
@@ -587,15 +587,26 @@ employee.terminate(termination_time: may_1)
 employee.correct(valid_from: feb_1, valid_to: mar_1, name: "X")
 # Result: A (Jan-Feb) → X (Feb-Mar) → B (Mar-May)
 
+# Unbounded correction — safe, inherits terminated boundary:
+employee.terminate(termination_time: may_1)
+employee.correct(valid_from: feb_1, name: "X")
+# Result: Correction bounded by next change point, within terminated range
+
 # Shift genesis backward — preserves termination date:
 employee.terminate(termination_time: may_1)
 employee.shift_genesis(new_valid_from: earlier_date)
 # Result: Timeline starts earlier, still ends at May
 
-# Correct beyond termination — raises error:
+# Correct beyond termination (valid_from) — raises error:
 employee.terminate(termination_time: mar_1)
 employee.correct(valid_from: may_1, name: "X")
 # => ActiveRecord::RecordNotFound (no record exists at May)
+
+# Bounded correction past termination (valid_to) — raises error:
+employee.terminate(termination_time: may_1)
+employee.correct(valid_from: feb_1, valid_to: jul_1, name: "X")
+# => ActiveRecord::Bitemporal::ValidDatetimeRangeError
+# (correction valid_to exceeds timeline end — cancel termination first)
 ```
 
 ### Re-Termination
