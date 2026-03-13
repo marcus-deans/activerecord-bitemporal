@@ -8,11 +8,12 @@ This document covers the internal architecture and implementation details of the
 2. [Database Schema](#database-schema)
 3. [Update Mechanism](#update-mechanism)
 4. [Correction Mechanism](#correction-mechanism)
-5. [Uniqueness Validation](#uniqueness-validation)
-6. [ID Swapping Mechanism](#id-swapping-mechanism)
-7. [Query Scoping](#query-scoping)
-8. [Performance Considerations](#performance-considerations)
-9. [Limitations](#limitations)
+5. [Termination Mechanism](#termination-mechanism)
+6. [Uniqueness Validation](#uniqueness-validation)
+7. [ID Swapping Mechanism](#id-swapping-mechanism)
+8. [Query Scoping](#query-scoping)
+9. [Performance Considerations](#performance-considerations)
+10. [Limitations](#limitations)
 
 ---
 
@@ -39,6 +40,12 @@ ActiveRecord::Bitemporal
 | `bitemporal_build_update_records` | Line 641 | Builds before/after for updates |
 | `bitemporal_build_cascade_correction_records` | Line 567 | Builds new timeline for corrections |
 | `scope_relation` | Line 724 | Uniqueness validation scoping |
+| `terminate` | Line ~332 | Public API for timeline termination |
+| `_terminate_record` | Line ~777 | Main termination implementation |
+| `cancel_termination` | Line ~340 | Public API for termination reversal |
+| `_cancel_termination_record` | Line ~852 | Main cancel implementation |
+| `build_termination_records` | Line ~922 | Builds truncated timeline for termination |
+| `find_pre_termination_state` | Line ~952 | Searches transaction history for pre-termination state |
 
 ### Bitemporal Invariant
 
@@ -233,6 +240,106 @@ After:  A    X         B             C
 ### Attribute Inheritance
 
 When correcting with only some attributes, non-corrected attributes are inherited from the **containing record at valid_from**, not from `self` (which may be a different time period).
+
+---
+
+## Termination Mechanism
+
+### Overview
+
+The `#terminate` method sets a finite end date on an entity's valid-time timeline. Unlike `destroy` (which closes `transaction_to` to say "we no longer know about this"), `terminate` modifies `valid_to` to say "this entity stopped being valid at this date." The `#cancel_termination` method fully reverses a termination by recovering the pre-termination state from transaction history.
+
+Both methods are whole-timeline operations — they fetch all current-knowledge segments for the entity and operate on them atomically, similar to `_correct_record` and `_shift_genesis_record`.
+
+### Terminate Algorithm
+
+```
+1. BEGIN TRANSACTION
+2. LOCK all records for the entity (SELECT ... FOR UPDATE)
+3. FETCH all current-knowledge segments (transaction_to = ∞), ordered by valid_from
+4. GUARD: Raise RecordNotFound if no segments exist
+5. GUARD: Raise ArgumentError if termination_time <= first segment's valid_from
+6. GUARD: Raise ArgumentError if termination_time > last segment's valid_to
+7. NO-OP: Return true if last segment's valid_to already equals termination_time
+8. BUILD new timeline:
+   a. Segments entirely before termination_time → keep unchanged
+   b. Segment spanning termination_time → truncate (set valid_to = termination_time)
+   c. Segments entirely at/after termination_time → remove
+9. CLOSE affected old segments (set transaction_to = now)
+10. INSERT new truncated segment (if a segment was split)
+11. COALESCE adjacent identical segments
+12. VALIDATE no overlapping valid times
+13. UPDATE self to point at the last surviving segment
+14. COMMIT TRANSACTION
+```
+
+### Cancel Termination Algorithm
+
+```
+1. BEGIN TRANSACTION
+2. LOCK all records for the entity
+3. FETCH all current-knowledge segments
+4. GUARD: Raise RecordNotFound if no segments exist
+5. NO-OP: Return true if last segment's valid_to = ∞ (not terminated)
+6. FIND pre-termination state:
+   a. Collect all distinct transaction_to values as change points
+   b. Walk backward through change points
+   c. At each point, query the timeline that was current just before that change
+   d. Return the first timeline where the last segment's valid_to = ∞
+7. CLOSE all current segments (set transaction_to = now)
+8. RECREATE pre-termination segments as new records (dup + save)
+   - Clear deleted_at to prevent transaction_to corruption during save
+9. COALESCE adjacent identical segments
+10. VALIDATE no overlapping valid times
+11. UPDATE self to point at the last restored segment
+12. COMMIT TRANSACTION
+```
+
+### Key Implementation Detail: `deleted_at` Corruption
+
+When recreating records from historical state during cancel, `dup` copies the `deleted_at` attribute. During `_create_record`, `bitemporal_assign_initialize_value` checks `changes.key?("deleted_at")` and overwrites `transaction_to` with `deleted_at` if present. This would corrupt the newly created record's `transaction_to`. The fix: explicitly clear `deleted_at = nil` on each duped record before saving.
+
+### Terminate vs Destroy — Time Dimensions
+
+```
+destroy: operates on TRANSACTION TIME
+  Before: record with transaction_to = ∞
+  After:  record with transaction_to = now (logically deleted)
+          + new historical record with valid_to = now
+
+terminate: operates on VALID TIME
+  Before: A              B              C
+          |--------------|--------------|----------->
+          Jan           Mar            May            ∞
+
+  terminate(termination_time: Apr)
+
+  After:  A              B
+          |--------------|------|
+          Jan           Mar    Apr
+          (C is removed, B is truncated)
+```
+
+### Cancel — Full History Recovery
+
+```
+State after terminate(termination_time: Feb):
+  Current knowledge: A
+                     |----|
+                     Jan  Feb
+
+cancel_termination → walks transaction history backward:
+  Before termination, current knowledge was:
+    A              B              C
+    |--------------|--------------|----------->
+    Jan           Mar            May            ∞
+
+State after cancel:
+  Current knowledge: A              B              C
+                     |--------------|--------------|----------->
+                     Jan           Mar            May            ∞
+  (Full pre-termination timeline restored)
+```
 
 ---
 
