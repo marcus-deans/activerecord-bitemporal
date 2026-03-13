@@ -479,6 +479,42 @@ Employee.find_at_time(feb_1, employee.id)
 # => #<Employee name: "Alice">
 ```
 
+### Canceling a Genesis Shift
+
+The `cancel_shift_genesis` method reverses a genesis shift by restoring the complete pre-shift timeline from transaction history:
+
+```ruby
+# Original: Timeline starts in March
+# After shift: Timeline starts in January
+employee.shift_genesis(new_valid_from: jan_1)
+
+# Cancel: Restores timeline to start in March again
+employee.cancel_shift_genesis
+```
+
+**Important:** `cancel_shift_genesis` is a **full undo** — it restores the exact pre-shift state. Any operations performed *after* the shift (such as updates or corrections) are lost. If you need to preserve post-shift changes, consider rebuilding the timeline manually instead of using `cancel_shift_genesis`.
+
+Cancel is a no-op if the entity's genesis has never been shifted (returns `true`, no DB changes).
+
+### Checking Genesis Shift Status
+
+The `shifted_genesis?` predicate checks whether the entity's current genesis differs from its original creation genesis:
+
+```ruby
+employee.shifted_genesis?
+# => false (genesis matches original creation)
+
+employee.shift_genesis(new_valid_from: jan_1)
+employee.shifted_genesis?
+# => true (genesis has been moved)
+
+employee.cancel_shift_genesis
+employee.shifted_genesis?
+# => false (genesis restored to original)
+```
+
+This queries the full transaction history to find the original genesis — it's always accurate regardless of how many shifts have occurred.
+
 ---
 
 ## Terminating a Timeline
@@ -1033,6 +1069,8 @@ position.valid_at(3.days.ago) { |p| p.update!(rate: 200) }  # Backdated change
 position.force_update { |p| p.update(rate: 200) }  # Correction (not temporal)
 position.correct(valid_from: feb_1, name: "X")    # Retroactive correction (preserves cascade)
 position.shift_genesis(new_valid_from: jan_1)      # Change when timeline begins
+position.cancel_shift_genesis                      # Reverse genesis shift (full history recovery)
+position.shifted_genesis?                          # Check if genesis differs from original
 position.terminate(termination_time: mar_1)        # End timeline at specific date
 position.cancel_termination                        # Reverse termination (full history recovery)
 position.terminated?                               # Check if timeline has finite end

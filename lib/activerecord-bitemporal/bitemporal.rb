@@ -368,6 +368,41 @@ module ActiveRecord
           last_valid_to < ActiveRecord::Bitemporal::DEFAULT_VALID_TO
         end
 
+        # Cancel Shift Genesis: Full reversal via transaction history
+        #
+        # Restores the complete pre-shift timeline by searching backward through
+        # transaction history. Recovers ALL segments removed during a forward shift.
+        #
+        # IMPORTANT: This is a full undo — it restores the state from BEFORE the
+        # most recent genesis change. Any operations performed after the shift
+        # (corrections, updates, etc.) are lost.
+        #
+        # No-op if the genesis has never been shifted (matches original creation).
+        #
+        # @raise [ActiveRecord::RecordNotFound] if no current-knowledge records exist
+        # @raise [ActiveRecord::Bitemporal::PreShiftGenesisStateNotFoundError] if
+        #   transaction history cannot determine the pre-shift state
+        # @return [Boolean] true if successful
+        def cancel_shift_genesis
+          _cancel_shift_genesis_record
+        end
+
+        # Predicate: Has this entity's genesis been shifted from its original value?
+        #
+        # @return [Boolean] true if current genesis differs from original creation genesis
+        def shifted_genesis?
+          current_genesis = self.class
+            .where(bitemporal_id: bitemporal_id)
+            .ignore_valid_datetime
+            .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+            .order(valid_from_key => :asc)
+            .pick(valid_from_key)
+          return false if current_genesis.nil?
+
+          original_genesis = find_original_genesis
+          current_genesis != original_genesis
+        end
+
         def correcting?
           bitemporal_option[:correcting].present?
         end
@@ -1000,6 +1035,159 @@ module ActiveRecord
 
           next if state.empty?
           return state if state.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+        end
+
+        nil
+      end
+
+      # Cancel Shift Genesis: Main implementation
+      #
+      # Algorithm mirrors _cancel_termination_record:
+      # 1. Lock → 2. Fetch segments → 3. Guard existence →
+      # 4. No-op if genesis matches original → 5. Find pre-shift state →
+      # 6. Close current → 7. Recreate pre-shift → 8. Coalesce → 9. Validate → 10. Reload self
+      def _cancel_shift_genesis_record
+        current_time = Time.current
+
+        ActiveRecord::Base.transaction(requires_new: true) do
+          # 1. Lock all records for this entity
+          self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
+
+          # 2. Fetch all current-knowledge segments
+          segments = find_all_current_knowledge_segments
+
+          # 3. Guard: entity must exist
+          if segments.empty?
+            raise ActiveRecord::RecordNotFound.new(
+              "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
+              "(no current-knowledge records)",
+              self.class, "bitemporal_id", bitemporal_id
+            )
+          end
+
+          # 4. No-op: genesis matches original (never shifted, or already canceled)
+          current_genesis = segments.first[valid_from_key]
+          original_genesis = find_original_genesis
+          return true if current_genesis == original_genesis
+
+          # 5. Find pre-shift state via transaction history
+          pre_shift_state = find_pre_shift_genesis_state(current_genesis)
+          if pre_shift_state.nil?
+            raise PreShiftGenesisStateNotFoundError,
+              "Cannot determine pre-shift genesis state for #{self.class} " \
+              "with bitemporal_id=#{bitemporal_id}"
+          end
+
+          # 6. Close ALL current segments
+          segments.each do |record|
+            record.update_transaction_to(current_time)
+          end
+
+          # 7. Recreate pre-shift segments with new transaction_from
+          #    Must clear deleted_at because historical records have it set (via update_transaction_to),
+          #    and bitemporal_assign_initialize_value would use it to overwrite transaction_to during save.
+          pre_shift_state.each do |old_record|
+            new_record = old_record.dup
+            new_record.id = nil
+            new_record.transaction_from = current_time
+            new_record.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
+            new_record.deleted_at = nil if new_record.class.column_names.include?("deleted_at")
+            new_record.save_without_bitemporal_callbacks!(validate: false)
+          end
+
+          # 8. Coalesce adjacent identical segments
+          coalesce_adjacent_segments!(current_time)
+
+          # 9. Validate no overlapping valid periods
+          validate_cascade_correction_timeline!
+
+          # 10. Reload self from the restored segment that covers our valid_from
+          all_current = find_all_current_knowledge_segments
+          current_record = all_current.find { |r|
+            r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
+          } || all_current.first
+
+          @_swapped_id_previously_was = swapped_id
+          @_swapped_id = current_record.swapped_id
+          self[valid_from_key] = current_record[valid_from_key]
+          self[valid_to_key] = current_record[valid_to_key]
+          self.transaction_from = current_record.transaction_from
+          self.transaction_to = current_record.transaction_to
+
+          true
+        end
+      end
+
+      # Find the original genesis date — the valid_from of the entity's very first
+      # database record, ordered by transaction_from (creation time).
+      #
+      # This is the "birth date" that was set when the entity was first created.
+      # It never changes even as the entity is updated, corrected, or shifted.
+      #
+      # @return [Time, nil] the original genesis time, or nil if no records exist
+      def find_original_genesis
+        self.class
+          .where(bitemporal_id: bitemporal_id)
+          .ignore_valid_datetime
+          .within_deleted
+          .order(transaction_from: :asc, valid_from_key => :asc)
+          .pick(valid_from_key)
+      end
+
+      # Find the pre-shift state: the most recent complete timeline snapshot where
+      # the genesis (first segment's valid_from) differs from current_genesis.
+      #
+      # == How it works (transaction history search)
+      #
+      # Every bitemporal mutation closes old records (transaction_to = now) and
+      # inserts new ones (transaction_from = now). This creates "change points"
+      # — transaction_to values where the timeline was rewritten.
+      #
+      # We walk backward through change points, reconstructing the timeline that
+      # was active just before each change, until we find one with a different
+      # genesis:
+      #
+      #   Transaction time →
+      #   ┌─────────────────────────────────────────────────────┐
+      #   │ t1: CREATE    |---A---|---B---|---C--->∞             │ genesis = Jan 1
+      #   │               └──────────────────────┘              │
+      #   │ t2: SHIFT →   closed at t2                          │
+      #   │               |---B---|---C--->∞                    │ genesis = Mar 1
+      #   │               └──────────────┘                      │
+      #   │                                                     │
+      #   │ Walking backward from t2:                           │
+      #   │   change_point = t2 → reconstruct t1 state          │
+      #   │   t1 genesis = Jan 1 ≠ current (Mar 1) → FOUND! ✅  │
+      #   └─────────────────────────────────────────────────────┘
+      #
+      # @param current_genesis [Time] the current first segment's valid_from
+      # @return [Array<ActiveRecord::Base>, nil] the pre-shift segment records,
+      #   or nil if no prior state with a different genesis can be found
+      def find_pre_shift_genesis_state(current_genesis)
+        change_points = self.class
+          .where(bitemporal_id: bitemporal_id)
+          .ignore_valid_datetime
+          .within_deleted
+          .where.not(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+          .distinct.pluck(:transaction_to)
+          .sort.reverse
+
+        change_points.each do |cp|
+          state = self.class
+            .where(bitemporal_id: bitemporal_id)
+            .ignore_valid_datetime
+            .within_deleted
+            .where(self.class.arel_table[:transaction_from].lt(cp))
+            .where(self.class.arel_table[:transaction_to].gteq(cp))
+            .order(valid_from_key => :asc)
+            .to_a
+            .each { |r|
+              r.id = r.swapped_id
+              r.clear_changes_information
+            }
+
+          next if state.empty?
+          return state if state.first[valid_from_key] != current_genesis
         end
 
         nil
