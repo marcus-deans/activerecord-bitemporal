@@ -546,6 +546,73 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
         ])
       end
     end
+
+    # Test 4.5: Terminate → correct within range → cancel (full undo semantics)
+    context "terminate → correct within range → cancel" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+        end
+      end
+
+      # cancel_termination is a full undo: it restores the pre-termination state.
+      # Any corrections made after termination are LOST.
+      #
+      # before: A             B
+      #         |-------------|----------->
+      #         Jan          Mar          ∞
+      #
+      # terminate(termination_time: May):
+      #         A             B
+      #         |-------------|------|
+      #         Jan          Mar    May
+      #
+      # correct(valid_from: Feb, valid_to: Mar, name: "X"):
+      #         A    X        B
+      #         |----|--------|------|
+      #         Jan  Feb     Mar    May
+      #
+      # cancel_termination:
+      #         A             B
+      #         |-------------|----------->    ← correction is LOST
+      #         Jan          Mar          ∞
+      it "restores pre-termination state, losing post-termination corrections" do
+        employee = Employee.find(@employee.id)
+
+        # Step 1: Terminate at May
+        Timecop.freeze("2020/10/02") do
+          employee.terminate(termination_time: _05_01)
+        end
+
+        expect(current_timeline(employee)).to eq([
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"]
+        ])
+
+        # Step 2: Correct within the terminated range
+        Timecop.freeze("2020/10/03") do
+          employee.correct(valid_from: _02_01, valid_to: _03_01, name: "X")
+        end
+
+        expect(current_timeline(employee)).to eq([
+          [_01_01, _02_01, "A"],
+          [_02_01, _03_01, "X"],
+          [_03_01, _05_01, "B"]
+        ])
+
+        # Step 3: Cancel termination — full undo, correction is lost
+        Timecop.freeze("2020/10/04") do
+          employee.cancel_termination
+        end
+
+        # Timeline should be back to pre-termination state (no "X")
+        expect(current_timeline(employee)).to eq([
+          [_01_01, _03_01, "A"],
+          [_03_01, infinity, "B"]
+        ])
+      end
+    end
   end
 
   # ==========================================================================
