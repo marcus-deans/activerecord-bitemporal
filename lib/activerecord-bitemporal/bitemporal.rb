@@ -340,9 +340,15 @@ module ActiveRecord
         # through transaction history. Recovers ALL segments that were removed
         # during termination.
         #
-        # No-op if entity is not currently terminated.
-        # Raises ActiveRecord::RecordNotFound if no current-knowledge records exist.
+        # IMPORTANT: This is a full undo — it restores the state from BEFORE the
+        # termination, not just the current state with valid_to extended. Any
+        # operations performed after termination (corrections, etc.) are lost.
         #
+        # No-op if entity is not currently terminated.
+        #
+        # @raise [ActiveRecord::RecordNotFound] if no current-knowledge records exist
+        # @raise [ActiveRecord::Bitemporal::PreTerminationStateNotFoundError] if
+        #   transaction history cannot determine the pre-termination state
         # @return [Boolean] true if successful
         def cancel_termination
           _cancel_termination_record
@@ -352,14 +358,14 @@ module ActiveRecord
         #
         # @return [Boolean] true if last segment's valid_to < DEFAULT_VALID_TO
         def terminated?
-          last_segment = self.class
+          last_valid_to = self.class
             .where(bitemporal_id: bitemporal_id)
             .ignore_valid_datetime
             .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
             .order(valid_from_key => :desc)
-            .first
-          return false if last_segment.nil?
-          last_segment[valid_to_key] < ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+            .pick(valid_to_key)
+          return false if last_valid_to.nil?
+          last_valid_to < ActiveRecord::Bitemporal::DEFAULT_VALID_TO
         end
 
         def correcting?
@@ -875,8 +881,9 @@ module ActiveRecord
           # 5. Find pre-termination state via transaction history
           pre_termination_state = find_pre_termination_state
           if pre_termination_state.nil?
-            raise "Cannot determine pre-termination state for #{self.class} " \
-                  "with bitemporal_id=#{bitemporal_id}"
+            raise PreTerminationStateNotFoundError,
+              "Cannot determine pre-termination state for #{self.class} " \
+              "with bitemporal_id=#{bitemporal_id}"
           end
 
           # 6. Close ALL current segments
