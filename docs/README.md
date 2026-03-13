@@ -554,6 +554,8 @@ employee.cancel_termination
 
 This recovers **all** segments that were removed during termination, including segments that were entirely past the termination point. The recovery uses the transaction history — no data is ever lost.
 
+**Important:** `cancel_termination` is a **full undo** — it restores the exact pre-termination state. Any operations performed *after* termination (such as corrections within the terminated range) are lost. If you need to preserve post-termination changes, consider rebuilding the timeline manually instead of using `cancel_termination`.
+
 Cancel is a no-op if the entity is not currently terminated (returns `true`, no DB changes).
 
 ### Checking Termination Status
