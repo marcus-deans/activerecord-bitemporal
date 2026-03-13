@@ -1571,4 +1571,149 @@ RSpec.describe "Cascade Correction (#correct method)" do
       end
     end
   end
+
+  # ==========================================================================
+  # Category 13: Correction Guard — Cannot Extend Past Timeline End
+  # ==========================================================================
+
+  # Helper to find a terminated employee (whose valid_to is in the past)
+  def find_ignoring_valid_time(record)
+    Employee.ignore_valid_datetime
+      .where(bitemporal_id: record.bitemporal_id)
+      .where(transaction_to: tt_infinity)
+      .order(:valid_from)
+      .first
+  end
+
+  describe "correction guard against extending past timeline end" do
+
+    # Test 13.1: Bounded correction past termination raises ValidDatetimeRangeError
+    #
+    #   Timeline:  |---A---|---B---|  (terminated at May)
+    #   Correction:        |---X-------->|  ← valid_to past May — REJECTED
+    context "bounded correction with valid_to past terminated timeline" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+        end
+        Timecop.freeze("2020/10/02") do
+          find_ignoring_valid_time(@employee).terminate(termination_time: _05_01)
+        end
+      end
+
+      it "raises ValidDatetimeRangeError" do
+        employee = find_ignoring_valid_time(@employee)
+
+        expect {
+          Timecop.freeze("2020/10/03") do
+            employee.correct(valid_from: _02_01, valid_to: "2020/07/01".in_time_zone, name: "X")
+          end
+        }.to raise_error(
+          ActiveRecord::Bitemporal::ValidDatetimeRangeError,
+          /exceeds timeline end/
+        )
+      end
+
+      it "does not modify the timeline" do
+        employee = find_ignoring_valid_time(@employee)
+        timeline_before = current_timeline(employee)
+
+        begin
+          Timecop.freeze("2020/10/03") do
+            employee.correct(valid_from: _02_01, valid_to: "2020/07/01".in_time_zone, name: "X")
+          end
+        rescue ActiveRecord::Bitemporal::ValidDatetimeRangeError
+          # expected
+        end
+
+        expect(current_timeline(employee)).to eq(timeline_before)
+      end
+    end
+
+    # Test 13.2: Unbounded correction on terminated entity stays within range
+    #
+    #   Timeline:  |---A---|---B---|  (terminated at May)
+    #   Correction:   |---X---|         ← unbounded, inherits B's valid_to (May) — OK
+    context "unbounded correction on terminated entity" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+        end
+        Timecop.freeze("2020/10/02") do
+          find_ignoring_valid_time(@employee).terminate(termination_time: _05_01)
+        end
+      end
+
+      it "succeeds and respects the terminated boundary" do
+        employee = find_ignoring_valid_time(@employee)
+
+        Timecop.freeze("2020/10/03") do
+          employee.correct(valid_from: _02_01, name: "X")
+        end
+
+        timeline = current_timeline(employee)
+
+        # Correction replaces A from Feb to Mar (next change point), everything else intact
+        expect(timeline).to eq([
+          [_01_01, _02_01, "A"],
+          [_02_01, _03_01, "X"],
+          [_03_01, _05_01, "B"]
+        ])
+
+        # Crucially: timeline still ends at May (termination preserved)
+        expect(timeline.last[1]).to eq(_05_01)
+      end
+    end
+
+    # Test 13.3: Bounded correction exactly at timeline end (edge case — should pass)
+    context "bounded correction with valid_to exactly at timeline end" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+        end
+        Timecop.freeze("2020/10/02") do
+          find_ignoring_valid_time(@employee).terminate(termination_time: _05_01)
+        end
+      end
+
+      it "succeeds because valid_to equals timeline end (not exceeds)" do
+        employee = find_ignoring_valid_time(@employee)
+
+        Timecop.freeze("2020/10/03") do
+          employee.correct(valid_from: _02_01, valid_to: _05_01, name: "X")
+        end
+
+        timeline = current_timeline(employee)
+        expect(timeline.last[1]).to eq(_05_01)
+      end
+    end
+
+    # Test 13.4: Correction on non-terminated entity (no guard triggered)
+    context "bounded correction on non-terminated entity" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+        end
+      end
+
+      it "succeeds normally — guard only applies when valid_to exceeds infinity" do
+        employee = Employee.find(@employee.id)
+
+        # This sets valid_to to Apr, which is < infinity — no guard triggered
+        Timecop.freeze("2020/10/03") do
+          employee.correct(valid_from: _02_01, valid_to: _04_01, name: "X")
+        end
+
+        expect(current_timeline(employee)).to eq([
+          [_01_01, _02_01, "A"],
+          [_02_01, _04_01, "X"],
+          [_04_01, infinity, "B"]
+        ])
+      end
+    end
+  end
 end
