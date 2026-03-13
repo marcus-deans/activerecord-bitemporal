@@ -1117,4 +1117,354 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
       end
     end
   end
+
+  # ==========================================================================
+  # Category 11: cancel_shift_genesis
+  # ==========================================================================
+
+  describe "cancel_shift_genesis" do
+
+    # Test 11.1: Cancel after backward shift restores original genesis
+    #
+    #   t1: CREATE    |---A--->∞          genesis = Mar
+    #   t2: SHIFT ←   |---A--->∞          genesis = Jan
+    #   t3: CANCEL    |---A--->∞          genesis = Mar (restored)
+    context "cancel after backward shift" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee = Employee.create!(name: "A") }
+        end
+        Timecop.freeze("2020/10/02") do
+          Employee.find(@employee.id).shift_genesis(new_valid_from: _01_01)
+        end
+      end
+
+      it "restores original genesis" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/03") do
+          employee.cancel_shift_genesis
+        end
+
+        expect(current_timeline(employee)).to eq([
+          [_03_01, infinity, "A"]
+        ])
+      end
+    end
+
+    # Test 11.2: Cancel after forward shift recovers ALL removed segments
+    #
+    #   t1: CREATE    |---A---|---B---|---C--->∞    genesis = Jan
+    #   t2: SHIFT →             |---B---|---C--->∞  genesis = Apr (A removed, B trimmed)
+    #   t3: CANCEL    |---A---|---B---|---C--->∞    genesis = Jan (full restoration)
+    context "cancel after forward shift" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
+        end
+        Timecop.freeze("2020/10/02") do
+          Employee.find(@employee.id).shift_genesis(new_valid_from: _04_01)
+        end
+      end
+
+      it "recovers all removed segments" do
+        employee = Employee.find(@employee.id)
+
+        # Before cancel: A is gone, B trimmed to [Apr, May)
+        expect(current_timeline(employee)).to eq([
+          [_04_01, _05_01, "B"],
+          [_05_01, infinity, "C"]
+        ])
+
+        Timecop.freeze("2020/10/03") do
+          employee.cancel_shift_genesis
+        end
+
+        # After cancel: full original timeline restored
+        expect(current_timeline(employee)).to eq([
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"],
+          [_05_01, infinity, "C"]
+        ])
+      end
+    end
+
+    # Test 11.3: Cancel on never-shifted entity is no-op
+    context "cancel on never-shifted entity" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+        end
+      end
+
+      it "returns true without DB changes" do
+        employee = Employee.find(@employee.id)
+        records_before = all_records(employee).count
+
+        Timecop.freeze("2020/10/02") do
+          result = employee.cancel_shift_genesis
+          expect(result).to eq(true)
+        end
+
+        expect(all_records(employee).count).to eq(records_before)
+        expect(current_timeline(employee)).to eq([
+          [_01_01, infinity, "A"]
+        ])
+      end
+    end
+
+    # Test 11.4: shift → cancel → shift → cancel round-trip
+    context "shift → cancel → shift → cancel round-trip" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "B") }
+        end
+      end
+
+      it "each cancel restores the original genesis" do
+        employee = Employee.find(@employee.id)
+        original_timeline = current_timeline(employee)
+
+        # First shift
+        Timecop.freeze("2020/10/02") do
+          employee.shift_genesis(new_valid_from: _01_01)
+        end
+        expect(current_timeline(employee).first[0]).to eq(_01_01)
+
+        # First cancel
+        Timecop.freeze("2020/10/03") do
+          employee.cancel_shift_genesis
+        end
+        expect(current_timeline(employee)).to eq(original_timeline)
+
+        # Second shift (forward this time)
+        Timecop.freeze("2020/10/04") do
+          employee.shift_genesis(new_valid_from: _04_01)
+        end
+        expect(current_timeline(employee).first[0]).to eq(_04_01)
+
+        # Second cancel
+        Timecop.freeze("2020/10/05") do
+          employee.cancel_shift_genesis
+        end
+        expect(current_timeline(employee)).to eq(original_timeline)
+      end
+    end
+
+    # Test 11.5: shift → update → cancel (full undo, update lost)
+    context "shift → update → cancel (full undo semantics)" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+        end
+      end
+
+      it "restores pre-shift state, losing post-shift updates" do
+        employee = Employee.find(@employee.id)
+
+        # Shift forward (removes A, trims B)
+        Timecop.freeze("2020/10/02") do
+          employee.shift_genesis(new_valid_from: _02_01)
+        end
+
+        # Update after shift
+        Timecop.freeze("2020/10/03") do
+          ActiveRecord::Bitemporal.valid_at(_04_01) { employee.update!(name: "C") }
+        end
+
+        expect(current_timeline(employee)).to include(
+          [_04_01, infinity, "C"]
+        )
+
+        # Cancel — full undo restores pre-shift state, post-shift update (C) is lost
+        Timecop.freeze("2020/10/04") do
+          employee.cancel_shift_genesis
+        end
+
+        expect(current_timeline(employee)).to eq([
+          [_01_01, _03_01, "A"],
+          [_03_01, infinity, "B"]
+        ])
+      end
+    end
+
+    # Test 11.6: Double cancel is no-op
+    context "double cancel" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee = Employee.create!(name: "A") }
+        end
+        Timecop.freeze("2020/10/02") do
+          Employee.find(@employee.id).shift_genesis(new_valid_from: _01_01)
+        end
+      end
+
+      it "second cancel is no-op" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/03") do
+          employee.cancel_shift_genesis
+        end
+
+        records_after_first_cancel = all_records(employee).count
+        timeline_after_first_cancel = current_timeline(employee)
+
+        Timecop.freeze("2020/10/04") do
+          result = employee.cancel_shift_genesis
+          expect(result).to eq(true)
+        end
+
+        # No additional records created
+        expect(all_records(employee).count).to eq(records_after_first_cancel)
+        expect(current_timeline(employee)).to eq(timeline_after_first_cancel)
+      end
+    end
+
+    # Test 11.7: shifted_genesis? predicate
+    context "shifted_genesis? predicate" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee = Employee.create!(name: "A") }
+        end
+      end
+
+      it "returns false for never-shifted entity" do
+        employee = Employee.find(@employee.id)
+        expect(employee.shifted_genesis?).to be false
+      end
+
+      it "returns true after shift" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/02") do
+          employee.shift_genesis(new_valid_from: _01_01)
+        end
+
+        expect(employee.shifted_genesis?).to be true
+      end
+
+      it "returns false after cancel" do
+        employee = Employee.find(@employee.id)
+
+        Timecop.freeze("2020/10/02") do
+          employee.shift_genesis(new_valid_from: _01_01)
+        end
+
+        Timecop.freeze("2020/10/03") do
+          employee.cancel_shift_genesis
+        end
+
+        expect(employee.shifted_genesis?).to be false
+      end
+    end
+
+    # Test 11.8: Concurrent cancel_shift_genesis (locking serialization)
+    context "concurrent cancel_shift_genesis", use_truncation: true do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee = Employee.create!(name: "A") }
+        end
+        Timecop.freeze("2020/10/02") do
+          Employee.find(@employee.id).shift_genesis(new_valid_from: _01_01)
+        end
+      end
+
+      it "both succeed via locking serialization" do
+        employee_id = @employee.bitemporal_id
+        errors = []
+
+        threads = 2.times.map do
+          Thread.new do
+            Employee.find(employee_id).cancel_shift_genesis
+          rescue => e
+            errors << e
+          end
+        end
+
+        threads.each(&:join)
+        expect(errors).to be_empty
+
+        timeline = current_timeline(@employee)
+        expect(no_overlaps?(timeline)).to be true
+      end
+    end
+
+    # Test 11.9: Audit trail after cancel
+    context "audit trail after cancel" do
+      before do
+        @t0 = "2020/10/01".in_time_zone
+        @t1 = "2020/10/02".in_time_zone
+        @t2 = "2020/10/03".in_time_zone
+
+        Timecop.freeze(@t0) do
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee = Employee.create!(name: "A") }
+        end
+        Timecop.freeze(@t1) do
+          Employee.find(@employee.id).shift_genesis(new_valid_from: _01_01)
+        end
+        Timecop.freeze(@t2) do
+          Employee.find(@employee.id).cancel_shift_genesis
+        end
+      end
+
+      it "preserves full history through transaction time" do
+        employee = @employee
+
+        # At t0: genesis = Mar
+        Timecop.freeze(@t2) do
+          ActiveRecord::Bitemporal.transaction_at(@t0) do
+            ActiveRecord::Bitemporal.valid_at(_03_01) do
+              expect(Employee.find(employee.id).name).to eq("A")
+            end
+          end
+        end
+
+        # At t1 (after shift): genesis = Jan
+        Timecop.freeze(@t2) do
+          ActiveRecord::Bitemporal.transaction_at(@t1) do
+            ActiveRecord::Bitemporal.valid_at(_02_01) do
+              expect(Employee.find(employee.id).name).to eq("A")
+            end
+          end
+        end
+
+        # At t2 (after cancel): genesis = Mar (restored)
+        Timecop.freeze(@t2) do
+          ActiveRecord::Bitemporal.valid_at(_02_01) do
+            expect(Employee.find_at_time(_02_01, employee.id)).to be_nil
+          end
+          ActiveRecord::Bitemporal.valid_at(_03_01) do
+            expect(Employee.find(employee.id).name).to eq("A")
+          end
+        end
+      end
+    end
+
+    # Test 11.10: Timeline integrity after cancel
+    context "timeline integrity after cancel" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
+        end
+        Timecop.freeze("2020/10/02") do
+          Employee.find(@employee.id).shift_genesis(new_valid_from: _04_01)
+        end
+        Timecop.freeze("2020/10/03") do
+          Employee.find(@employee.id).cancel_shift_genesis
+        end
+      end
+
+      it "restored timeline has no overlaps and no gaps" do
+        timeline = current_timeline(@employee)
+        expect(valid_timeline?(timeline)).to be true
+        expect(timeline.size).to eq(3)
+      end
+    end
+  end
 end
