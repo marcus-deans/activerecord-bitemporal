@@ -159,6 +159,19 @@ module ActiveRecord
 
       if ActiveRecord.version >= Gem::Version.new("8.0.0")
         use_bitemporal_id_as_primary_key :ids
+
+        # Ensure that AR::Batches
+        # (https://github.com/rails/rails/blob/v8.0.5/activerecord/lib/active_record/relation/batches.rb)
+        # works with `bitemporal_id` as the primary key in Rails 8+.
+        use_bitemporal_id_as_primary_key :find_each
+        use_bitemporal_id_as_primary_key :find_in_batches
+        use_bitemporal_id_as_primary_key :in_batches
+
+        # Ensure that `#excluding` and `#without`
+        # (https://github.com/rails/rails/blob/v8.0.5/activerecord/lib/active_record/relation/query_methods.rb#L1548-L1591)
+        # work with `bitemporal_id` as the primary key in Rails 8+.
+        use_bitemporal_id_as_primary_key :excluding
+        use_bitemporal_id_as_primary_key :without
       end
 
       def build_arel(*)
@@ -171,9 +184,9 @@ module ActiveRecord
         return super if loaded?
 
         # このタイミングで先読みしているアソシエーションが読み込まれるので時間を固定
-        records = ActiveRecord::Bitemporal.with_bitemporal_option(**bitemporal_option) { super }
+        relation = ActiveRecord::Bitemporal.with_bitemporal_option(**bitemporal_option) { super }
 
-        return records if records.empty?
+        return relation if relation.empty?
 
         valid_datetime_ = valid_datetime
         if ActiveRecord::Bitemporal.valid_datetime.nil? && (bitemporal_value[:with_valid_datetime].nil? || bitemporal_value[:with_valid_datetime] == :default_scope || valid_datetime_.nil?)
@@ -185,12 +198,14 @@ module ActiveRecord
           transaction_datetime_ = nil
         end
 
-        return records if valid_datetime_.nil? && transaction_datetime_.nil?
+        return relation if valid_datetime_.nil? && transaction_datetime_.nil?
 
-        records.each do |record|
+        relation.each do |record|
           record.send(:bitemporal_option_storage)[:valid_datetime] = valid_datetime_ if valid_datetime_
           record.send(:bitemporal_option_storage)[:transaction_datetime] = transaction_datetime_ if transaction_datetime_
         end
+
+        relation
       end
 
       # Use original primary_key for Active Record 8.0+ as much as possible
