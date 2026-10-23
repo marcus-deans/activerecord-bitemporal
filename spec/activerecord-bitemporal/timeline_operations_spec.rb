@@ -187,4 +187,141 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
       end
     end
   end
+
+  describe "locking the timeline" do
+    let(:_01_01) { "2020/01/01".in_time_zone }
+    let(:_02_01) { "2020/02/01".in_time_zone }
+
+    # The app-side lock_family! helper, copied verbatim apart from taking the
+    # model and key as arguments. The timeline operations must take this same lock.
+    def app_lock_family!(model, bitemporal_id)
+      keys = [model.table_name, bitemporal_id].map do |value|
+        Arel::Nodes::NamedFunction.new("hashtext", [Arel::Nodes.build_quoted(value)])
+      end
+      lock = Arel::Nodes::NamedFunction.new("pg_advisory_xact_lock", keys)
+      model.connection.execute(Arel::SelectManager.new.project(lock).to_sql)
+    end
+
+    # Every SQL statement the block runs, in order
+    def statements_during(&block)
+      statements = []
+      callback = ->(*, payload) { statements << payload[:sql] }
+      ActiveSupport::Notifications.subscribed(callback, "sql.active_record", &block)
+      statements
+    end
+
+    describe "in each operation" do
+      let!(:employee) {
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
+        end
+      }
+
+      {
+        "correct" => [nil, ->(e) { e.correct(valid_from: "2020/02/01".in_time_zone, name: "X") }],
+        "shift_genesis" => [nil, ->(e) { e.shift_genesis(new_valid_from: "2020/02/01".in_time_zone) }],
+        "cancel_shift_genesis" => [->(e) { e.shift_genesis(new_valid_from: "2020/02/01".in_time_zone) }, :cancel_shift_genesis.to_proc],
+        "terminate" => [nil, ->(e) { e.terminate(termination_time: "2020/03/01".in_time_zone) }],
+        "cancel_termination" => [->(e) { e.terminate(termination_time: "2020/03/01".in_time_zone) }, :cancel_termination.to_proc],
+      }.each do |name, (setup, operation)|
+        it "#{name} takes lock_family!'s advisory lock, then row-locks the timeline, before it writes" do
+          Timecop.freeze("2020/10/02") { setup&.call(employee) }
+          statements = Timecop.freeze("2020/10/03") { statements_during { operation.call(employee) } }
+
+          expected_lock = "SELECT pg_advisory_xact_lock(hashtext('employees'), hashtext('#{employee.bitemporal_id}'))"
+          advisory_lock = statements.index(expected_lock)
+          row_lock = statements.index { |sql| sql.include?("FOR UPDATE") }
+          first_write = statements.index { |sql| sql.match?(/\A\s*(INSERT|UPDATE)\b/i) }
+
+          expect([advisory_lock, row_lock, first_write]).to all(be_an(Integer))
+          expect(advisory_lock).to be < row_lock
+          expect(row_lock).to be < first_write
+        end
+      end
+    end
+
+    it "re-enters the lock when the caller already holds lock_family!" do
+      employee = Timecop.freeze("2020/10/01") {
+        ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
+      }
+
+      Employee.transaction do
+        app_lock_family!(Employee, employee.bitemporal_id.to_s)
+        expect(Timecop.freeze("2020/10/02") { employee.correct(valid_from: _02_01, name: "X") }).to be true
+      end
+    end
+
+    context "across connections", use_truncation: true do
+      # Nothing is valid now, so a lock on the row valid now would cover nothing
+      let(:start) { 1.year.from_now.beginning_of_day }
+      let!(:employee) { ActiveRecord::Bitemporal.valid_at(start) { Employee.create!(name: "A") } }
+
+      def in_thread(&block)
+        Thread.new { ActiveRecord::Base.connection_pool.with_connection(&block) }
+      end
+
+      def current_timeline(employee)
+        Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id, transaction_to: tt_infinity)
+          .order(:valid_from)
+          .pluck(:valid_from, :valid_to, :name)
+      end
+
+      it "waits for app code holding lock_family!, then builds on what that code committed" do
+        locked = Queue.new
+        release = Queue.new
+        app = in_thread {
+          Employee.transaction do
+            app_lock_family!(Employee, employee.bitemporal_id.to_s)
+            record = Employee.find_at_time(start, employee.id)
+            record.valid_at(start + 60.days) { record.update!(name: "U") }
+            locked << true
+            release.pop
+          end
+        }
+        locked.pop
+
+        # Loaded before the app's write commits, as a caller's copy often is
+        stale = Employee.find_at_time(start, employee.id)
+        operation = in_thread { stale.correct(valid_from: start + 30.days, name: "X") }
+        begin
+          expect(operation.join(0.5)).to be_nil
+        ensure
+          release << true
+          app.join
+        end
+        operation.join
+
+        expect(current_timeline(employee)).to eq [
+          [start, start + 30.days, "A"],
+          [start + 30.days, start + 60.days, "X"],
+          [start + 60.days, ActiveRecord::Bitemporal::DEFAULT_VALID_TO, "U"],
+        ]
+        expect(all_rows(Employee, employee.bitemporal_id).where("transaction_to < transaction_from")).to be_empty
+      end
+
+      it "row-locks every current row, including rows valid only in the future" do
+        paused = Queue.new
+        resume = Queue.new
+        record = Employee.find_at_time(start, employee.id)
+        # Holds the operation right after it has taken its locks
+        allow(record).to receive(:find_affected_records_for_correction).and_wrap_original { |original, *args|
+          paused << true
+          resume.pop
+          original.call(*args)
+        }
+        operation = in_thread { record.correct(valid_from: start + 30.days, name: "X") }
+        paused.pop
+
+        begin
+          expect {
+            Employee.ignore_valid_datetime.where(bitemporal_id: employee.bitemporal_id).lock("FOR UPDATE NOWAIT").to_a
+          }.to raise_error(ActiveRecord::LockWaitTimeout)
+        ensure
+          resume << true
+          operation.join
+        end
+      end
+    end
+  end
 end
