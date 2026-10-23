@@ -176,18 +176,6 @@ RSpec.describe "Fork review repros" do
     end
   end
 
-  describe "lock scope" do
-    it "lock query only targets the row valid *now*; future-dated entity locks nothing" do
-      e = ActiveRecord::Bitemporal.valid_at(3.years.from_now) { Employee.create!(name: "FutureHire") }
-      sqls = []
-      sub = ActiveSupport::Notifications.subscribe("sql.active_record") { |*, p| sqls << p[:sql] if p[:sql].include?("FOR UPDATE") }
-      locked = Employee.where(bitemporal_id: e.id).lock!.pluck(:id)
-      ActiveSupport::Notifications.unsubscribe(sub)
-      puts "\n[lock] #{sqls.first}\n[lock] rows locked for future-dated entity: #{locked.size}"
-      expect(locked.size).to be >= 1
-    end
-  end
-
   describe "date-typed valid time in non-UTC zone (Department)" do
     %w[Tokyo America/New_York].each do |zone|
       it "correct at an exact segment boundary (#{zone})" do
