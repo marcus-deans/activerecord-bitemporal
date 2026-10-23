@@ -1,142 +1,164 @@
-# Gem Fix: Coalesce Adjacent Identical Segments in `activerecord-bitemporal`
+# Fork Hardening Plan
 
-## The Problem
+Working plan for fixing what the 2026-10-23 review of the fork's timeline operations found
+(`correct`, `shift_genesis`, `terminate` and their cancels). Branch `fix/fork-hardening` is
+stacked on `sync/upstream-7.0.2` (PR #8), so every fix is built and tested against upstream v7.0.2+.
 
-The `correct()` method in `activerecord-bitemporal` can produce timelines with adjacent segments
-that have identical business attributes — a "cosmetic seam." This happens because `correct()`
-only operates on segments from `valid_from` onward and never examines whether the newly created
-segment is identical to the preceding one.
+The previous plan in this file (coalesce adjacent identical segments) shipped in PR #4 (`3e6a8fd`).
+Its invariant still stands: **no two adjacent current-knowledge segments may have identical business
+attributes.** dsptch-api's `future_versions` relies on it, because a seam between identical segments
+reads as a phantom scheduled change.
 
-### Concrete Example (Cancel Future Change)
+## Working conventions
 
-Starting timeline:
+- Cite methods, not line numbers. Every upstream merge shifts `bitemporal.rb`.
+- Repros for open findings live in `spec/review_repros/*_repro.rb`. They aren't picked up by the
+  normal suite. Run them with:
+  `mise exec ruby@4.0.6 -- bundle exec rspec spec/review_repros --pattern '**/*_repro.rb'`
+  (17 examples, 11 failing as of 2026-10-23). Each fix moves its repro into the matching spec
+  file as a real example and deletes it from `spec/review_repros/`.
+- Never run two rspec processes at once: `spec/spec_helper.rb` drops and recreates the test DB.
+- One PR per step into `dsptch`. The full suite stays green at every step.
 
-```
-Segment A: Bonus,  valid_from=Feb 12, valid_to=Mar 11
-Segment B: PW CF,  valid_from=Mar 11, valid_to=∞
-```
+## Fork boundary (rule)
 
-Cancel calls `correct(valid_from: Mar 11, valid_to: ∞, CE: Bonus)`:
+**The fork never edits upstream code or changes upstream behaviour.** Fork-added code can be
+refactored freely. This keeps upstream syncs conflict-free.
 
-```
-Segment A: Bonus,  valid_from=Feb 12, valid_to=Mar 11  ← untouched (not in affected_records)
-Segment B: PW CF,  valid_from=Mar 11, valid_to=∞       ← closed (transaction_to = now)
-Segment C: Bonus,  valid_from=Mar 11, valid_to=∞       ← NEW (identical to A)
-```
+- As of 2026-10-23, the fork had changed **0** upstream lines. Its 847 added lines sit in three places
+  inside upstream's `bitemporal.rb` (one is a stray blank line), plus two error classes in `errors.rb`.
+- Target, set in step 1a:
+  - all fork code lives in `lib/activerecord-bitemporal/timeline_operations.rb`
+  - that file includes itself into `ActiveRecord::Bitemporal::Persistence`
+  - the only upstream-file footprint is one `require` line in `lib/activerecord-bitemporal.rb`
+- ⚠️ **Refinements caveat:**
+  - Upstream's `update_transaction_to` and its `dup` override are Ruby refinements, active only inside
+    the `Persistence` module body in `bitemporal.rb`.
+  - The refined `dup` resets `@_swapped_id`, `@_swapped_id_previously_was` and `@previously_force_updated`.
+    Plain `dup` copies them, which silently corrupts new segments.
+  - Fork code outside that file needs its own equivalents, covered by specs.
+  - **On every upstream sync, diff upstream's refinements block and mirror any change into the fork's helpers.**
+- Gaps in upstream behaviour are closed in dsptch-api (e.g. `lock_family!`) or offered upstream to kufu
+  as a PR, never patched in the fork.
 
-Result: A and C have identical business attributes but are split at Mar 11. This seam causes
-downstream queries (like `future_versions`) to incorrectly report C as a "scheduled change."
+## 0. Branch migration (in progress)
 
-### Why It Happens Mechanically
+Target model: `dsptch` is the product branch dsptch-api pins, and `master` mirrors kufu/master.
 
-In `_correct_record`:
+- [x] PR #8 (upstream v7.0.2 sync) retargeted to `dsptch`. Held; CI green on the full matrix.
+- [ ] dsptch-api PR into `stage`: Gemfile `branch: 'master'` → `branch: 'dsptch'`, with the lockfile
+      revision unchanged at `2f0de0c`. Opened as rnwbllabs/dsptch-api#20598 (lockfile diff is the one
+      `branch:` line; CI green); waiting on merge. Close the stale draft #14238 (same change, Aug 2026).
+- [ ] Once that PR is merged into `stage`: merge PR #8 into `dsptch`, then a dsptch-api PR bumping the lockfile.
+- [ ] Production deploy (planned Mon 2026-10-26) carries the switch to dsptch-api `main`.
+- [x] Rollback safety verified (2026-10-23, against GitHub, with caches wiped and `BUNDLE_DEPLOYMENT=1`):
+      Bundler 2.7.2 fetches a locked revision directly by SHA and never checks it's on the named
+      branch. An old release locked to `branch: master` @ `2f0de0c` therefore still builds after the
+      reset, **as long as `2f0de0c` stays reachable**. Only frozen installs are safe this way; a
+      `bundle update` would re-resolve `master` to the new history.
+- [ ] Protect `dsptch` on GitHub. Its history is what keeps `2f0de0c` fetchable, and that's a squash
+      commit no PR ref holds. Currently unprotected. Proposal, as two repository rulesets:
+  - *dsptch-integrity*: block deletion and non-fast-forward pushes. **No bypass, not even admins.**
+  - *dsptch-pr-flow*: require a PR (0 approvals); admins may bypass for emergencies. Don't require
+    specific status checks: CI matrix job names change when upstream changes the matrix (kufu's
+    `drop-rails-7-1-support` is in flight), which would leave PRs stuck waiting on a check that
+    never reports.
+  - `master` stays unprotected until the reset; afterwards it can only move by sync.
+- [ ] Then: tag the old master head (`legacy-master-2f0de0c`), reset `master` to `upstream/master`, and
+      make `dsptch` the GitHub default branch.
 
-1. `find_affected_records_for_correction(valid_from)` uses `WHERE valid_to > valid_from` — so
-   Segment A (whose `valid_to` equals `valid_from`, not greater) is excluded
-2. `bitemporal_build_cascade_correction_records` builds the correction segment from the
-   containing record (Segment B), applies the new attributes, but has no visibility into
-   Segment A
-3. The new segment is inserted, the old one closed — resulting in the seam
+## 1. Findings
 
-The same issue can occur with `shift_genesis()` (e.g., a forward shift that trims a segment
-to match its successor).
+"Exposure" is how dsptch-api is affected today: it is UTC with `datetime` columns, and uses
+`correct`, `terminate`, `cancel_termination` and `shift_genesis` on payroll models.
 
-## Where the Fix Belongs
+| ID  | Finding | Where | dsptch-api exposure |
+| --- | ------- | ----- | ------------------- |
+| F1  | Each op's `lock!` runs through the default scope, so it locks only the row valid **now**. A future-dated or past-terminated entity locks 0 rows, and concurrent writes leave overlapping current rows. Upstream `save`/`_update_row` has the same pattern. | all five `_*_record` ops | **High** on paths without the app's `lock_family!`: timecode correct/terminate, external-map correct, `Bitemporal::ShiftGenesis`, cancel_termination controllers |
+| F2  | `current_time` is read *before* the lock. A writer that lands in between gets `transaction_to < transaction_from`, and "as known at T" queries return overlapping history. | all five `_*_record` ops | Same paths as F1 |
+| F3  | A bounded `correct` that spans several segments copies the containing segment's untouched attributes over the whole span, and fills any gap inside it. | `bitemporal_build_cascade_correction_records` | `timecodes/correct.rb`, the only bounded caller: a span crossing a scheduled change flattens it |
+| F4  | `self` is stale and dirty after every op. Only ids and time columns are copied back. A later `save` silently reverts the op. | the five "repoint self" blocks | Mitigated: the services `reload` around `correct` |
+| F5  | Coalescing closes rows inserted by the same op, leaving `transaction_from == transaction_to` rows that fail the model's own validation. | `coalesce_adjacent_segments!` | Yes: invalid rows in the audit history |
+| F6  | Model validations are skipped (`validate: false` on every insert); only an overlap check runs. | all inserts, `validate_cascade_correction_timeline!` | Mitigated: services call `valid?` first |
+| F7  | `after_save` fires once per inserted row (3× for one `correct`), and `bitemporal_*` callbacks never fire. | `save_without_bitemporal_callbacks!` call sites | Unknown: check PaperTrail/callbacks on these models |
+| F8  | With Date-typed valid time in a non-UTC zone, the inputs aren't type-cast, so ops break at segment boundaries. | `correct`, `determine_correction_end`, builders | None (UTC + datetime) |
+| F9  | `cancel_shift_genesis` toggles between the last two geneses instead of undoing to the original. `shifted_genesis?` is true after a plain upstream update before genesis. | `find_pre_shift_genesis_state`, `find_original_genesis` | None (app never calls it) |
+| F10 | `terminate` at a time inside a gap ends the timeline at the gap's start. Probably *correct*, since the entity doesn't exist in the gap: document it rather than fix it. | `_terminate_record` | Low |
+| F11 | Calling an op inside a global `transaction_at`/`valid_at` block builds from a partial view, or raises a misleading `RecordNotFound`. | segment queries | Low |
+| F12 | Dead code: `correcting?`, and the infinity branch of `determine_correction_end` (unreachable). | — | None |
+| F13 | All five ops copy-paste one skeleton (timestamp, lock, fetch, guards, close, insert, coalesce, validate, repoint). This is why F1/F2/F4 each exist five times, with diverging fallbacks (`.first` vs `.last`). | — | Root cause |
 
-**In the gem**, not the app. This is a data model integrity issue — the gem should guarantee
-that its timeline operations produce minimal, non-redundant timelines. The app shouldn't need
-to work around cosmetic seams in every query.
+## 2. Decisions needed
 
-## Conceptual Requirements
+**D1. Lock mechanism (F1, F2).** Upstream's `save`/`destroy` are off-limits (see the fork-boundary rule).
+Proposal, all inside fork code:
+1. **Advisory lock.** Take a Postgres advisory transaction lock on `(table_name, bitemporal_id)`,
+   built exactly like dsptch-api's `lock_family!` (`hashtext` of each). Then the app's lock and the
+   gem's are the *same* lock. It's re-entrant, so the app's existing calls nest harmlessly.
+2. **Row locks.** Also take `FOR UPDATE` on every current-knowledge row
+   (`ignore_valid_datetime`), not just the row valid now. This keeps interlocking with upstream's
+   plain `update!`/`destroy`, which row-lock the row they touch.
+3. **Timestamp.** Read it *after* both locks (fixes F2).
 
-After any timeline-mutating operation (`correct()`, `shift_genesis()`), the gem should ensure:
+**Remaining gap.** Suppose a plain upstream `update!`/`destroy` runs on an entity with no row valid
+now, and starts *after* a fork op has begun. Upstream's own lock covers nothing in that case.
+- Fix it in the app: wrap such writes in `lock_family!`.
+- Optionally, propose upstream's lock scope as a fix to kufu.
+- Match the app's key byte-for-byte (`bitemporal_id` is a UUID string there).
 
-> **No two adjacent segments in the current-knowledge timeline should have identical business
-> attributes.** If they do, they must be merged into a single contiguous segment.
+**D2. Bounded correction semantics (F3).** Options:
+- (a) *Patch*: each overlapping segment keeps its own attributes, and only the named ones change. Gaps are preserved, and coalescing merges identical results.
+- (b) *Snapshot* (current): the span becomes one segment, the containing segment plus the given attributes.
 
-"Adjacent" means `segment_1.valid_to == segment_2.valid_from` (contiguous, no gap).
+*Recommendation:* (a). It also fixes gap-filling for `correct`. Callers that pass a full attribute set still get (b)'s flattening; `cancel_future_changes` does this on purpose and keeps working. The `cascade_correction_spec` provenance example that encodes (b) has to change. Note: `timecodes/correct.rb` passes the full correctable set from its baseline, so it only benefits once it passes just the changed attributes.
 
-"Business attributes" means all columns **except** temporal/infrastructure columns:
-`id`, `bitemporal_id`, `valid_from`, `valid_to`, `transaction_from`, `transaction_to`,
-`created_at`, `updated_at`, `deleted_at`. The gem already has `valid_from_key` and
-`valid_to_key` accessors for configurable column names.
+**D3. Validations (F6).** *Recommendation:* by default, validate only the segments that receive new attributes, with an opt-out. Don't validate the trimmed before/after copies of old rows: legacy data could fail validations added since.
 
-"Merged" means: extend the earlier segment's `valid_to` to the later segment's `valid_to`,
-then close the later segment (set its `transaction_to` to `current_time`). This preserves the
-audit trail — the closed segment is still visible in transaction-time queries.
+**D4. Callback contract (F7).** First check which callbacks and PaperTrail hooks dsptch-api's bitemporal models have, and whether anything relies on per-row firing.
 
-## Implementation Guidance
+**D5. Where `self` points after an op (F4).** *Recommendation:* for every op, the segment covering now, otherwise the last one. Refresh *all* attributes from it and clear dirty state.
 
-### Placement
+**D6. Coalescing scope (F5).** *Recommendation:* keep coalescing the whole timeline, since that's the invariant above. Rows created earlier in the same op were never visible outside the transaction, so delete them instead of closing them.
 
-The coalesce step should run inside the existing transaction in `_correct_record` (and
-`_shift_genesis_record`), **after** the new timeline records are inserted and **before** the
-post-hoc validation (`validate_cascade_correction_timeline!`). This mirrors how validation
-already works — it loads the full current-knowledge timeline and checks invariants.
+## 3. Work order (one PR each, into `dsptch`)
 
-### Key Methods to Understand
+1. **Refactor fork code only, with no behaviour change.** Two commits:
+   - **1a. Move.** Move every fork addition out of `bitemporal.rb` and `errors.rb` into
+     `timeline_operations.rb`, replacing the two refinements with fork-owned helpers plus specs.
+     Afterwards `git diff upstream/master -- lib/activerecord-bitemporal/{bitemporal,errors}.rb` is empty.
+   - **1b. Skeleton (F13).** One private helper owns lock → timestamp → fetch → yield (the op builds
+     the rows to close and insert) → close → insert → coalesce → validate → repoint `self`. Keep
+     today's quirks exactly, including timestamp-before-lock and the `.first` vs `.last` fallback;
+     later steps fix them in one place.
+   - Bar for both: suite green and unchanged, and the repros show the same 11 failures.
+2. **F1 + F2** inside the helper, per D1. Port the concurrency repros.
+3. **F4** per D5.
+4. **F5** per D6.
+5. **F3** per D2.
+6. **Smaller items:** F6/F7 (D3/D4), F8 (type-cast inputs with `type_for_attribute`, as `scope_relation` does), F9, F11, F12.
+7. **Docs** (section 5).
 
-| Method                                        | Location            | Purpose                                       |
-| --------------------------------------------- | ------------------- | --------------------------------------------- |
-| `_correct_record`                             | `bitemporal.rb:502` | Main correction logic                         |
-| `_shift_genesis_record`                       | `bitemporal.rb:565` | Genesis shifting logic                        |
-| `find_all_current_knowledge_segments`         | `bitemporal.rb:633` | Loads all live segments ordered by valid_from |
-| `validate_cascade_correction_timeline!`       | `bitemporal.rb:714` | Post-hoc overlap check                        |
-| `bitemporal_build_cascade_correction_records` | `bitemporal.rb:733` | Builds the new timeline                       |
-| `update_transaction_to`                       | Used throughout     | Closes a segment                              |
+## 4. dsptch-api follow-ups
 
-### Merging Mechanics
+- **Now, independent of the gem:** add `lock_family!` to the unprotected paths listed under F1. It's the quickest protection for production while gem fixes land.
+- D1's remaining gap: plain `update!`/`destroy` on these models, for entities that may have no row valid now, should run inside `lock_family!`.
+- After step 3: the `reload` calls around `correct` become redundant (harmless to keep).
+- After step 5: `timecodes/correct.rb` should pass only changed attributes.
+- If D1 goes with (b): `lock_family!` can delegate to the gem's lock, so there's one key definition.
 
-When merging segment pair (earlier, later):
+## 5. Docs cleanup
 
-- **Earlier segment**: `update_columns(valid_to_key => later[valid_to_key])` — extend its range
-- **Later segment**: `update_transaction_to(current_time)` — close it, preserving audit trail
-- Must handle chains: if A=B=C are all identical, merge A+B first, then the extended A with C
-
-### Self-Pointer Update
-
-After coalescing, `_correct_record` step 7 updates `self` to point at the "current" record.
-Currently it reads from the in-memory `new_timeline` array, but a coalesced-away record may
-still be in that array. Step 7 should instead use `find_all_current_knowledge_segments` (a DB
-query) to get the post-coalesce state. Note that `_shift_genesis_record` already does this
-(its step 10 reads from `find_all_current_knowledge_segments`), so this is a consistency fix.
-
-### What NOT to Do
-
-- Don't prevent the seam from being created in the first place (in
-  `bitemporal_build_cascade_correction_records`). That method doesn't have access to pre-existing
-  segments outside its `affected_records` window. Coalescing post-hoc is simpler and more robust.
-- Don't make coalescing optional or configurable. It should always happen — redundant segments
-  are never desirable.
-- Don't modify the before/correction/after segment construction logic. The existing logic is
-  correct for producing valid timelines; coalescing is a separate cleanup step.
-
-## Test Cases
-
-### For `correct()`
-
-1. **Identical correction** — correct a segment with the same attributes it already has →
-   should coalesce into one segment (no seam)
-2. **Cancel pattern** — two-segment timeline, correct the future segment with current values →
-   should produce one segment spanning the full range
-3. **Different attributes** — correct with genuinely different values → should NOT coalesce
-   (segments are legitimately different)
-4. **Bounded correction in the middle** — correct with `valid_to` set, where the correction
-   matches the following segment → should coalesce the correction with the after-segment
-5. **Chain coalescing** — three identical adjacent segments → should merge all into one
-
-### For `shift_genesis()`
-
-6. **Forward shift producing seam** — shift genesis forward past a segment boundary where the
-   next segment has the same attributes → should coalesce
-
-### Existing specs
-
-All existing `cascade_correction_spec.rb` and `shift_genesis_spec.rb` tests must continue to
-pass. The coalescing should be transparent to operations that don't produce seams.
-
-## Gem Location
-
-Fork: `marcus-deans/activerecord-bitemporal` (commit `d76bb5d`)
-Main file: `lib/activerecord-bitemporal/bitemporal.rb`
-Specs: `spec/activerecord-bitemporal/cascade_correction_spec.rb`, `shift_genesis_spec.rb`
+- `docs/ARCHITECTURE.md` hasn't been updated since PR #3:
+  - the bounded-correction diagram still closes and re-inserts untouched segments
+  - the algorithm lacks the timeline-end guard, coalescing and repointing
+  - there's no shift_genesis section
+- `docs/BITEMPORAL_CONCEPTS.md` says to rebuild and close the whole timeline, which contradicts the surgical design. It also uses `correct(...)` for a force_update-style fix.
+- `docs/README.md`:
+  - `correct` before genesis raises `RecordNotFound`, not `ArgumentError`
+  - the force_update example overstates what it replaces
+  - the `destroy` semantics are wrong in two places
+  - examples use `rate:` where the schema has `hourly_rate_cents`
+- Undocumented: `PreTerminationStateNotFoundError`, `PreShiftGenesisStateNotFoundError`, coalescing, skipped validations, and the state of `self` after an op.
+- Replace line-number references with method names everywhere.
+- Root `README.md`: say it's a fork and link `docs/`. CHANGELOG: add fork entries; consider a fork version suffix (it currently reports 7.0.2, same as upstream).
+- When this plan is done, delete it or move what's worth keeping into `docs/`.
