@@ -23,6 +23,7 @@ end
 
 ActiveSupport.on_load(:active_record) do
   require "activerecord-bitemporal/bitemporal"
+  require "activerecord-bitemporal/timeline_operations"
   require "activerecord-bitemporal/bitemporalize"
   require "activerecord-bitemporal/patches"
 
