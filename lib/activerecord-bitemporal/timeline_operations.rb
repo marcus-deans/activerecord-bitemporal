@@ -213,14 +213,68 @@ module ActiveRecord
         end
       end
 
-      # Cascade Correction: Main implementation
-      def _correct_record(valid_from:, valid_to:, attributes:)
+      # Shared skeleton of the five timeline operations.
+      #
+      # Owns the steps every operation repeats: timestamp, transaction, lock, close,
+      # insert, coalesce, validate and repointing self. The block does the op-specific
+      # part (fetch, guards, build): it receives current_time and returns
+      # [records_to_close, new_records]. Raising in the block, or a `return` from the
+      # calling op (its no-op exits), leaves the transaction before any write.
+      #
+      # Kept exactly as each op behaved before this was extracted, to be changed here
+      # in one place later:
+      # - current_time is read before the lock is taken
+      # - the lock query goes through the default scope
+      # - self only gets its ids and time columns copied from the segment it points at
+      # - when no segment covers now, self points at all_current.public_send(repoint_fallback):
+      #   :last for every op except cancel_shift_genesis, which passes :first
+      def perform_timeline_operation(repoint_fallback: :last)
         current_time = Time.current
 
         ActiveRecord::Base.transaction(requires_new: true) do
           # Lock all records for this entity
           self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
 
+          # Fetch, guard and build (op-specific)
+          records_to_close, new_records = yield(current_time)
+
+          # CLOSE old records FIRST (critical ordering)
+          records_to_close.each do |record|
+            timeline_close(record, current_time)
+          end
+
+          # Insert new records
+          new_records.each do |record|
+            record.save_without_bitemporal_callbacks!(validate: false)
+          end
+
+          # Coalesce adjacent identical segments
+          coalesce_adjacent_segments!(current_time)
+
+          # Validate the new timeline (post-hoc)
+          validate_cascade_correction_timeline!
+
+          # Update self to point at the currently-valid record, else the fallback.
+          # Query DB since untouched segments aren't in new_records
+          all_current = find_all_current_knowledge_segments
+          current_record = all_current.find { |r|
+            r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
+          } || all_current.public_send(repoint_fallback)
+
+          @_swapped_id_previously_was = swapped_id
+          @_swapped_id = current_record.swapped_id
+          self[valid_from_key] = current_record[valid_from_key]
+          self[valid_to_key] = current_record[valid_to_key]
+          self.transaction_from = current_record.transaction_from
+          self.transaction_to = current_record.transaction_to
+
+          true
+        end
+      end
+
+      # Cascade Correction: Main implementation
+      def _correct_record(valid_from:, valid_to:, attributes:)
+        perform_timeline_operation do |current_time|
           # 1. Find all affected records (current knowledge, from valid_from onward)
           affected_records = find_affected_records_for_correction(valid_from)
 
@@ -260,61 +314,24 @@ module ActiveRecord
               "(#{timeline_end}). Cancel termination first to extend the timeline."
           end
 
-          # 3. Build the new timeline
-          records_to_close, new_timeline = bitemporal_build_cascade_correction_records(
+          # 3. Build the new timeline: [records_to_close, new_timeline]
+          bitemporal_build_cascade_correction_records(
             affected_records: affected_records,
             valid_from: valid_from,
             valid_to: effective_valid_to,
             attributes: attributes,
             current_time: current_time
           )
-
-          # 4. CLOSE all affected records FIRST (critical ordering!)
-          records_to_close.each do |record|
-            timeline_close(record, current_time)
-          end
-
-          # 5. Insert all new timeline records
-          new_timeline.each do |record|
-            record.save_without_bitemporal_callbacks!(validate: false)
-          end
-
-          # 5.5. Coalesce adjacent identical segments
-          coalesce_adjacent_segments!(current_time)
-
-          # 6. Validate the new timeline (post-hoc)
-          validate_cascade_correction_timeline!
-
-          # 7. Update self to point to the "current" record in the new timeline
-          # Query DB since untouched segments (fully after correction) aren't in new_timeline
-          all_current = find_all_current_knowledge_segments
-          current_record = all_current.find { |r|
-            r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
-          } || all_current.last
-
-          @_swapped_id_previously_was = swapped_id
-          @_swapped_id = current_record.swapped_id
-          self[valid_from_key] = current_record[valid_from_key]
-          self[valid_to_key] = current_record[valid_to_key]
-          self.transaction_from = current_record.transaction_from
-          self.transaction_to = current_record.transaction_to
-
-          true
         end
       end
 
       # Shift Genesis: Main implementation
       def _shift_genesis_record(new_valid_from:)
-        current_time = Time.current
-
-        ActiveRecord::Base.transaction(requires_new: true) do
-          # 1. Lock all records for this entity
-          self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
-
-          # 2. Fetch all current-knowledge segments
+        perform_timeline_operation do |current_time|
+          # 1. Fetch all current-knowledge segments
           segments = find_all_current_knowledge_segments
 
-          # 3. Guard: entity must exist
+          # 2. Guard: entity must exist
           if segments.empty?
             raise ActiveRecord::RecordNotFound.new(
               "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
@@ -325,53 +342,22 @@ module ActiveRecord
 
           genesis = segments.first
 
-          # 4. No-op: same date
+          # 3. No-op: same date
           return true if new_valid_from == genesis[valid_from_key]
 
-          # 5. Guard: forward shift must not erase all segments
+          # 4. Guard: forward shift must not erase all segments
           if new_valid_from >= segments.last[valid_to_key]
             raise ArgumentError,
               "shift_genesis would erase all segments: new_valid_from (#{new_valid_from}) " \
               ">= last segment valid_to (#{segments.last[valid_to_key]})"
           end
 
-          # 6. Build records to close and new records
-          records_to_close, new_records = if new_valid_from < genesis[valid_from_key]
+          # 5. Build records to close and new records
+          if new_valid_from < genesis[valid_from_key]
             build_genesis_backward_shift(genesis, new_valid_from, current_time)
           else
             build_genesis_forward_shift(segments, new_valid_from, current_time)
           end
-
-          # 7. CLOSE old records FIRST (critical ordering)
-          records_to_close.each do |record|
-            timeline_close(record, current_time)
-          end
-
-          # 8. Insert new records
-          new_records.each do |record|
-            record.save_without_bitemporal_callbacks!(validate: false)
-          end
-
-          # 8.5. Coalesce adjacent identical segments
-          coalesce_adjacent_segments!(current_time)
-
-          # 9. Validate post-hoc (reuse existing)
-          validate_cascade_correction_timeline!
-
-          # 10. Update self to point at the currently-valid record
-          all_current = find_all_current_knowledge_segments
-          current_record = all_current.find { |r|
-            r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
-          } || all_current.last
-
-          @_swapped_id_previously_was = swapped_id
-          @_swapped_id = current_record.swapped_id
-          self[valid_from_key] = current_record[valid_from_key]
-          self[valid_to_key] = current_record[valid_to_key]
-          self.transaction_from = current_record.transaction_from
-          self.transaction_to = current_record.transaction_to
-
-          true
         end
       end
 
@@ -429,16 +415,11 @@ module ActiveRecord
 
       # Terminate: Main implementation
       def _terminate_record(termination_time:)
-        current_time = Time.current
-
-        ActiveRecord::Base.transaction(requires_new: true) do
-          # 1. Lock all records for this entity
-          self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
-
-          # 2. Fetch all current-knowledge segments
+        perform_timeline_operation do |current_time|
+          # 1. Fetch all current-knowledge segments
           segments = find_all_current_knowledge_segments
 
-          # 3. Guard: entity must exist
+          # 2. Guard: entity must exist
           if segments.empty?
             raise ActiveRecord::RecordNotFound.new(
               "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
@@ -450,71 +431,35 @@ module ActiveRecord
           first_segment = segments.first
           last_segment = segments.last
 
-          # 4. Guard: termination_time must be after timeline start
+          # 3. Guard: termination_time must be after timeline start
           if termination_time <= first_segment[valid_from_key]
             raise ArgumentError,
               "termination_time (#{termination_time}) must be greater than " \
               "first segment valid_from (#{first_segment[valid_from_key]})"
           end
 
-          # 5. Guard: termination_time must not exceed timeline end
+          # 4. Guard: termination_time must not exceed timeline end
           if termination_time > last_segment[valid_to_key]
             raise ArgumentError,
               "termination_time (#{termination_time}) exceeds last segment " \
               "valid_to (#{last_segment[valid_to_key]})"
           end
 
-          # 6. No-op: already terminated at this exact time
+          # 5. No-op: already terminated at this exact time
           return true if termination_time == last_segment[valid_to_key]
 
-          # 7. Build records to close and new records
-          records_to_close, new_records = build_termination_records(segments, termination_time, current_time)
-
-          # 8. Close old records FIRST (critical ordering)
-          records_to_close.each do |record|
-            timeline_close(record, current_time)
-          end
-
-          # 9. Insert new records
-          new_records.each do |record|
-            record.save_without_bitemporal_callbacks!(validate: false)
-          end
-
-          # 10. Coalesce adjacent identical segments
-          coalesce_adjacent_segments!(current_time)
-
-          # 11. Validate post-hoc
-          validate_cascade_correction_timeline!
-
-          # 12. Update self to point at the currently-valid or last record
-          all_current = find_all_current_knowledge_segments
-          current_record = all_current.find { |r|
-            r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
-          } || all_current.last
-
-          @_swapped_id_previously_was = swapped_id
-          @_swapped_id = current_record.swapped_id
-          self[valid_from_key] = current_record[valid_from_key]
-          self[valid_to_key] = current_record[valid_to_key]
-          self.transaction_from = current_record.transaction_from
-          self.transaction_to = current_record.transaction_to
-
-          true
+          # 6. Build records to close and new records
+          build_termination_records(segments, termination_time, current_time)
         end
       end
 
       # Cancel Termination: Main implementation
       def _cancel_termination_record
-        current_time = Time.current
-
-        ActiveRecord::Base.transaction(requires_new: true) do
-          # 1. Lock all records for this entity
-          self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
-
-          # 2. Fetch all current-knowledge segments
+        perform_timeline_operation do |current_time|
+          # 1. Fetch all current-knowledge segments
           segments = find_all_current_knowledge_segments
 
-          # 3. Guard: entity must exist
+          # 2. Guard: entity must exist
           if segments.empty?
             raise ActiveRecord::RecordNotFound.new(
               "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
@@ -523,10 +468,10 @@ module ActiveRecord
             )
           end
 
-          # 4. No-op: not terminated (last segment extends to infinity)
+          # 3. No-op: not terminated (last segment extends to infinity)
           return true if segments.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
 
-          # 5. Find pre-termination state via transaction history
+          # 4. Find pre-termination state via transaction history
           pre_termination_state = find_pre_termination_state
           if pre_termination_state.nil?
             raise PreTerminationStateNotFoundError,
@@ -534,44 +479,20 @@ module ActiveRecord
               "with bitemporal_id=#{bitemporal_id}"
           end
 
-          # 6. Close ALL current segments
-          segments.each do |record|
-            timeline_close(record, current_time)
-          end
-
-          # 7. Recreate pre-termination segments with new transaction_from
+          # 5. Close ALL current segments; recreate pre-termination segments with new transaction_from.
           #    Must clear deleted_at because historical records have it set (by timeline_close or
           #    upstream's update_transaction_to), and bitemporal_assign_initialize_value would use it
           #    to overwrite transaction_to during save.
-          pre_termination_state.each do |old_record|
+          new_records = pre_termination_state.map do |old_record|
             new_record = timeline_dup(old_record)
             new_record.id = nil
             new_record.transaction_from = current_time
             new_record.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
             new_record.deleted_at = nil if new_record.class.column_names.include?("deleted_at")
-            new_record.save_without_bitemporal_callbacks!(validate: false)
+            new_record
           end
 
-          # 8. Coalesce adjacent identical segments
-          coalesce_adjacent_segments!(current_time)
-
-          # 9. Validate post-hoc
-          validate_cascade_correction_timeline!
-
-          # 10. Update self to point at the currently-valid or last record
-          all_current = find_all_current_knowledge_segments
-          current_record = all_current.find { |r|
-            r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
-          } || all_current.last
-
-          @_swapped_id_previously_was = swapped_id
-          @_swapped_id = current_record.swapped_id
-          self[valid_from_key] = current_record[valid_from_key]
-          self[valid_to_key] = current_record[valid_to_key]
-          self.transaction_from = current_record.transaction_from
-          self.transaction_to = current_record.transaction_to
-
-          true
+          [segments, new_records]
         end
       end
 
@@ -634,21 +555,17 @@ module ActiveRecord
 
       # Cancel Shift Genesis: Main implementation
       #
-      # Algorithm mirrors _cancel_termination_record:
-      # 1. Lock → 2. Fetch segments → 3. Guard existence →
-      # 4. No-op if genesis matches original → 5. Find pre-shift state →
-      # 6. Close current → 7. Recreate pre-shift → 8. Coalesce → 9. Validate → 10. Reload self
+      # Algorithm mirrors _cancel_termination_record (perform_timeline_operation does
+      # the lock, close, insert, coalesce, validate and repointing self):
+      # 1. Fetch segments → 2. Guard existence → 3. No-op if genesis matches original →
+      # 4. Find pre-shift state → 5. Close current, recreate pre-shift
+      # Unlike the other ops, self falls back to the *first* segment when none covers now.
       def _cancel_shift_genesis_record
-        current_time = Time.current
-
-        ActiveRecord::Base.transaction(requires_new: true) do
-          # 1. Lock all records for this entity
-          self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
-
-          # 2. Fetch all current-knowledge segments
+        perform_timeline_operation(repoint_fallback: :first) do |current_time|
+          # 1. Fetch all current-knowledge segments
           segments = find_all_current_knowledge_segments
 
-          # 3. Guard: entity must exist
+          # 2. Guard: entity must exist
           if segments.empty?
             raise ActiveRecord::RecordNotFound.new(
               "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
@@ -657,12 +574,12 @@ module ActiveRecord
             )
           end
 
-          # 4. No-op: genesis matches original (never shifted, or already canceled)
+          # 3. No-op: genesis matches original (never shifted, or already canceled)
           current_genesis = segments.first[valid_from_key]
           original_genesis = find_original_genesis
           return true if current_genesis == original_genesis
 
-          # 5. Find pre-shift state via transaction history
+          # 4. Find pre-shift state via transaction history
           pre_shift_state = find_pre_shift_genesis_state(current_genesis)
           if pre_shift_state.nil?
             raise PreShiftGenesisStateNotFoundError,
@@ -670,44 +587,20 @@ module ActiveRecord
               "with bitemporal_id=#{bitemporal_id}"
           end
 
-          # 6. Close ALL current segments
-          segments.each do |record|
-            timeline_close(record, current_time)
-          end
-
-          # 7. Recreate pre-shift segments with new transaction_from
+          # 5. Close ALL current segments; recreate pre-shift segments with new transaction_from.
           #    Must clear deleted_at because historical records have it set (by timeline_close or
           #    upstream's update_transaction_to), and bitemporal_assign_initialize_value would use it
           #    to overwrite transaction_to during save.
-          pre_shift_state.each do |old_record|
+          new_records = pre_shift_state.map do |old_record|
             new_record = timeline_dup(old_record)
             new_record.id = nil
             new_record.transaction_from = current_time
             new_record.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
             new_record.deleted_at = nil if new_record.class.column_names.include?("deleted_at")
-            new_record.save_without_bitemporal_callbacks!(validate: false)
+            new_record
           end
 
-          # 8. Coalesce adjacent identical segments
-          coalesce_adjacent_segments!(current_time)
-
-          # 9. Validate no overlapping valid periods
-          validate_cascade_correction_timeline!
-
-          # 10. Reload self from the restored segment that covers our valid_from
-          all_current = find_all_current_knowledge_segments
-          current_record = all_current.find { |r|
-            r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
-          } || all_current.first
-
-          @_swapped_id_previously_was = swapped_id
-          @_swapped_id = current_record.swapped_id
-          self[valid_from_key] = current_record[valid_from_key]
-          self[valid_to_key] = current_record[valid_to_key]
-          self.transaction_from = current_record.transaction_from
-          self.transaction_to = current_record.transaction_to
-
-          true
+          [segments, new_records]
         end
       end
 

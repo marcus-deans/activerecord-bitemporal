@@ -122,4 +122,69 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
       end
     end
   end
+
+  # Characterizes where self points after an op when no segment covers now. This is
+  # today's behaviour, kept unchanged by extracting the shared skeleton
+  # (perform_timeline_operation's repoint_fallback); it's expected to change once
+  # repointing self is fixed.
+  describe "repointing self when no segment covers now" do
+    let(:_01_01) { "2020/01/01".in_time_zone }
+    let(:_02_01) { "2020/02/01".in_time_zone }
+    let(:_03_01) { "2020/03/01".in_time_zone }
+    let(:_06_01) { "2020/06/01".in_time_zone }
+
+    #   A |01-01, 03-01)  B |03-01, ∞)   then terminated at 06-01, so nothing covers now (Oct)
+    let!(:employee_id) {
+      Timecop.freeze("2020/10/01") do
+        ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+      end
+      Timecop.freeze("2020/10/02") do
+        ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+      end
+      @employee.id
+    }
+
+    it "falls back to the last segment, except cancel_shift_genesis which falls back to the first" do
+      employee = Employee.find(employee_id)
+
+      Timecop.freeze("2020/10/03") { employee.terminate(termination_time: _06_01) }
+      expect([employee.valid_from, employee.valid_to]).to eq [_03_01, _06_01]
+
+      Timecop.freeze("2020/10/04") { employee.shift_genesis(new_valid_from: _02_01) }
+      expect([employee.valid_from, employee.valid_to]).to eq [_03_01, _06_01]
+
+      Timecop.freeze("2020/10/05") { employee.cancel_shift_genesis }
+      expect([employee.valid_from, employee.valid_to]).to eq [_01_01, _03_01]
+
+      Timecop.freeze("2020/10/06") { employee.correct(valid_from: _01_01, name: "A2") }
+      expect([employee.valid_from, employee.valid_to]).to eq [_03_01, _06_01]
+    end
+
+    context "with a future-dated timeline" do
+      #   A |2021-01-01, 2021-03-01)  B |2021-03-01, ∞)   while now is 2020-10
+      let(:_2021_01_01) { "2021/01/01".in_time_zone }
+      let(:_2021_03_01) { "2021/03/01".in_time_zone }
+      let(:_2021_06_01) { "2021/06/01".in_time_zone }
+      let(:infinity) { ActiveRecord::Bitemporal::DEFAULT_VALID_TO }
+
+      let!(:employee_id) {
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_2021_01_01) { @employee = Employee.create!(name: "A") }
+        end
+        Timecop.freeze("2020/10/02") do
+          ActiveRecord::Bitemporal.valid_at(_2021_03_01) { @employee.update!(name: "B") }
+        end
+        @employee.id
+      }
+
+      it "cancel_termination falls back to the last segment" do
+        employee = Employee.ignore_valid_datetime.find_by!(bitemporal_id: employee_id, valid_from: _2021_01_01)
+
+        Timecop.freeze("2020/10/03") { employee.terminate(termination_time: _2021_06_01) }
+        Timecop.freeze("2020/10/04") { employee.cancel_termination }
+
+        expect([employee.valid_from, employee.valid_to]).to eq [_2021_03_01, infinity]
+      end
+    end
+  end
 end
