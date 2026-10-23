@@ -27,10 +27,14 @@ refactored freely. This keeps upstream syncs conflict-free.
 
 - As of 2026-10-23, the fork had changed **0** upstream lines. Its 847 added lines sit in three places
   inside upstream's `bitemporal.rb` (one is a stray blank line), plus two error classes in `errors.rb`.
-- Target, set in step 1a:
-  - all fork code lives in `lib/activerecord-bitemporal/timeline_operations.rb`
-  - that file includes itself into `ActiveRecord::Bitemporal::Persistence`
-  - the only upstream-file footprint is one `require` line in `lib/activerecord-bitemporal.rb`
+- Since step 1, fork code lives in two fork-owned files:
+  - `lib/activerecord-bitemporal/fork.rb`, the entry point. It defines the fork's error classes at
+    require time, like upstream's `errors.rb`, and registers an `on_load` hook.
+  - `lib/activerecord-bitemporal/timeline_operations.rb`, loaded by that hook and included into
+    `ActiveRecord::Bitemporal::Persistence`.
+  - The only upstream-file footprint is `require "activerecord-bitemporal/fork"` at the end of
+    `lib/activerecord-bitemporal.rb`. It must stay after upstream's `on_load` block, so the fork's
+    hook runs after upstream's.
 - ⚠️ **Refinements caveat:**
   - Upstream's `update_transaction_to` and its `dup` override are Ruby refinements, active only inside
     the `Persistence` module body in `bitemporal.rb`.
@@ -131,6 +135,12 @@ now, and starts *after* a fork op has begun. Upstream's own lock covers nothing 
      today's quirks exactly, including timestamp-before-lock and the `.first` vs `.last` fallback;
      later steps fix them in one place.
    - Bar for both: suite green and unchanged, and the repros show the same 11 failures.
+   - ✅ **Done** on local branch `refactor/fork-module`: `a2f0e6c` (move), `f9718ec` (skeleton), plus a
+     fix keeping the error classes defined at require time. Suite 1915 examples / 0 failures; the same
+     11 repros fail; an SQL trace of every op path is identical before and after.
+     - The helpers are `timeline_dup` / `timeline_close`; the skeleton is `perform_timeline_operation`.
+     - `timeline_operations_spec.rb` pins today's `.first`/`.last` repoint fallback, so step 3 (D5)
+       updates those examples.
 2. **F1 + F2** inside the helper, per D1. Port the concurrency repros.
 3. **F4** per D5.
 4. **F5** per D6.

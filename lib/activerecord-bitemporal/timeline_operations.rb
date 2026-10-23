@@ -2,14 +2,9 @@
 
 # Fork-added timeline operations: correct, shift_genesis, terminate and their cancels.
 #
-# Everything the fork adds on top of upstream kufu/activerecord-bitemporal lives in this
-# file, so upstream's own files stay byte-identical and upstream syncs stay conflict-free.
+# Loaded from fork.rb once ActiveRecord is loaded; the fork's error classes live there.
 module ActiveRecord
   module Bitemporal
-    class PreTerminationStateNotFoundError < BitemporalError; end
-
-    class PreShiftGenesisStateNotFoundError < BitemporalError; end
-
     module TimelineOperations
       # Cascade Correction: Correct a retroactive value while preserving future changes
       #
