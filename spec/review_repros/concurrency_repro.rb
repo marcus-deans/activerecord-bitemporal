@@ -2,17 +2,6 @@
 
 require 'spec_helper'
 
-module ReviewInjectBeforeTxn
-  def transaction(*args, **kw, &blk)
-    if (inj = Thread.current[:review_inject])
-      Thread.current[:review_inject] = nil
-      inj.call
-    end
-    super
-  end
-end
-ActiveRecord::Base.singleton_class.prepend(ReviewInjectBeforeTxn)
-
 module ReviewPauseBeforeValidate
   def validate_cascade_correction_timeline!
     if (hook = Thread.current[:review_pause])
@@ -31,33 +20,13 @@ RSpec.describe "Fork review concurrency repros" do
     rows.map { |vf, vt, n, tf, tt| "#{vf.to_date}..#{vt.year == 9999 ? 'inf' : vt.to_date} #{n} tx[#{tf.strftime('%H:%M:%S.%6N')}, #{tt.year == 9999 ? 'inf' : tt.strftime('%H:%M:%S.%6N')})" }.join("\n    ")
   end
 
-  it "current_time is taken before the lock: a write that lands in between gets closed with transaction_to < transaction_from, and as-of queries see overlapping history" do
-    jan = "2020/01/01".in_time_zone
-    feb = "2020/02/01".in_time_zone
-    e = ActiveRecord::Bitemporal.valid_at(jan) { Employee.create!(name: "A") }
-    sleep 0.01
-    ec = Employee.find(e.id)
-    eu = Employee.find(e.id)
-    # Simulates: correct() computes current_time, then another writer (plain update) acquires the lock first.
-    Thread.current[:review_inject] = -> { sleep 0.01; eu.update!(name: "U"); sleep 0.01 }
-    ec.correct(valid_from: feb, name: "X")
-
-    all = Employee.ignore_valid_datetime.within_deleted.where(bitemporal_id: e.id).order(:transaction_from, :valid_from)
-      .pluck(:valid_from, :valid_to, :name, :transaction_from, :transaction_to)
-    puts "\n[ts-before-lock] all rows:\n    #{fmt(all)}"
-    inverted = all.select { |*_, tf, tt| tf > tt }
-    t1 = all.find { |r| r[2] == "X" }[3]
-    t2 = all.find { |r| r[2] == "U" }[3]
-    tq = t1 + (t2 - t1) / 2
-    as_of = ActiveRecord::Bitemporal.transaction_at(tq) {
-      Employee.ignore_valid_datetime.where(bitemporal_id: e.id).order(:valid_from).pluck(:valid_from, :valid_to, :name)
-    }
-    puts "[ts-before-lock] as known at #{tq.strftime('%H:%M:%S.%6N')}: #{as_of.map { |a, b, n| "#{a.to_date}..#{b.year == 9999 ? 'inf' : b.to_date} #{n}" }.join(' | ')}"
-    overlap = as_of.each_cons(2).any? { |(_, vt, _), (vf, _, _)| vt > vf }
-    expect(inverted).to be_empty
-    expect(overlap).to be false
-  end
-
+  # F1/F2 (lock scope, timestamp read before the lock) are fixed by D1 and covered by
+  # timeline_operations_spec.rb ("locking the timeline"); their repros were removed.
+  #
+  # Stays red after D1 by design: the racing write is upstream's plain update!, whose own
+  # lock covers no rows here and which never takes the advisory lock. dsptch-api closes this
+  # by wrapping such writes in lock_family! (see FIX_PLAN.md, D1). The same race with the
+  # app's lock held is covered in timeline_operations_spec.rb ("locking the timeline").
   context "future-dated entity (no row valid now -> lock covers zero rows)", use_truncation: true do
     it "correct() racing a plain update produces overlapping current-knowledge rows" do
       start = 1.year.from_now.beginning_of_day

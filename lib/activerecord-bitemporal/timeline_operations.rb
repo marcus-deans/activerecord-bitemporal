@@ -208,27 +208,57 @@ module ActiveRecord
         end
       end
 
+      # Serializes writes to this entity's timeline until the surrounding transaction ends.
+      #
+      # 1. A transaction-scoped advisory lock on (table_name, bitemporal_id), built exactly
+      #    like dsptch-api's Bitemporal::Methods.lock_family!, so the two are one lock: app
+      #    code holding lock_family! and these operations wait for each other, and an
+      #    operation called under lock_family! re-enters it instead of deadlocking. Unlike a
+      #    row lock it holds even when the entity has no row valid now. Keep the key in sync
+      #    with the app.
+      # 2. FOR UPDATE on every current-knowledge row, not just the one valid now. Upstream's
+      #    save and destroy lock rows but never take the advisory lock, so this makes an
+      #    upstream write already in flight on any of these rows commit before this
+      #    operation reads the timeline.
+      #
+      # Not covered: an upstream save or destroy on an entity with no row valid now. Its own
+      # lock covers no rows, so it can read the timeline before this operation commits and
+      # write after. The app closes that by wrapping such writes in lock_family!.
+      def lock_timeline!
+        keys = [self.class.table_name, bitemporal_id.to_s].map { |value|
+          Arel::Nodes::NamedFunction.new("hashtext", [Arel::Nodes.build_quoted(value)])
+        }
+        lock = Arel::Nodes::NamedFunction.new("pg_advisory_xact_lock", keys)
+        self.class.connection.execute(Arel::SelectManager.new.project(lock).to_sql)
+
+        self.class
+          .where(bitemporal_id: bitemporal_id)
+          .ignore_valid_datetime
+          .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+          .lock!
+          .pluck(:id)
+      end
+
       # Shared skeleton of the five timeline operations.
       #
-      # Owns the steps every operation repeats: timestamp, transaction, lock, close,
+      # Owns the steps every operation repeats: transaction, lock, timestamp, close,
       # insert, coalesce, validate and repointing self. The block does the op-specific
       # part (fetch, guards, build): it receives current_time and returns
       # [records_to_close, new_records]. Raising in the block, or a `return` from the
       # calling op (its no-op exits), leaves the transaction before any write.
       #
+      # current_time is read only once the locks are held, so it is later than every write
+      # that committed while this operation waited for them.
+      #
       # Kept exactly as each op behaved before this was extracted, to be changed here
       # in one place later:
-      # - current_time is read before the lock is taken
-      # - the lock query goes through the default scope
       # - self only gets its ids and time columns copied from the segment it points at
       # - when no segment covers now, self points at all_current.public_send(repoint_fallback):
       #   :last for every op except cancel_shift_genesis, which passes :first
       def perform_timeline_operation(repoint_fallback: :last)
-        current_time = Time.current
-
         ActiveRecord::Base.transaction(requires_new: true) do
-          # Lock all records for this entity
-          self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
+          lock_timeline!
+          current_time = Time.current
 
           # Fetch, guard and build (op-specific)
           records_to_close, new_records = yield(current_time)

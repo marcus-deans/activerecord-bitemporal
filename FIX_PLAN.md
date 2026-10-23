@@ -1,8 +1,9 @@
 # Fork Hardening Plan
 
 Working plan for fixing what the 2026-10-23 review of the fork's timeline operations found
-(`correct`, `shift_genesis`, `terminate` and their cancels). Branch `fix/fork-hardening` is
-stacked on `sync/upstream-7.0.2` (PR #8), so every fix is built and tested against upstream v7.0.2+.
+(`correct`, `shift_genesis`, `terminate` and their cancels). Every fix is built and tested against
+upstream v7.0.2+ (PR #8, merged into `dsptch`). Work lands as a stack of PRs into `dsptch`:
+#9 (this plan) → #10 (step 1, refactor) → D1 (step 2), each based on the one before.
 
 The previous plan in this file (coalesce adjacent identical segments) shipped in PR #4 (`3e6a8fd`).
 Its invariant still stands: **no two adjacent current-knowledge segments may have identical business
@@ -15,7 +16,7 @@ reads as a phantom scheduled change.
 - Repros for open findings live in `spec/review_repros/*_repro.rb`. They aren't picked up by the
   normal suite. Run them with:
   `mise exec ruby@4.0.6 -- bundle exec rspec spec/review_repros --pattern '**/*_repro.rb'`
-  (17 examples, 11 failing as of 2026-10-23). Each fix moves its repro into the matching spec
+  (15 examples, 9 failing after D1). Each fix moves its repro into the matching spec
   file as a real example and deletes it from `spec/review_repros/`.
 - Never run two rspec processes at once: `spec/spec_helper.rb` drops and recreates the test DB.
 - One PR per step into `dsptch`. The full suite stays green at every step.
@@ -50,24 +51,34 @@ refactored freely. This keeps upstream syncs conflict-free.
 Target model: `dsptch` is the product branch dsptch-api pins, and `master` mirrors kufu/master.
 
 - [x] PR #8 (upstream v7.0.2 sync) retargeted to `dsptch`. Held; CI green on the full matrix.
-- [ ] dsptch-api PR into `stage`: Gemfile `branch: 'master'` → `branch: 'dsptch'`, with the lockfile
-      revision unchanged at `2f0de0c`. Opened as rnwbllabs/dsptch-api#20598 (lockfile diff is the one
-      `branch:` line; CI green); waiting on merge. Close the stale draft #14238 (same change, Aug 2026).
-- [ ] Once that PR is merged into `stage`: merge PR #8 into `dsptch`, then a dsptch-api PR bumping the lockfile.
+- [x] dsptch-api PR into `stage`: Gemfile `branch: 'master'` → `branch: 'dsptch'`, with the lockfile
+      revision unchanged at `2f0de0c`. rnwbllabs/dsptch-api#20598, merged 2026-10-23. Close the stale
+      draft #14238 (same change, Aug 2026).
+- [x] PR #8 merged into `dsptch` on 2026-10-23 as **merge commit** `1a5c798`.
+  - **Upstream-sync PRs always use "Create a merge commit", never squash.** A squash drops kufu's
+    master as an ancestor of `dsptch`. Every later sync would then merge against the stale v7.0.0
+    base and conflict wherever kufu re-edits lines, and the no-force-push ruleset makes that
+    unfixable. Normal fork PRs squash.
+- [ ] dsptch-api PR bumping the lockfile to a newer `dsptch` revision. Decide what goes into it before
+      Monday's deploy (the v7.0.2 sync alone, or the hardening stack as well).
 - [ ] Production deploy (planned Mon 2026-10-26) carries the switch to dsptch-api `main`.
 - [x] Rollback safety verified (2026-10-23, against GitHub, with caches wiped and `BUNDLE_DEPLOYMENT=1`):
       Bundler 2.7.2 fetches a locked revision directly by SHA and never checks it's on the named
       branch. An old release locked to `branch: master` @ `2f0de0c` therefore still builds after the
       reset, **as long as `2f0de0c` stays reachable**. Only frozen installs are safe this way; a
       `bundle update` would re-resolve `master` to the new history.
-- [ ] Protect `dsptch` on GitHub. Its history is what keeps `2f0de0c` fetchable, and that's a squash
-      commit no PR ref holds. Currently unprotected. Proposal, as two repository rulesets:
+- [x] Protect `dsptch` on GitHub. Its history is what keeps `2f0de0c` fetchable, and that's a squash
+      commit no PR ref holds. Applied 2026-10-23 as two repository rulesets (ids 25757048, 25757050):
   - *dsptch-integrity*: block deletion and non-fast-forward pushes. **No bypass, not even admins.**
   - *dsptch-pr-flow*: require a PR (0 approvals); admins may bypass for emergencies. Don't require
     specific status checks: CI matrix job names change when upstream changes the matrix (kufu's
     `drop-rails-7-1-support` is in flight), which would leave PRs stuck waiting on a check that
-    never reports.
+    never reports. GitHub also set `require_extra_approval_for_unattributed_changes: true` on
+    this rule by default. It's undocumented in the REST docs and hasn't blocked a merge so far.
   - `master` stays unprotected until the reset; afterwards it can only move by sync.
+- [ ] Graphite: trunk is set to `dsptch`, but `gt track` still reports "untracked branch dsptch", and
+      Graphite has no GitHub access to this repo yet (grant it at app.graphite.com/settings). Until
+      then the stack is plain git branches, with PRs opened via `gh`.
 - [ ] Then: tag the old master head (`legacy-master-2f0de0c`), reset `master` to `upstream/master`, and
       make `dsptch` the GitHub default branch.
 
@@ -94,8 +105,8 @@ Target model: `dsptch` is the product branch dsptch-api pins, and `master` mirro
 
 ## 2. Decisions needed
 
-**D1. Lock mechanism (F1, F2).** Upstream's `save`/`destroy` are off-limits (see the fork-boundary rule).
-Proposal, all inside fork code:
+**D1. Lock mechanism (F1, F2).** ✅ **Decided 2026-10-23 and implemented** (step 2). Upstream's
+`save`/`destroy` are off-limits (see the fork-boundary rule), so everything is inside fork code:
 1. **Advisory lock.** Take a Postgres advisory transaction lock on `(table_name, bitemporal_id)`,
    built exactly like dsptch-api's `lock_family!` (`hashtext` of each). Then the app's lock and the
    gem's are the *same* lock. It's re-entrant, so the app's existing calls nest harmlessly.
@@ -109,6 +120,18 @@ now, and starts *after* a fork op has begun. Upstream's own lock covers nothing 
 - Fix it in the app: wrap such writes in `lock_family!`.
 - Optionally, propose upstream's lock scope as a fix to kufu.
 - Match the app's key byte-for-byte (`bitemporal_id` is a UUID string there).
+
+Notes from implementing it:
+- dsptch-api has a **second** advisory-lock scheme. `Api::TemporalPrecondition#lock_family` keys on
+  `('api:temporal_family', "#{model.name}:#{family_key}")`, deliberately apart from `lock_family!`.
+  The gem matches `lock_family!`, the only key it can compute. API services that call
+  `lock_family!` take both, always in the order API → family → rows.
+- Waiting on the gem's lock counts against the app's `lock_timeout`. A timeout raises SQLSTATE
+  55P03, which the app already renders as a 503 "write contended".
+- Lock order is advisory → rows. A transaction that does a plain `update!` on an entity and then
+  calls an op on it, without taking `lock_family!` first, can deadlock with another
+  `lock_family!` holder. Postgres aborts one side (40P01, also a 503). Rule for the app: take
+  `lock_family!` before the first write to an entity in a transaction.
 
 **D2. Bounded correction semantics (F3).** Options:
 - (a) *Patch*: each overlapping segment keeps its own attributes, and only the named ones change. Gaps are preserved, and coalescing merges identical results.
@@ -142,6 +165,18 @@ now, and starts *after* a fork op has begun. Upstream's own lock covers nothing 
      - `timeline_operations_spec.rb` pins today's `.first`/`.last` repoint fallback, so step 3 (D5)
        updates those examples.
 2. **F1 + F2** inside the helper, per D1. Port the concurrency repros.
+   - ✅ **Done** on branch `fix/d1-family-lock`.
+     - `lock_timeline!` takes the advisory lock (same SQL as `lock_family!`), then `FOR UPDATE` on
+       every current-knowledge row.
+     - `perform_timeline_operation` reads `current_time` after both locks.
+     - Specs ("locking the timeline" in `timeline_operations_spec.rb`):
+       - SQL order for all five ops: advisory lock, then row locks, then the first write
+       - a future-dated entity waits for an app `lock_family!` holder and builds on its commit
+       - another connection's `FOR UPDATE NOWAIT` fails mid-op
+       - re-entry under `lock_family!`
+     - 7 of the 8 new examples fail on the pre-D1 code.
+     - Suite 1923 / 0 failures. The F1 and F2 repros went green and were removed. The plain-`update!`
+       race repro stays red by design (the remaining gap above).
 3. **F4** per D5.
 4. **F5** per D6.
 5. **F3** per D2.
@@ -154,7 +189,12 @@ now, and starts *after* a fork op has begun. Upstream's own lock covers nothing 
 - D1's remaining gap: plain `update!`/`destroy` on these models, for entities that may have no row valid now, should run inside `lock_family!`.
 - After step 3: the `reload` calls around `correct` become redundant (harmless to keep).
 - After step 5: `timecodes/correct.rb` should pass only changed attributes.
-- If D1 goes with (b): `lock_family!` can delegate to the gem's lock, so there's one key definition.
+- Optional: expose the gem's lock so `lock_family!` delegates to it, leaving one key definition. Until
+  then, a change to either key silently splits the lock, and the gem's spec only pins its own copy.
+- Take `lock_family!` before the first write to an entity in a transaction (see the D1 notes on lock order).
+- Worth a look: `with_family_precondition` doesn't take `lock_family!` itself, so its digest check
+  races with non-API writers. That's documented in the app as intentional; with the gem now on
+  `lock_family!`'s key, taking it there too would also serialize API writes with gem operations.
 
 ## 5. Docs cleanup
 
