@@ -1744,7 +1744,7 @@ RSpec.describe "Cascade Correction (#correct method)" do
       Employee.ignore_valid_datetime
         .where(bitemporal_id: record.bitemporal_id)
         .where(transaction_to: tt_infinity)
-        .order(:valid_from)
+        .order(:valid_from, :valid_to)
         .pluck(:valid_from, :valid_to, :name, :emp_code)
     end
 
@@ -1878,6 +1878,103 @@ RSpec.describe "Cascade Correction (#correct method)" do
       end
     end
 
+    # An upstream update! that sets the values the next segment already has leaves two equal
+    # segments side by side: [Jan, Mar) A, [Mar, May) B, [May, ∞) B
+    context "a seam of equal segments left by an upstream update" do
+      let!(:employee) {
+        built = build_timeline(_01_01, { name: "A", emp_code: "E1" }, [_05_01, { name: "B" }])
+        Timecop.freeze("2020/10/02") {
+          ActiveRecord::Bitemporal.valid_at(_03_01) { Employee.find_at_time(_03_01, built.id).update!(name: "B") }
+        }
+        Employee.find_at_time(_01_01, built.id)
+      }
+
+      it "merges it when the patch changes nothing" do
+        correct_at(corrected_at, employee, valid_from: _05_01, valid_to: infinity, name: "B")
+
+        expect(segments(employee)).to eq [
+          [_01_01, _03_01, "A", "E1"],
+          [_03_01, infinity, "B", "E1"],
+        ]
+        expect(written_at(employee, corrected_at)).to eq(closed: 2, inserted: 1, zero_length: 0)
+      end
+
+      it "merges it when the patch changes another part of the timeline" do
+        correct_at(corrected_at, employee, valid_from: _01_01, valid_to: _02_01, name: "X")
+
+        expect(segments(employee)).to eq [
+          [_01_01, _02_01, "X", "E1"],
+          [_02_01, _03_01, "A", "E1"],
+          [_03_01, infinity, "B", "E1"],
+        ]
+        expect(written_at(employee, corrected_at)).to eq(closed: 3, inserted: 3, zero_length: 0)
+      end
+    end
+
+    # A current row of zero length, [May, May) Q, sharing its start with the segment after it.
+    # Inserted after that segment, so it sorts after it by valid_from alone.
+    context "a zero-length segment sharing its start with the next one" do
+      let!(:employee) {
+        built = build_timeline(_01_01, { name: "A", emp_code: "E1" }, [_05_01, { name: "B" }])
+        Timecop.freeze("2020/10/02") {
+          Employee.unscoped.insert_all!([{
+            bitemporal_id: built.bitemporal_id, name: "Q", emp_code: "E1", valid_from: _05_01, valid_to: _05_01,
+            transaction_from: Time.current, transaction_to: tt_infinity, created_at: Time.current, updated_at: Time.current,
+          }])
+        }
+        built
+      }
+
+      it "absorbs it into a span that covers it" do
+        correct_at(corrected_at, employee, valid_from: _03_01, valid_to: _09_01, name: "X")
+
+        expect(segments(employee)).to eq [
+          [_01_01, _03_01, "A", "E1"],
+          [_03_01, _09_01, "X", "E1"],
+          [_09_01, infinity, "B", "E1"],
+        ]
+      end
+
+      it "corrects another part of the timeline and leaves it as it is" do
+        correct_at(corrected_at, employee, valid_from: _02_01, valid_to: _03_01, name: "X")
+
+        expect(segments(employee)).to eq [
+          [_01_01, _02_01, "A", "E1"],
+          [_02_01, _03_01, "X", "E1"],
+          [_03_01, _05_01, "A", "E1"],
+          [_05_01, _05_01, "Q", "E1"],
+          [_05_01, infinity, "B", "E1"],
+        ]
+      end
+    end
+
+    context "an attribute with no column" do
+      let(:noted_employee_class) {
+        Class.new(Employee) {
+          def self.name; "NotedEmployee"; end
+          attribute :note, :string
+        }
+      }
+
+      it "is no change on its own" do
+        employee = noted_employee_class.find_at_time(_01_01, build_timeline(_01_01, { name: "A", emp_code: "E1" }).id)
+
+        correct_at(corrected_at, employee, valid_from: _02_01, valid_to: _04_01, note: "x")
+
+        expect(written_at(employee, corrected_at)).to eq(closed: 0, inserted: 0, zero_length: 0)
+      end
+
+      it "doesn't keep equal neighbours apart" do
+        built = build_timeline(_01_01, { name: "A", emp_code: "E1" }, [_03_01, { name: "B" }])
+        employee = noted_employee_class.find_at_time(_01_01, built.id)
+
+        correct_at(corrected_at, employee, valid_from: _03_01, name: "A", note: "x")
+
+        expect(segments(employee)).to eq [[_01_01, infinity, "A", "E1"]]
+        expect(written_at(employee, corrected_at)).to eq(closed: 2, inserted: 1, zero_length: 0)
+      end
+    end
+
     context "result equal to a neighbouring segment" do
       it "merges with both neighbours without zero-length rows" do
         employee = build_timeline(_01_01, { name: "A", emp_code: "E1" }, [_03_01, { name: "B" }], [_05_01, { name: "A" }])
@@ -1936,6 +2033,19 @@ RSpec.describe "Cascade Correction (#correct method)" do
           }.to raise_error(ArgumentError, /#{column}/)
           expect(written_at(employee, corrected_at)).to eq(closed: 0, inserted: 0, zero_length: 0)
         end
+      end
+
+      it "rejects an alias of a valid-time column and writes nothing" do
+        aliased_employee_class = Class.new(Employee) {
+          def self.name; "AliasedEmployee"; end
+          alias_attribute :effective_from, :valid_from
+        }
+        aliased = aliased_employee_class.find_at_time(_01_01, employee.id)
+
+        expect {
+          correct_at(corrected_at, aliased, valid_from: _02_01, valid_to: _04_01, name: "X", effective_from: _03_01)
+        }.to raise_error(ArgumentError, /effective_from/)
+        expect(written_at(employee, corrected_at)).to eq(closed: 0, inserted: 0, zero_length: 0)
       end
 
       it "rejects string keys too" do

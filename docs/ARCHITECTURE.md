@@ -180,9 +180,11 @@ The `#correct` method implements cascade correction - fixing historical data whi
    a. Split every segment overlapping the span at the span's edges
    b. Assign the corrected attributes to each piece inside the span; each keeps its
       own values for the attributes not given
-   c. Keep segments the patch wouldn't change; if none would, stop without writing
-   d. Merge adjacent pieces with equal attributes
+   c. Keep the rows of segments the patch wouldn't change
+   d. Merge adjacent pieces with equal attributes anywhere in the timeline, including
+      seams an upstream update! left (only stored columns count, not virtual attributes)
    e. Records outside the span are preserved (CASCADE), and gaps stay gaps
+   f. Nothing changed and nothing to merge: write nothing
 6. CLOSE replaced records (set transaction_to = now)
 7. INSERT new timeline records
 8. VALIDATE no overlapping valid times

@@ -10,9 +10,9 @@ module ActiveRecord
       #
       # A patch over [valid_from, valid_to), like SQL:2011's UPDATE ... FOR PORTION OF: each
       # segment overlapping the span keeps its own attributes there, with only the given ones
-      # replaced. Gaps stay gaps and everything outside the span is untouched. Unlike the
-      # standard, adjacent equal segments are merged, and segments the patch wouldn't change
-      # aren't written (if none would, nothing is).
+      # replaced. Gaps stay gaps, and segments the patch wouldn't change keep their rows. Unlike
+      # the standard, adjacent equal segments are merged anywhere in the timeline, as every
+      # operation here does, so a correction that changes nothing writes only to merge those.
       #
       # @param valid_from [Time, Date, String] When the correction starts being true
       # @param valid_to [Time, Date, String, nil] When the correction ends (optional)
@@ -31,10 +31,12 @@ module ActiveRecord
           raise ArgumentError, "valid_to (#{valid_to}) must be greater than valid_from (#{valid_from})"
         end
 
-        bitemporal_columns = attributes.keys.map(&:to_s) &
-          (BITEMPORAL_INFRASTRUCTURE_COLUMNS + [valid_from_key.to_s, valid_to_key.to_s])
-        unless bitemporal_columns.empty?
-          raise ArgumentError, "correct can't write bitemporal columns: #{bitemporal_columns.join(', ')}"
+        bitemporal_columns = BITEMPORAL_INFRASTRUCTURE_COLUMNS + [valid_from_key.to_s, valid_to_key.to_s]
+        rejected = attributes.keys.map(&:to_s).select { |key|
+          bitemporal_columns.include?(self.class.attribute_aliases.fetch(key, key))
+        }
+        unless rejected.empty?
+          raise ArgumentError, "correct can't write bitemporal columns: #{rejected.join(', ')}"
         end
 
         with_bitemporal_option(correcting: true) do
@@ -104,8 +106,7 @@ module ActiveRecord
           .where(bitemporal_id: bitemporal_id)
           .ignore_valid_datetime
           .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
-          .order(valid_from_key => :desc)
-          .pick(valid_to_key)
+          .maximum(valid_to_key)
         return false if last_valid_to.nil?
         last_valid_to < ActiveRecord::Bitemporal::DEFAULT_VALID_TO
       end
@@ -187,9 +188,10 @@ module ActiveRecord
 
       BITEMPORAL_INFRASTRUCTURE_COLUMNS = %w[id type created_at updated_at bitemporal_id transaction_from transaction_to deleted_at].freeze
 
+      # Stored columns only: an attribute with no column can't tell two rows apart
       def bitemporal_business_attributes(record)
         excluded = BITEMPORAL_INFRASTRUCTURE_COLUMNS + [valid_from_key, valid_to_key]
-        record.attributes.except(*excluded)
+        record.attributes.slice(*record.class.column_names).except(*excluded)
       end
 
       def coalesce_adjacent_segments!(current_time)
@@ -353,13 +355,8 @@ module ActiveRecord
               "(#{timeline_end}). Cancel termination first to extend the timeline."
           end
 
-          # 3. Patch the span; a correction that changes no segment writes nothing
-          records_to_close, new_records = build_correction_records(
-            segments, valid_from, effective_valid_to, attributes, current_time
-          )
-          return true if records_to_close.empty?
-
-          [records_to_close, new_records]
+          # 3. Patch the span
+          build_correction_records(segments, valid_from, effective_valid_to, attributes, current_time)
         end
       end
 
@@ -404,7 +401,8 @@ module ActiveRecord
           .where(bitemporal_id: bitemporal_id)
           .ignore_valid_datetime
           .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
-          .order(valid_from_key => :asc)
+          # valid_to breaks ties, so a zero-length row comes before the segment it shares a start with
+          .order(valid_from_key => :asc, valid_to_key => :asc)
           .to_a
           .each { |record|
             record.id = record.swapped_id
@@ -723,7 +721,7 @@ module ActiveRecord
           .where(bitemporal_id: bitemporal_id)
           .ignore_valid_datetime
           .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
-          .order(valid_from_key => :asc)
+          .order(valid_from_key => :asc, valid_to_key => :asc)
           .to_a
 
         records.each_cons(2) do |r1, r2|
@@ -739,11 +737,11 @@ module ActiveRecord
       # Builds correct's patch over [valid_from, valid_to): returns [records_to_close, new_records].
       #
       # Each segment overlapping the span is split at the span's edges and the piece inside gets
-      # `attributes`; a segment the patch wouldn't change is kept as it is. When no segment changes
-      # this returns [[], []]. Otherwise equal adjacent segments of the resulting timeline are merged
-      # here, before anything is written, so coalescing has no rows of this operation to close again.
+      # `attributes`; a segment the patch wouldn't change is kept as it is. Equal adjacent segments
+      # of the resulting timeline, old seams included, are merged here before anything is written,
+      # so coalescing has no rows of this operation to close again. When nothing changes and
+      # nothing merges, this returns [[], []].
       def build_correction_records(segments, valid_from, valid_to, attributes, current_time)
-        changed = false
         timeline = segments.flat_map { |segment|
           from = segment[valid_from_key]
           to = segment[valid_to_key]
@@ -753,14 +751,12 @@ module ActiveRecord
           corrected.assign_attributes(attributes)
           next [segment] if bitemporal_business_attributes(corrected) == bitemporal_business_attributes(segment)
 
-          changed = true
           [
             (timeline_piece(segment, from, valid_from, current_time) if from < valid_from),
             corrected,
             (timeline_piece(segment, valid_to, to, current_time) if to > valid_to),
           ].compact
         }
-        return [[], []] unless changed
 
         merged = timeline.each_with_object([]) { |piece, acc|
           previous = acc.last

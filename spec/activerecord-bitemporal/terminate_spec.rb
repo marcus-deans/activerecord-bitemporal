@@ -984,6 +984,30 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
       end
     end
 
+    # A current zero-length row [May, May) sharing its start with the last segment, as an
+    # upstream destroy at a segment's exact start leaves behind
+    context "with a zero-length segment sharing its start with the last one" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "B") }
+        end
+        Timecop.freeze("2020/10/02") do
+          Employee.unscoped.insert_all!([{
+            bitemporal_id: @employee.bitemporal_id, name: "Q", valid_from: _05_01, valid_to: _05_01,
+            transaction_from: Time.current, transaction_to: tt_infinity, created_at: Time.current, updated_at: Time.current,
+          }])
+          # Any UPDATE moves a row to the end of the table, so the last segment now comes
+          # back after the zero-length row when the two tie on valid_from
+          Employee.unscoped.where(bitemporal_id: @employee.bitemporal_id, valid_to: infinity).update_all(updated_at: Time.current)
+        end
+      end
+
+      it "returns false" do
+        expect(find_ignoring_valid_time(@employee).terminated?).to be false
+      end
+    end
+
     # Test 9.4: When self is not the last segment → still correct
     context "when self is early in a multi-segment timeline" do
       before do
