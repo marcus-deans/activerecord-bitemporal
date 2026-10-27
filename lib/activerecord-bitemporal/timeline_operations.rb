@@ -8,11 +8,21 @@ module ActiveRecord
     module TimelineOperations
       # Cascade Correction: Correct a retroactive value while preserving future changes
       #
+      # A patch over [valid_from, valid_to), like SQL:2011's UPDATE ... FOR PORTION OF: each
+      # segment overlapping the span keeps its own attributes there, with only the given ones
+      # replaced. Gaps stay gaps, and segments the patch wouldn't change keep their rows. Unlike
+      # the standard, adjacent equal segments are merged anywhere in the timeline, as every
+      # operation here does, so a correction that changes nothing writes only to merge those.
+      #
       # @param valid_from [Time, Date, String] When the correction starts being true
       # @param valid_to [Time, Date, String, nil] When the correction ends (optional)
       #   - If specified: Correct exactly [valid_from, valid_to), resume timeline at valid_to
-      #   - If omitted: Correct from valid_from to next change point, preserve all future changes
+      #   - If omitted: Correct from valid_from to the end of the segment containing it, preserving
+      #     every later segment. That end counts even when the next segment holds equal values.
       # @param attributes [Hash] The corrected attribute values
+      # @raise [ArgumentError] if valid_to <= valid_from, or attributes name a bitemporal column
+      # @raise [ActiveRecord::RecordNotFound] if no segment contains valid_from
+      # @raise [ActiveRecord::Bitemporal::ValidDatetimeRangeError] if valid_to is past the timeline's end
       # @return [Boolean] true if successful
       def correct(valid_from:, valid_to: nil, **attributes)
         valid_from = valid_from.in_time_zone if valid_from.respond_to?(:in_time_zone)
@@ -20,6 +30,14 @@ module ActiveRecord
 
         if valid_to && valid_to <= valid_from
           raise ArgumentError, "valid_to (#{valid_to}) must be greater than valid_from (#{valid_from})"
+        end
+
+        bitemporal_columns = BITEMPORAL_INFRASTRUCTURE_COLUMNS + [valid_from_key.to_s, valid_to_key.to_s]
+        rejected = attributes.keys.map(&:to_s).select { |key|
+          bitemporal_columns.include?(self.class.attribute_aliases.fetch(key, key))
+        }
+        unless rejected.empty?
+          raise ArgumentError, "correct can't write bitemporal columns: #{rejected.join(', ')}"
         end
 
         with_bitemporal_option(correcting: true) do
@@ -89,8 +107,7 @@ module ActiveRecord
           .where(bitemporal_id: bitemporal_id)
           .ignore_valid_datetime
           .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
-          .order(valid_from_key => :desc)
-          .pick(valid_to_key)
+          .maximum(valid_to_key)
         return false if last_valid_to.nil?
         last_valid_to < ActiveRecord::Bitemporal::DEFAULT_VALID_TO
       end
@@ -172,9 +189,10 @@ module ActiveRecord
 
       BITEMPORAL_INFRASTRUCTURE_COLUMNS = %w[id type created_at updated_at bitemporal_id transaction_from transaction_to deleted_at].freeze
 
+      # Stored columns only: an attribute with no column can't tell two rows apart
       def bitemporal_business_attributes(record)
         excluded = BITEMPORAL_INFRASTRUCTURE_COLUMNS + [valid_from_key, valid_to_key]
-        record.attributes.except(*excluded)
+        record.attributes.slice(*record.class.column_names).except(*excluded)
       end
 
       def coalesce_adjacent_segments!(current_time)
@@ -300,12 +318,9 @@ module ActiveRecord
       # Cascade Correction: Main implementation
       def _correct_record(valid_from:, valid_to:, attributes:)
         perform_timeline_operation do |current_time|
-          # 1. Find all affected records (current knowledge, from valid_from onward)
-          affected_records = find_affected_records_for_correction(valid_from)
-
-          # Check if any record actually contains valid_from
-          # (valid_from must fall within an existing record's valid time range)
-          containing_record = affected_records.find { |r|
+          # 1. Fetch all current-knowledge segments; one must contain valid_from
+          segments = find_all_current_knowledge_segments
+          containing_record = segments.find { |r|
             r[valid_from_key] <= valid_from && r[valid_to_key] > valid_from
           }
 
@@ -316,8 +331,8 @@ module ActiveRecord
             )
           end
 
-          # 2. Determine effective valid_to (for unbounded corrections)
-          effective_valid_to = valid_to || determine_correction_end(valid_from, affected_records)
+          # 2. Unbounded corrections end where the containing segment ends, even at a seam
+          effective_valid_to = valid_to || containing_record[valid_to_key]
 
           # Guard: correction must not extend past the entity's timeline end
           #
@@ -331,22 +346,18 @@ module ActiveRecord
           #
           # Unbounded corrections (no explicit valid_to) are safe — they inherit the
           # containing record's valid_to, which already respects the timeline boundary.
-          all_segments = find_all_current_knowledge_segments
-          timeline_end = all_segments.last[valid_to_key]
+          #
+          # A patch leaves a trailing gap empty, so this no longer guards against un-terminating.
+          # It stays as part of the contract callers rely on (e.g. to answer a 409).
+          timeline_end = segments.last[valid_to_key]
           if effective_valid_to > timeline_end
             raise ActiveRecord::Bitemporal::ValidDatetimeRangeError,
               "correction valid_to (#{effective_valid_to}) exceeds timeline end " \
               "(#{timeline_end}). Cancel termination first to extend the timeline."
           end
 
-          # 3. Build the new timeline: [records_to_close, new_timeline]
-          bitemporal_build_cascade_correction_records(
-            affected_records: affected_records,
-            valid_from: valid_from,
-            valid_to: effective_valid_to,
-            attributes: attributes,
-            current_time: current_time
-          )
+          # 3. Patch the span
+          build_correction_records(segments, valid_from, effective_valid_to, attributes, current_time)
         end
       end
 
@@ -391,7 +402,8 @@ module ActiveRecord
           .where(bitemporal_id: bitemporal_id)
           .ignore_valid_datetime
           .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
-          .order(valid_from_key => :asc)
+          # valid_to breaks ties, so a zero-length row comes before the segment it shares a start with
+          .order(valid_from_key => :asc, valid_to_key => :asc)
           .to_a
           .each { |record|
             record.id = record.swapped_id
@@ -704,42 +716,13 @@ module ActiveRecord
         nil
       end
 
-      def find_affected_records_for_correction(correction_valid_from)
-        self.class
-          .where(bitemporal_id: bitemporal_id)
-          .ignore_valid_datetime
-          .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
-          .where("#{valid_to_key} > ?", correction_valid_from)
-          .order(valid_from_key => :asc)
-          .to_a
-          .each { |record|
-            record.id = record.swapped_id
-            record.clear_changes_information
-          }
-      end
-
-      def determine_correction_end(correction_valid_from, affected_records)
-        # Find the record that contains valid_from
-        containing_record = affected_records.find { |r|
-          r[valid_from_key] <= correction_valid_from && r[valid_to_key] > correction_valid_from
-        }
-
-        if containing_record
-          # Correction ends at this record's valid_to (next change point)
-          containing_record[valid_to_key]
-        else
-          # valid_from is in a gap or before all records - use infinity
-          ActiveRecord::Bitemporal::DEFAULT_VALID_TO
-        end
-      end
-
       def validate_cascade_correction_timeline!
         # Check for overlapping valid times at current transaction time
         records = self.class
           .where(bitemporal_id: bitemporal_id)
           .ignore_valid_datetime
           .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
-          .order(valid_from_key => :asc)
+          .order(valid_from_key => :asc, valid_to_key => :asc)
           .to_a
 
         records.each_cons(2) do |r1, r2|
@@ -752,61 +735,55 @@ module ActiveRecord
         end
       end
 
-      def bitemporal_build_cascade_correction_records(affected_records:, valid_from:, valid_to:, attributes:, current_time:)
-        new_timeline = []
+      # Builds correct's patch over [valid_from, valid_to): returns [records_to_close, new_records].
+      #
+      # Each segment overlapping the span is split at the span's edges and the piece inside gets
+      # `attributes`; a segment the patch wouldn't change is kept as it is. Equal adjacent segments
+      # of the resulting timeline, old seams included, are merged here before anything is written,
+      # so coalescing has no rows of this operation to close again. When nothing changes and
+      # nothing merges, this returns [[], []].
+      def build_correction_records(segments, valid_from, valid_to, attributes, current_time)
+        timeline = segments.flat_map { |segment|
+          from = segment[valid_from_key]
+          to = segment[valid_to_key]
+          next [segment] unless from < valid_to && to > valid_from
 
-        # Sort by valid_from to process in order
-        sorted_records = affected_records.sort_by { |r| r[valid_from_key] }
+          corrected = timeline_piece(segment, [from, valid_from].max, [to, valid_to].min, current_time)
+          corrected.assign_attributes(attributes)
+          next [segment] if bitemporal_business_attributes(corrected) == bitemporal_business_attributes(segment)
 
-        # Only close records that overlap the correction range [valid_from, valid_to)
-        records_to_close = sorted_records.select { |r| r[valid_from_key] < valid_to }
-
-        # 1. BEFORE: If first affected record starts before valid_from, create trimmed version
-        first_record = sorted_records.first
-        if first_record && first_record[valid_from_key] < valid_from
-          before_record = timeline_dup(first_record)
-          before_record.id = nil
-          before_record[valid_to_key] = valid_from
-          before_record.transaction_from = current_time
-          before_record.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
-          new_timeline << before_record
-        end
-
-        # 2. CORRECTION: Create the corrected record with new attributes
-        # Inherit from the record that contains valid_from (not from self)
-        containing_record = sorted_records.find { |r|
-          r[valid_from_key] <= valid_from && r[valid_to_key] > valid_from
+          [
+            (timeline_piece(segment, from, valid_from, current_time) if from < valid_from),
+            corrected,
+            (timeline_piece(segment, valid_to, to, current_time) if to > valid_to),
+          ].compact
         }
-        correction_record = timeline_dup(containing_record)
-        correction_record.id = nil
-        correction_record.assign_attributes(attributes)
-        correction_record[valid_from_key] = valid_from
-        correction_record[valid_to_key] = valid_to
-        correction_record.transaction_from = current_time
-        correction_record.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
-        new_timeline << correction_record
 
-        # 3. AFTER: Cascade - preserve records that extend past valid_to
-        if valid_to < ActiveRecord::Bitemporal::DEFAULT_VALID_TO
-          sorted_records.each do |record|
-            next unless record[valid_to_key] > valid_to
-
-            if record[valid_from_key] < valid_to
-              # Partially overlapped — trim start to valid_to
-              after_record = timeline_dup(record)
-              after_record.id = nil
-              after_record[valid_from_key] = valid_to
-              after_record.transaction_from = current_time
-              after_record.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
-              new_timeline << after_record
-            else
-              # Fully after correction — untouched, stop
-              break
-            end
+        merged = timeline.each_with_object([]) { |piece, acc|
+          previous = acc.last
+          if previous && previous[valid_to_key] == piece[valid_from_key] &&
+             bitemporal_business_attributes(previous) == bitemporal_business_attributes(piece)
+            # A stored segment is never extended in place: it's closed and replaced by a new row
+            acc[-1] = timeline_piece(previous, previous[valid_from_key], previous[valid_to_key], current_time) unless previous.new_record?
+            acc.last[valid_to_key] = piece[valid_to_key]
+          else
+            acc << piece
           end
-        end
+        }
 
-        [records_to_close, new_timeline.sort_by { |r| r[valid_from_key] }]
+        records_to_close = segments.reject { |segment| merged.any? { |piece| piece.equal?(segment) } }
+        [records_to_close, merged.select(&:new_record?)]
+      end
+
+      # A new current-knowledge row with source's attributes over [from, to)
+      def timeline_piece(source, from, to, current_time)
+        timeline_dup(source).tap { |piece|
+          piece.id = nil
+          piece[valid_from_key] = from
+          piece[valid_to_key] = to
+          piece.transaction_from = current_time
+          piece.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
+        }
       end
     end
 

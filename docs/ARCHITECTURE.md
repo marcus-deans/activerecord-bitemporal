@@ -38,7 +38,7 @@ ActiveRecord::Bitemporal
 | `_correct_record` | Line 456 | Main cascade correction implementation |
 | `_update_row` | Line 349 | Regular update persistence |
 | `bitemporal_build_update_records` | Line 641 | Builds before/after for updates |
-| `bitemporal_build_cascade_correction_records` | Line 567 | Builds new timeline for corrections |
+| `build_correction_records` | `timeline_operations.rb` | Builds the patched timeline for corrections |
 | `scope_relation` | Line 724 | Uniqueness validation scoping |
 | `terminate` | Line ~332 | Public API for timeline termination |
 | `_terminate_record` | Line ~777 | Main termination implementation |
@@ -173,14 +173,19 @@ The `#correct` method implements cascade correction - fixing historical data whi
 ```
 1. BEGIN TRANSACTION
 2. LOCK all records for the entity (prevent concurrent modifications)
-3. FIND containing record at valid_from
-4. FIND all affected records (from valid_from to valid_to or next change point)
-5. BUILD new timeline:
-   a. Trim the containing record to end at valid_from
-   b. Insert correction record for [valid_from, effective_valid_to)
-   c. Trim/preserve subsequent records as needed
-   d. Preserve future changes beyond the correction window (CASCADE)
-6. CLOSE old records (set transaction_to = now)
+3. FIND containing record at valid_from (none, e.g. inside a gap: RecordNotFound)
+4. END the span at valid_to, or at the containing record's end when unbounded
+   (past the timeline's end: ValidDatetimeRangeError)
+5. BUILD new timeline (a patch):
+   a. Split every segment overlapping the span at the span's edges
+   b. Assign the corrected attributes to each piece inside the span; each keeps its
+      own values for the attributes not given
+   c. Keep the rows of segments the patch wouldn't change
+   d. Merge adjacent pieces with equal attributes anywhere in the timeline, including
+      seams an upstream update! left (only stored columns count, not virtual attributes)
+   e. Records outside the span are preserved (CASCADE), and gaps stay gaps
+   f. Nothing changed and nothing to merge: write nothing
+6. CLOSE replaced records (set transaction_to = now)
 7. INSERT new timeline records
 8. VALIDATE no overlapping valid times
 9. COMMIT TRANSACTION
@@ -223,7 +228,21 @@ After:  A    X             B    C
         Jan  Feb           Apr  May
 ```
 
-**Unbounded** (no `valid_to`): Correction extends to the next change point, fully preserving all future changes.
+Each segment in the span keeps its own values for the attributes not given: a patch, like SQL:2011's `UPDATE ... FOR PORTION OF`. Correcting `name` across a change of `emp_code` leaves that change where it was:
+
+```
+Before: A/E1          A/E2
+        |-------------|-------------------------->
+        Jan          Mar
+
+correct(valid_from: Feb, valid_to: Apr, name: "X")
+
+After:  A/E1 X/E1     X/E2 A/E2
+        |----|--------|----|--------------------->
+        Jan  Feb     Mar  Apr
+```
+
+**Unbounded** (no `valid_to`): Correction extends to the end of the segment containing `valid_from`, fully preserving all future changes. A seam of equal segments still counts as that end.
 
 ```
 Before: A             B             C
@@ -239,7 +258,7 @@ After:  A    X         B             C
 
 ### Attribute Inheritance
 
-When correcting with only some attributes, non-corrected attributes are inherited from the **containing record at valid_from**, not from `self` (which may be a different time period).
+When correcting with only some attributes, each corrected piece keeps the non-corrected attributes of **the segment it was cut from**, not those of `self` (which may be a different time period).
 
 ---
 
