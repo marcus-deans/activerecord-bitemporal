@@ -260,7 +260,7 @@ module ActiveRecord
       # Shared skeleton of the five timeline operations.
       #
       # Owns the steps every operation repeats: transaction, lock, timestamp, close,
-      # insert, coalesce, validate and repointing self. The block does the op-specific
+      # insert, coalesce, validate and reloading self. The block does the op-specific
       # part (fetch, guards, build): it receives current_time and returns
       # [records_to_close, new_records]. Raising in the block, or a `return` from the
       # calling op (its no-op exits), leaves the transaction before any write.
@@ -268,12 +268,9 @@ module ActiveRecord
       # current_time is read only once the locks are held, so it is later than every write
       # that committed while this operation waited for them.
       #
-      # Kept exactly as each op behaved before this was extracted, to be changed here
-      # in one place later:
-      # - self only gets its ids and time columns copied from the segment it points at
-      # - when no segment covers now, self points at all_current.public_send(repoint_fallback):
-      #   :last for every op except cancel_shift_genesis, which passes :first
-      def perform_timeline_operation(repoint_fallback: :last)
+      # Afterwards self is reloaded onto the new timeline (see reload_onto_timeline). An op's
+      # no-op exit writes nothing and leaves self alone.
+      def perform_timeline_operation
         ActiveRecord::Base.transaction(requires_new: true) do
           lock_timeline!
           current_time = Time.current
@@ -297,22 +294,32 @@ module ActiveRecord
           # Validate the new timeline (post-hoc)
           validate_cascade_correction_timeline!
 
-          # Update self to point at the currently-valid record, else the fallback.
           # Query DB since untouched segments aren't in new_records
-          all_current = find_all_current_knowledge_segments
-          current_record = all_current.find { |r|
-            r[valid_from_key] <= Time.current && r[valid_to_key] > Time.current
-          } || all_current.public_send(repoint_fallback)
-
-          @_swapped_id_previously_was = swapped_id
-          @_swapped_id = current_record.swapped_id
-          self[valid_from_key] = current_record[valid_from_key]
-          self[valid_to_key] = current_record[valid_to_key]
-          self.transaction_from = current_record.transaction_from
-          self.transaction_to = current_record.transaction_to
+          reload_onto_timeline(find_all_current_knowledge_segments)
 
           true
         end
+      end
+
+      # Leaves self as reload would: on the current version valid at self's valid datetime
+      # (now when it has none). When no version is valid then, self takes the latest version
+      # starting before it, else the first one. Runs the real reload pinned to that version,
+      # so every reload hook runs (dirty tracking, autosave flags, a model's own resets) and
+      # unsaved changes are discarded.
+      def reload_onto_timeline(segments)
+        at = valid_datetime || Time.current
+        versions = segments.reject { |r| r[valid_from_key] == r[valid_to_key] }
+        version = versions.find { |r| r[valid_from_key] <= at && at < r[valid_to_key] } ||
+          versions.reverse.find { |r| r[valid_from_key] <= at } ||
+          versions.first
+
+        # Forced, so neither the times self was loaded at nor a caller's valid_at!,
+        # transaction_at! or ignore_* block can move the lookup off that version
+        previous_swapped_id = swapped_id
+        ActiveRecord::Bitemporal.valid_at!(version[valid_from_key]) do
+          ActiveRecord::Bitemporal.transaction_at!(Time.current) { reload }
+        end
+        @_swapped_id_previously_was = previous_swapped_id
       end
 
       # Cascade Correction: Main implementation
@@ -593,12 +600,11 @@ module ActiveRecord
       # Cancel Shift Genesis: Main implementation
       #
       # Algorithm mirrors _cancel_termination_record (perform_timeline_operation does
-      # the lock, close, insert, coalesce, validate and repointing self):
+      # the lock, close, insert, coalesce, validate and reloading self):
       # 1. Fetch segments → 2. Guard existence → 3. No-op if genesis matches original →
       # 4. Find pre-shift state → 5. Close current, recreate pre-shift
-      # Unlike the other ops, self falls back to the *first* segment when none covers now.
       def _cancel_shift_genesis_record
-        perform_timeline_operation(repoint_fallback: :first) do |current_time|
+        perform_timeline_operation do |current_time|
           # 1. Fetch all current-knowledge segments
           segments = find_all_current_knowledge_segments
 
