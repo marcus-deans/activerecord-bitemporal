@@ -1254,8 +1254,8 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
       end
     end
 
-    # Test 11.5: shift → update → cancel (full undo, update lost)
-    context "shift → update → cancel (full undo semantics)" do
+    # Test 11.5: shift → update → cancel (refuses, update kept)
+    context "shift → update → cancel" do
       before do
         Timecop.freeze("2020/10/01") do
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
@@ -1263,7 +1263,7 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
       end
 
-      it "restores pre-shift state, losing post-shift updates" do
+      it "refuses, keeping the update made after the shift" do
         employee = Employee.find(@employee.id)
 
         # Shift forward (removes A, trims B)
@@ -1280,15 +1280,186 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
           [_04_01, infinity, "C"]
         )
 
-        # Cancel — full undo restores pre-shift state, post-shift update (C) is lost
-        Timecop.freeze("2020/10/04") do
-          employee.cancel_shift_genesis
-        end
+        # Cancel — refuses rather than discard the update (C)
+        expect {
+          Timecop.freeze("2020/10/04") do
+            employee.cancel_shift_genesis
+          end
+        }.to raise_error(ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError)
 
         expect(current_timeline(employee)).to eq([
-          [_01_01, _03_01, "A"],
-          [_03_01, infinity, "B"]
+          [_02_01, _03_01, "A"],
+          [_03_01, _04_01, "B"],
+          [_04_01, infinity, "C"]
         ])
+      end
+    end
+
+    # A cancel restores the timeline as it stood just before the genesis shift it undoes.
+    # When anything was recorded for the entity after that shift, it refuses rather than
+    # discard it: it raises RecordedSinceGenesisShiftError, which a rescue of
+    # PreShiftGenesisStateNotFoundError catches, writes nothing, and leaves self as it was.
+    describe "what was recorded after the shift" do
+      let(:shifted_at) { "2020/10/02".in_time_zone }
+
+      #   A |Jan, Mar)  B |Mar, ∞), genesis shifted forward to Feb:
+      #   A |Feb, Mar)  B |Mar, ∞)
+      let!(:employee_id) {
+        id = Timecop.freeze("2020/10/01") {
+          employee = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { employee.update!(name: "B") }
+          employee.id
+        }
+        Timecop.freeze(shifted_at) { Employee.find_at_time(_03_01, id).shift_genesis(new_valid_from: _02_01) }
+        id
+      }
+      let(:employee) { Employee.find_at_time(_02_01, employee_id) }
+
+      subject(:cancel) { Timecop.freeze("2020/10/06") { employee.cancel_shift_genesis } }
+
+      # Every row of the entity, each with its own key and every column
+      def history(record)
+        all_records(record)
+          .map { |row| row.attributes.merge("swapped_id" => row.swapped_id) }
+          .sort_by { |row| row["swapped_id"] }
+      end
+
+      # Each write below happens on 10/03, between the shift and the cancel
+      def record_after_shift(&block)
+        Timecop.freeze("2020/10/03") { block.call(Employee.find_at_time(_02_01, employee_id)) }
+      end
+
+      shared_examples "a refused cancel" do
+        it "raises RecordedSinceGenesisShiftError" do
+          expect { cancel }.to raise_error(
+            ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError,
+            /recorded .* after its genesis shift; cancelling it would discard them/
+          )
+        end
+
+        it "is caught by a rescue of PreShiftGenesisStateNotFoundError" do
+          rescued = begin
+            cancel
+          rescue ActiveRecord::Bitemporal::PreShiftGenesisStateNotFoundError => e
+            e
+          end
+
+          expect(rescued).to be_a ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError
+        end
+
+        it "writes nothing" do
+          history_before = history(employee)
+
+          expect { cancel }.to raise_error(ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError)
+          expect(history(employee)).to eq history_before
+        end
+
+        it "leaves self and its unsaved changes as they were" do
+          employee.emp_code = "PENDING"
+          attributes = employee.attributes
+          swapped_id = employee.swapped_id
+
+          expect { cancel }.to raise_error(ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError)
+          expect(employee.attributes).to eq attributes
+          expect(employee.swapped_id).to eq swapped_id
+          expect(employee.changes).to eq("emp_code" => [nil, "PENDING"])
+        end
+      end
+
+      context "when nothing was recorded" do
+        it "restores the timeline as it stood before the shift" do
+          expect(cancel).to be true
+          expect(current_timeline(employee)).to eq [
+            [_01_01, _03_01, "A"],
+            [_03_01, infinity, "B"],
+          ]
+        end
+      end
+
+      context "when a correct changed the segment the shift trimmed" do
+        before { record_after_shift { |e| e.correct(valid_from: _02_01, valid_to: _03_01, name: "X") } }
+
+        it_behaves_like "a refused cancel"
+      end
+
+      context "when a correct changed a segment after the one the shift trimmed" do
+        before { record_after_shift { |e| e.correct(valid_from: _04_01, valid_to: _05_01, name: "X") } }
+
+        it_behaves_like "a refused cancel"
+      end
+
+      context "when an upstream update! changed it" do
+        before {
+          record_after_shift { |e|
+            ActiveRecord::Bitemporal.valid_at(_04_01) { Employee.find(e.id).update!(name: "X") }
+          }
+        }
+
+        it_behaves_like "a refused cancel"
+      end
+
+      # Cancelling would bring back the pre-shift timeline, which runs to infinity
+      context "when a terminate ended it" do
+        before { record_after_shift { |e| e.terminate(termination_time: _06_01) } }
+
+        it_behaves_like "a refused cancel"
+      end
+
+      # Terminating at a segment boundary closes rows and inserts none
+      context "when a terminate ended it at a segment boundary" do
+        before { record_after_shift { |e| e.terminate(termination_time: _03_01) } }
+
+        it_behaves_like "a refused cancel"
+      end
+
+      context "when a cancel and a second shift were recorded" do
+        before {
+          record_after_shift(&:cancel_shift_genesis)
+          Timecop.freeze("2020/10/04") { Employee.find_at_time(_02_01, employee_id).shift_genesis(new_valid_from: _02_01) }
+        }
+
+        it "undoes the second shift" do
+          expect(cancel).to be true
+          expect(current_timeline(employee)).to eq [
+            [_01_01, _03_01, "A"],
+            [_03_01, infinity, "B"],
+          ]
+        end
+      end
+
+      # An upstream update! that sets the values the next segment already has leaves a seam:
+      #   A |Jan, Mar)  B |Mar, May)  B |May, ∞)
+      # Shifting genesis to Apr trims B |Mar, May) to B |Apr, May), and coalescing merges that
+      # with B |May, ∞), so the shift writes more rows at its own transaction time.
+      context "when the shift's coalescing wrote rows" do
+        let!(:employee_id) {
+          id = Timecop.freeze("2020/10/01") {
+            employee = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
+            ActiveRecord::Bitemporal.valid_at(_05_01) { employee.update!(name: "B") }
+            employee.id
+          }
+          Timecop.freeze("2020/10/01 12:00") {
+            ActiveRecord::Bitemporal.valid_at(_03_01) { Employee.find(id).update!(name: "B") }
+          }
+          Timecop.freeze(shifted_at) { Employee.find_at_time(_05_01, id).shift_genesis(new_valid_from: _04_01) }
+          id
+        }
+        let(:employee) { Employee.find_at_time(_05_01, employee_id) }
+
+        it "doesn't count them as recorded after it" do
+          # The trimmed row, closed again by coalescing, and the merged row
+          expect(all_records(employee).where(transaction_from: shifted_at).pluck(:valid_from, :valid_to, :transaction_to)).to contain_exactly(
+            [_04_01, _05_01, shifted_at],
+            [_04_01, infinity, tt_infinity],
+          )
+
+          expect(cancel).to be true
+          # The restored seam is merged again by the cancel's own coalescing (under review)
+          expect(current_timeline(employee)).to eq [
+            [_01_01, _03_01, "A"],
+            [_03_01, infinity, "B"],
+          ]
+        end
       end
     end
 

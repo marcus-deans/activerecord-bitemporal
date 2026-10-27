@@ -512,7 +512,16 @@ employee.shift_genesis(new_valid_from: jan_1)
 employee.cancel_shift_genesis
 ```
 
-**Important:** `cancel_shift_genesis` is a **full undo** — it restores the exact pre-shift state. Any operations performed *after* the shift (such as updates or corrections) are lost. If you need to preserve post-shift changes, consider rebuilding the timeline manually instead of using `cancel_shift_genesis`.
+**Important:** `cancel_shift_genesis` is an **undo** — it restores the timeline exactly as it stood just before the most recent genesis shift. It never discards anything: if anything was recorded for the entity after that shift (a `correct`, an upstream `update!`, a `terminate`, ...), it **refuses**. It raises `ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError`, writes nothing, and leaves the record as it was. That error is a subclass of `PreShiftGenesisStateNotFoundError`, so a `rescue` of that class catches it too:
+
+```ruby
+employee.shift_genesis(new_valid_from: jan_1)
+employee.correct(valid_from: jan_1, valid_to: feb_1, name: "X")
+
+employee.cancel_shift_genesis
+# => ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError
+#    (the correction would be discarded; nothing is written)
+```
 
 Cancel is a no-op if the entity's genesis has never been shifted (returns `true`, no DB changes).
 
@@ -565,7 +574,7 @@ employee.terminate(termination_time: Date.new(2024, 3, 1))
 | **Time dimension** | Valid time (`valid_to`) | Transaction time (`transaction_to`) |
 | **Meaning** | "Entity stopped being valid at date X" | "We no longer know about this entity" |
 | **Historical queries** | ✅ `find_at_time` still works for dates before termination | ❌ Record is logically deleted |
-| **Reversible?** | ✅ `cancel_termination` restores full pre-termination timeline | Requires manual recreation |
+| **Reversible?** | ✅ `cancel_termination` restores the full pre-termination timeline, as long as nothing was recorded for the entity after the termination (otherwise it refuses) | Requires manual recreation |
 | **What changes** | Last segment's `valid_to` is set to termination date; segments after are removed | Record's `transaction_to` is set to deletion time |
 
 ### Basic Termination
@@ -608,9 +617,18 @@ employee.cancel_termination
 #   Jan            Mar            May            ∞
 ```
 
-This recovers **all** segments that were removed during termination, including segments that were entirely past the termination point. The recovery uses the transaction history — no data is ever lost.
+This recovers **all** segments that were removed during termination, including segments that were entirely past the termination point. The recovery uses the transaction history.
 
-**Important:** `cancel_termination` is a **full undo** — it restores the exact pre-termination state. Any operations performed *after* termination (such as corrections within the terminated range) are lost. If you need to preserve post-termination changes, consider rebuilding the timeline manually instead of using `cancel_termination`.
+**Important:** `cancel_termination` is an **undo** — it restores the timeline exactly as it stood just before the termination. It never discards anything: if anything was recorded for the entity after the termination (a `correct` anywhere in the timeline, an upstream `update!`, a re-termination at an earlier point, ...), it **refuses**. It raises `ActiveRecord::Bitemporal::RecordedSinceTerminationError`, writes nothing, and leaves the record as it was. That error is a subclass of `PreTerminationStateNotFoundError`, so a `rescue` of that class catches it too:
+
+```ruby
+employee.terminate(termination_time: may_1)
+employee.correct(valid_from: feb_1, valid_to: mar_1, name: "X")
+
+employee.cancel_termination
+# => ActiveRecord::Bitemporal::RecordedSinceTerminationError
+#    (the correction would be discarded; nothing is written)
+```
 
 Cancel is a no-op if the entity is not currently terminated (returns `true`, no DB changes).
 

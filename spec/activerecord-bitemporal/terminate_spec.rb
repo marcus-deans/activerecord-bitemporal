@@ -547,7 +547,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
       end
     end
 
-    # Test 4.5: Terminate → correct within range → cancel (full undo semantics)
+    # Test 4.5: Terminate → correct within range → cancel (refuses)
     context "terminate → correct within range → cancel" do
       before do
         Timecop.freeze("2020/10/01") do
@@ -556,8 +556,8 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
         end
       end
 
-      # cancel_termination is a full undo: it restores the pre-termination state.
-      # Any corrections made after termination are LOST.
+      # cancel_termination restores the timeline as it stood before the termination,
+      # so it would discard a correction made after it. It refuses instead.
       #
       # before: A             B
       #         |-------------|----------->
@@ -574,10 +574,8 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
       #         Jan  Feb     Mar    May
       #
       # cancel_termination:
-      #         A             B
-      #         |-------------|----------->    ← correction is LOST
-      #         Jan          Mar          ∞
-      it "restores pre-termination state, losing post-termination corrections" do
+      #         raises RecordedSinceTerminationError, timeline unchanged
+      it "refuses, keeping the correction made after the termination" do
         employee = Employee.find(@employee.id)
 
         # Step 1: Terminate at May
@@ -601,16 +599,184 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           [_03_01, _05_01, "B"]
         ])
 
-        # Step 3: Cancel termination — full undo, correction is lost
-        Timecop.freeze("2020/10/04") do
-          employee.cancel_termination
+        # Step 3: Cancel termination — refuses rather than discard the correction
+        expect {
+          Timecop.freeze("2020/10/04") do
+            employee.cancel_termination
+          end
+        }.to raise_error(ActiveRecord::Bitemporal::RecordedSinceTerminationError)
+
+        expect(current_timeline(employee)).to eq([
+          [_01_01, _02_01, "A"],
+          [_02_01, _03_01, "X"],
+          [_03_01, _05_01, "B"]
+        ])
+      end
+    end
+
+    # A cancel restores the timeline as it stood just before the termination it undoes. When
+    # anything was recorded for the entity after that termination, it refuses rather than
+    # discard it: it raises RecordedSinceTerminationError, which a rescue of
+    # PreTerminationStateNotFoundError catches, writes nothing, and leaves self as it was.
+    describe "what was recorded after the termination" do
+      let(:terminated_at) { "2020/10/02".in_time_zone }
+
+      #   A |Jan, Mar)  B |Mar, ∞), terminated at May:
+      #   A |Jan, Mar)  B |Mar, May)
+      let!(:employee_id) {
+        id = Timecop.freeze("2020/10/01") {
+          employee = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { employee.update!(name: "B") }
+          employee.id
+        }
+        Timecop.freeze(terminated_at) { Employee.find_at_time(_01_01, id).terminate(termination_time: _05_01) }
+        id
+      }
+      let(:employee) { Employee.find_at_time(_01_01, employee_id) }
+
+      subject(:cancel) { Timecop.freeze("2020/10/06") { employee.cancel_termination } }
+
+      # Every row of the entity, each with its own key and every column
+      def history(record)
+        all_records(record)
+          .map { |row| row.attributes.merge("swapped_id" => row.swapped_id) }
+          .sort_by { |row| row["swapped_id"] }
+      end
+
+      # Each write below happens on 10/03, between the termination and the cancel
+      def record_after_termination(&block)
+        Timecop.freeze("2020/10/03") { block.call(Employee.find_at_time(_01_01, employee_id)) }
+      end
+
+      shared_examples "a refused cancel" do
+        it "raises RecordedSinceTerminationError" do
+          expect { cancel }.to raise_error(
+            ActiveRecord::Bitemporal::RecordedSinceTerminationError,
+            /recorded .* after its termination; cancelling it would discard them/
+          )
         end
 
-        # Timeline should be back to pre-termination state (no "X")
-        expect(current_timeline(employee)).to eq([
-          [_01_01, _03_01, "A"],
-          [_03_01, infinity, "B"]
-        ])
+        it "is caught by a rescue of PreTerminationStateNotFoundError" do
+          rescued = begin
+            cancel
+          rescue ActiveRecord::Bitemporal::PreTerminationStateNotFoundError => e
+            e
+          end
+
+          expect(rescued).to be_a ActiveRecord::Bitemporal::RecordedSinceTerminationError
+        end
+
+        it "writes nothing" do
+          history_before = history(employee)
+
+          expect { cancel }.to raise_error(ActiveRecord::Bitemporal::RecordedSinceTerminationError)
+          expect(history(employee)).to eq history_before
+        end
+
+        it "leaves self and its unsaved changes as they were" do
+          employee.emp_code = "PENDING"
+          attributes = employee.attributes
+          swapped_id = employee.swapped_id
+
+          expect { cancel }.to raise_error(ActiveRecord::Bitemporal::RecordedSinceTerminationError)
+          expect(employee.attributes).to eq attributes
+          expect(employee.swapped_id).to eq swapped_id
+          expect(employee.changes).to eq("emp_code" => [nil, "PENDING"])
+        end
+      end
+
+      context "when nothing was recorded" do
+        it "restores the timeline as it stood before the termination" do
+          expect(cancel).to be true
+          expect(current_timeline(employee)).to eq [
+            [_01_01, _03_01, "A"],
+            [_03_01, infinity, "B"],
+          ]
+        end
+      end
+
+      context "when a correct changed the segment the termination cut" do
+        before { record_after_termination { |e| e.correct(valid_from: _04_01, valid_to: _05_01, name: "X") } }
+
+        it_behaves_like "a refused cancel"
+      end
+
+      context "when a correct changed a segment before the one the termination cut" do
+        before { record_after_termination { |e| e.correct(valid_from: _01_01, valid_to: _02_01, name: "X") } }
+
+        it_behaves_like "a refused cancel"
+      end
+
+      context "when an upstream update! changed it" do
+        before {
+          record_after_termination { |e|
+            ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.find(e.id).update!(name: "X") }
+          }
+        }
+
+        it_behaves_like "a refused cancel"
+      end
+
+      context "when a terminate ended it earlier" do
+        before { record_after_termination { |e| e.terminate(termination_time: _04_01) } }
+
+        it_behaves_like "a refused cancel"
+      end
+
+      # Terminating at a segment boundary closes rows and inserts none
+      context "when a terminate ended it earlier, at a segment boundary" do
+        before { record_after_termination { |e| e.terminate(termination_time: _03_01) } }
+
+        it_behaves_like "a refused cancel"
+      end
+
+      context "when a cancel and a second termination were recorded" do
+        before {
+          record_after_termination(&:cancel_termination)
+          Timecop.freeze("2020/10/04") { Employee.find_at_time(_01_01, employee_id).terminate(termination_time: _04_01) }
+        }
+
+        it "undoes the second termination" do
+          expect(cancel).to be true
+          expect(current_timeline(employee)).to eq [
+            [_01_01, _03_01, "A"],
+            [_03_01, infinity, "B"],
+          ]
+        end
+      end
+
+      # An upstream update! that sets the values the next segment already has leaves a seam:
+      #   A |Jan, Mar)  B |Mar, May)  B |May, ∞)
+      # Terminating at Jul cuts B |May, ∞) to B |May, Jul), and coalescing merges that with
+      # B |Mar, May), so the termination writes more rows at its own transaction time.
+      context "when the termination's coalescing wrote rows" do
+        let!(:employee_id) {
+          id = Timecop.freeze("2020/10/01") {
+            employee = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
+            ActiveRecord::Bitemporal.valid_at(_05_01) { employee.update!(name: "B") }
+            employee.id
+          }
+          Timecop.freeze("2020/10/01 12:00") {
+            ActiveRecord::Bitemporal.valid_at(_03_01) { Employee.find(id).update!(name: "B") }
+          }
+          Timecop.freeze(terminated_at) { Employee.find_at_time(_01_01, id).terminate(termination_time: _07_01) }
+          id
+        }
+
+        it "doesn't count them as recorded after it" do
+          # The cut row, closed again by coalescing, and the merged row
+          expect(all_records(employee).where(transaction_from: terminated_at).pluck(:valid_from, :valid_to, :transaction_to)).to contain_exactly(
+            [_05_01, _07_01, terminated_at],
+            [_03_01, _07_01, tt_infinity],
+          )
+
+          expect(cancel).to be true
+          # The restored seam is merged again by the cancel's own coalescing (under review)
+          expect(current_timeline(employee)).to eq [
+            [_01_01, _03_01, "A"],
+            [_03_01, infinity, "B"],
+          ]
+        end
       end
     end
   end
