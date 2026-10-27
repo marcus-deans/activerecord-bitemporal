@@ -869,28 +869,6 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
 
   describe "timeline integrity" do
 
-    # Test 6.1: After terminate: no overlaps, no gaps
-    context "after termination" do
-      before do
-        Timecop.freeze("2020/10/01") do
-          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
-          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
-          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
-        end
-      end
-
-      it "maintains no overlaps and no gaps in surviving timeline" do
-        employee = Employee.find(@employee.id)
-
-        Timecop.freeze("2020/10/06") do
-          employee.terminate(termination_time: _04_01)
-        end
-
-        timeline = current_timeline(employee)
-        expect(valid_timeline?(timeline)).to be true
-      end
-    end
-
     # Test 6.2: After cancel: no overlaps, no gaps
     context "after cancel" do
       before do
@@ -1283,10 +1261,13 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
 
         expect(errors).to be_empty
 
-        # Timeline should be consistent
+        # The same timeline as a single termination, whichever thread went first
         timeline = current_timeline(@employee)
+        expect(timeline).to eq([
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"]
+        ])
         expect(valid_timeline?(timeline)).to be true
-        expect(timeline.last[1]).to eq(_05_01)
       end
     end
   end

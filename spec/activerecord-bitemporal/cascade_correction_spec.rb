@@ -74,8 +74,8 @@ RSpec.describe "Cascade Correction (#correct method)" do
 
     # Test 1.1: Basic bounded correction spanning multiple records
     # -------------------------------------------------------------------------
-    # This is the core cascade correction scenario from PROBLEM_ANALYSIS.md:
-    # Correct a period that spans across multiple existing timeline segments.
+    # The core cascade correction scenario: correct a period that spans
+    # several existing timeline segments.
     #
     # The correction should:
     # 1. Trim the first record that starts before valid_from
@@ -1032,13 +1032,15 @@ RSpec.describe "Cascade Correction (#correct method)" do
         # Both threads should succeed (no errors)
         expect(errors).to be_empty
 
-        # Final timeline should be consistent (no overlaps, no gaps)
+        # The spans don't overlap, so either order gives both corrections
         timeline = current_timeline(@employee)
+        expect(timeline).to eq([
+          [_01_01, _02_01, "A"],
+          [_02_01, _03_01, "Thread0"],
+          [_03_01, _04_01, "Thread1"],
+          [_04_01, infinity, "A"]
+        ])
         expect(valid_timeline?(timeline)).to be true
-
-        # Should have both corrections in the timeline
-        names = timeline.map { |_, _, name| name }
-        expect(names).to include("Thread0", "Thread1")
       end
     end
   end

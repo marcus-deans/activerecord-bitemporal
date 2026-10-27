@@ -711,7 +711,7 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
       end
 
-      it "maintains no overlaps and no gaps" do
+      it "extends only the genesis segment, leaving no overlaps or gaps" do
         employee = Employee.find(@employee.id)
 
         Timecop.freeze("2020/10/06") do
@@ -719,8 +719,12 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
 
         timeline = current_timeline(employee)
+        expect(timeline).to eq([
+          [_01_01, _05_01, "A"],
+          [_05_01, _07_01, "B"],
+          [_07_01, infinity, "C"]
+        ])
         expect(valid_timeline?(timeline)).to be true
-        expect(timeline.size).to eq(3)
       end
     end
 
@@ -735,7 +739,7 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
       end
 
-      it "maintains no overlaps and no gaps" do
+      it "trims the timeline to start at the new genesis, leaving no overlaps or gaps" do
         employee = Employee.find(@employee.id)
 
         Timecop.freeze("2020/10/06") do
@@ -743,6 +747,11 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
 
         timeline = current_timeline(employee)
+        expect(timeline).to eq([
+          [_04_01, _05_01, "B"],
+          [_05_01, _07_01, "C"],
+          [_07_01, infinity, "D"]
+        ])
         expect(valid_timeline?(timeline)).to be true
       end
     end
@@ -899,10 +908,10 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
 
         expect(errors).to be_empty
 
-        # Timeline should be consistent
+        # The genesis is the date of whichever thread went last
         timeline = current_timeline(@employee)
+        expect(timeline).to eq([[_03_01, infinity, "A"]]).or eq([[_01_01, infinity, "A"]])
         expect(no_overlaps?(timeline)).to be true
-        expect(timeline.size).to eq(1)
       end
     end
   end
