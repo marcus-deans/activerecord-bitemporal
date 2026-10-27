@@ -699,6 +699,8 @@ employee.cancel_termination
 employee.terminate(termination_time: jul_1)
 ```
 
+That cancel refuses once anything has been recorded for the entity after the termination, including a re-termination at an earlier point. No timeline operation extends an ended timeline, so in that case the timeline can only be extended by hand.
+
 ### Error Handling
 
 ```ruby
@@ -1153,10 +1155,10 @@ position.valid_at(3.days.ago) { |p| p.update!(rate: 200) }  # Backdated change
 position.force_update { |p| p.update(rate: 200) }  # Correction (not temporal)
 position.correct(valid_from: feb_1, name: "X")    # Retroactive correction (preserves cascade)
 position.shift_genesis(new_valid_from: jan_1)      # Change when timeline begins
-position.cancel_shift_genesis                      # Reverse genesis shift (full history recovery)
+position.cancel_shift_genesis                      # Undo the last genesis shift (refuses if anything was recorded since)
 position.shifted_genesis?                          # Check if genesis differs from original
 position.terminate(termination_time: mar_1)        # End timeline at specific date
-position.cancel_termination                        # Reverse termination (full history recovery)
+position.cancel_termination                        # Undo termination (refuses if anything was recorded since)
 position.terminated?                               # Check if timeline has finite end
 
 # Queries
