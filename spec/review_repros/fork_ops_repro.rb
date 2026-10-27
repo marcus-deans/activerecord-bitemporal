@@ -2,11 +2,14 @@
 
 require 'spec_helper'
 
-# Removed once fixed and covered by real specs (cascade_correction_spec.rb, "patch semantics"):
-# - F3, bounded correct flattening other attributes and filling gaps (D2)
+# Removed once fixed and covered by real specs:
+# - F3, bounded correct flattening other attributes and filling gaps (D2;
+#   cascade_correction_spec.rb, "patch semantics")
 # - F5 for correct, zero-length rows from coalescing its own inserts (D2 merges before
-#   inserting). That repro's last zero-length row came from its setup: an upstream update!
-#   at the same frozen time as the create!.
+#   inserting; same spec). That repro's last zero-length row came from its setup: an
+#   upstream update! at the same frozen time as the create!.
+# - F4, self left stale and dirty after an op (D5; timeline_operations_spec.rb, "self after
+#   an operation")
 RSpec.describe "Fork review repros" do
   let(:jan) { "2020/01/01".in_time_zone }
   let(:feb) { "2020/02/01".in_time_zone }
@@ -40,23 +43,6 @@ RSpec.describe "Fork review repros" do
         [mar, may, "Alice", "E002"],
         [may, inf, "Bob", "E002"],
       ])
-    end
-  end
-
-  describe "stale self after correct" do
-    before do
-      Timecop.freeze("2020/10/01") do
-        ActiveRecord::Bitemporal.valid_at(jan) { @e = Employee.create!(name: "A", emp_code: "C1") }
-      end
-    end
-
-    it "self keeps pre-correction attributes and is dirty; a later update! reverts the correction" do
-      e = Employee.find(@e.id)
-      e.correct(valid_from: feb, name: "X") # unbounded -> [Feb, inf)
-      puts "\n[stale self] e.name=#{e.name.inspect} changed?=#{e.changed?} changes=#{e.changes.keys}"
-      expect(Employee.find(e.id).name).to eq("X")
-      e.update!(emp_code: "C2")
-      expect(Employee.find(e.id).name).to eq("X") # FAILS: correction reverted for [now, inf)
     end
   end
 
