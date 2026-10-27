@@ -1568,7 +1568,9 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         threads.each(&:join)
         expect(errors).to be_empty
 
+        # The second cancel finds the original genesis already restored and does nothing
         timeline = current_timeline(@employee)
+        expect(timeline).to eq([[_03_01, infinity, "A"]])
         expect(no_overlaps?(timeline)).to be true
       end
     end
@@ -1640,10 +1642,14 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
       end
 
-      it "restored timeline has no overlaps and no gaps" do
+      it "restores all three segments, leaving no overlaps or gaps" do
         timeline = current_timeline(@employee)
+        expect(timeline).to eq([
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"],
+          [_05_01, infinity, "C"]
+        ])
         expect(valid_timeline?(timeline)).to be true
-        expect(timeline.size).to eq(3)
       end
     end
   end

@@ -882,7 +882,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
         end
       end
 
-      it "maintains no overlaps and no gaps in restored timeline" do
+      it "restores all three segments, leaving no overlaps or gaps" do
         employee = find_ignoring_valid_time(@employee)
 
         Timecop.freeze("2020/10/06") do
@@ -890,9 +890,12 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
         end
 
         timeline = current_timeline(employee)
+        expect(timeline).to eq([
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"],
+          [_05_01, infinity, "C"]
+        ])
         expect(valid_timeline?(timeline)).to be true
-        expect(timeline.size).to eq(3)
-        expect(timeline.last[1]).to eq(infinity)
       end
     end
   end
