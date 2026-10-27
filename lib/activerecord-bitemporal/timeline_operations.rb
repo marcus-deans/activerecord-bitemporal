@@ -257,27 +257,36 @@ module ActiveRecord
       end
 
       # Serializes writes to this entity's timeline until the surrounding transaction ends.
+      # PostgreSQL only.
       #
-      # 1. A transaction-scoped advisory lock on (table_name, bitemporal_id), built exactly
-      #    like the app-side lock_family! helper, so the two are one lock: app
-      #    code holding lock_family! and these operations wait for each other, and an
-      #    operation called under lock_family! re-enters it instead of deadlocking. Unlike a
-      #    row lock it holds even when the entity has no row valid now. Keep the key in sync
-      #    with the app.
-      # 2. FOR UPDATE on every current-knowledge row, not just the one valid now. Upstream's
+      # 1. A transaction-scoped advisory lock with this key:
+      #      pg_advisory_xact_lock(hashtext(<table_name>), hashtext(<bitemporal_id as text>))
+      #    The key is a public contract. A caller holding that lock in the same transaction
+      #    and these operations wait for each other, and an operation called while holding
+      #    it re-enters it instead of deadlocking. Unlike a row lock it holds even when the
+      #    entity has no row valid now.
+      # 2. FOR UPDATE on the row valid now, by the statement upstream's save and save! lock
+      #    with. They lock that row first and then close the row valid at the record's own
+      #    time, another row for a future-dated update. Taking any other row before this one
+      #    could deadlock with them; taking this one first makes them wait holding nothing.
+      # 3. FOR UPDATE on every current-knowledge row, not just the one valid now. Upstream's
       #    save and destroy lock rows but never take the advisory lock, so this makes an
       #    upstream write already in flight on any of these rows commit before this
       #    operation reads the timeline.
       #
-      # Not covered: an upstream save or destroy on an entity with no row valid now. Its own
-      # lock covers no rows, so it can read the timeline before this operation commits and
-      # write after. The app closes that by wrapping such writes in lock_family!.
+      # Not covered: upstream writes that read the timeline before they lock a row this
+      # operation holds. A save on an entity with no row valid now locks no row first, and
+      # destroy reads the version it copies before it locks the row it closes. Either can
+      # read the timeline before this operation commits and write after. Callers serialize
+      # such writes with these operations by holding the same advisory lock.
       def lock_timeline!
         keys = [self.class.table_name, bitemporal_id.to_s].map { |value|
           Arel::Nodes::NamedFunction.new("hashtext", [Arel::Nodes.build_quoted(value)])
         }
         lock = Arel::Nodes::NamedFunction.new("pg_advisory_xact_lock", keys)
         self.class.connection.execute(Arel::SelectManager.new.project(lock).to_sql)
+
+        self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
 
         self.class
           .where(bitemporal_id: bitemporal_id)

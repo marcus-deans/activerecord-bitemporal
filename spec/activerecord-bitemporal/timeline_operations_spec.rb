@@ -512,9 +512,10 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
     let(:_01_01) { "2020/01/01".in_time_zone }
     let(:_02_01) { "2020/02/01".in_time_zone }
 
-    # The app-side lock_family! helper, copied verbatim apart from taking the
-    # model and key as arguments. The timeline operations must take this same lock.
-    def app_lock_family!(model, bitemporal_id)
+    # Holds the advisory lock as a caller does, by the key lock_timeline! documents:
+    # pg_advisory_xact_lock(hashtext(<table_name>), hashtext(<bitemporal_id as text>)).
+    # The timeline operations must take this same lock.
+    def hold_advisory_lock!(model, bitemporal_id)
       keys = [model.table_name, bitemporal_id].map do |value|
         Arel::Nodes::NamedFunction.new("hashtext", [Arel::Nodes.build_quoted(value)])
       end
@@ -544,29 +545,33 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
         "terminate" => [nil, ->(e) { e.terminate(termination_time: "2020/03/01".in_time_zone) }],
         "cancel_termination" => [->(e) { e.terminate(termination_time: "2020/03/01".in_time_zone) }, :cancel_termination.to_proc],
       }.each do |name, (setup, operation)|
-        it "#{name} takes lock_family!'s advisory lock, then row-locks the timeline, before it writes" do
+        it "#{name} takes the advisory lock, then save!'s lock on the row valid now, then row-locks the timeline, before it writes" do
           Timecop.freeze("2020/10/02") { setup&.call(employee) }
+          # The row lock upstream's save! takes before it writes
+          save_lock = Timecop.freeze("2020/10/03") { statements_during { employee.save! } }.find { |sql| sql.include?("FOR UPDATE") }
           statements = Timecop.freeze("2020/10/03") { statements_during { operation.call(employee) } }
 
           expected_lock = "SELECT pg_advisory_xact_lock(hashtext('employees'), hashtext('#{employee.bitemporal_id}'))"
           advisory_lock = statements.index(expected_lock)
-          row_lock = statements.index { |sql| sql.include?("FOR UPDATE") }
+          now_row_lock = statements.index(save_lock)
+          all_rows_lock = statements.index { |sql| sql.include?("FOR UPDATE") && sql != save_lock }
           first_write = statements.index { |sql| sql.match?(/\A\s*(INSERT|UPDATE)\b/i) }
 
-          expect([advisory_lock, row_lock, first_write]).to all(be_an(Integer))
-          expect(advisory_lock).to be < row_lock
-          expect(row_lock).to be < first_write
+          expect([advisory_lock, now_row_lock, all_rows_lock, first_write]).to all(be_an(Integer))
+          expect(advisory_lock).to be < now_row_lock
+          expect(now_row_lock).to be < all_rows_lock
+          expect(all_rows_lock).to be < first_write
         end
       end
     end
 
-    it "re-enters the lock when the caller already holds lock_family!" do
+    it "re-enters the advisory lock when the caller already holds it" do
       employee = Timecop.freeze("2020/10/01") {
         ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
       }
 
       Employee.transaction do
-        app_lock_family!(Employee, employee.bitemporal_id.to_s)
+        hold_advisory_lock!(Employee, employee.bitemporal_id.to_s)
         expect(Timecop.freeze("2020/10/02") { employee.correct(valid_from: _02_01, name: "X") }).to be true
       end
     end
@@ -587,12 +592,12 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           .pluck(:valid_from, :valid_to, :name)
       end
 
-      it "waits for app code holding lock_family!, then builds on what that code committed" do
+      it "waits for a caller holding the advisory lock, then builds on what that caller committed" do
         locked = Queue.new
         release = Queue.new
-        app = in_thread {
+        holder = in_thread {
           Employee.transaction do
-            app_lock_family!(Employee, employee.bitemporal_id.to_s)
+            hold_advisory_lock!(Employee, employee.bitemporal_id.to_s)
             record = Employee.find_at_time(start, employee.id)
             record.valid_at(start + 60.days) { record.update!(name: "U") }
             locked << true
@@ -601,14 +606,14 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
         }
         locked.pop
 
-        # Loaded before the app's write commits, as a caller's copy often is
+        # Loaded before that write commits, as a caller's copy often is
         stale = Employee.find_at_time(start, employee.id)
         operation = in_thread { stale.correct(valid_from: start + 30.days, name: "X") }
         begin
           expect(operation.join(0.5)).to be_nil
         ensure
           release << true
-          app.join
+          holder.join
         end
         operation.join
 
@@ -644,6 +649,52 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
         ensure
           resume << true
           operation.join
+        end
+      end
+
+      context "when the row valid now is stored after a future row" do
+        let(:today) { Time.current.beginning_of_day }
+        let(:start) { today - 100.days }
+
+        # The past update! writes the rows valid now after the future row, so a lock
+        # taking rows in storage order would take the future row first
+        before do
+          [[today + 30.days, "F"], [today - 50.days, "P"]].each do |time, name|
+            record = Employee.find_at_time(time, employee.id)
+            record.valid_at(time) { record.update!(name: name) }
+          end
+        end
+
+        it "waits for an upstream update! of a future version without deadlocking, then builds on it" do
+          locked = Queue.new
+          release = Queue.new
+          paused_employee_class = Class.new(Employee) {
+            def self.name; "PausedEmployee"; end
+            # Runs inside save!, after its lock on the row valid now and before it writes
+            before_update { locked << true; release.pop }
+          }
+          writer = in_thread {
+            record = paused_employee_class.find_at_time(today + 35.days, employee.id)
+            record.valid_at(today + 35.days) { record.update!(name: "U") }
+          }
+          locked.pop
+
+          operation = in_thread { Employee.find(employee.id).correct(valid_from: today + 40.days, name: "X") }
+          begin
+            expect(operation.join(0.5)).to be_nil
+          ensure
+            release << true
+            writer.join
+          end
+          operation.join
+
+          expect(current_timeline(employee)).to eq [
+            [start, today - 50.days, "A"],
+            [today - 50.days, today + 30.days, "P"],
+            [today + 30.days, today + 35.days, "F"],
+            [today + 35.days, today + 40.days, "U"],
+            [today + 40.days, ActiveRecord::Bitemporal::DEFAULT_VALID_TO, "X"],
+          ]
         end
       end
     end
