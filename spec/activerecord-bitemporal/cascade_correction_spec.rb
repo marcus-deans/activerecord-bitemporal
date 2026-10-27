@@ -1272,9 +1272,9 @@ RSpec.describe "Cascade Correction (#correct method)" do
   # Category 9: Seam Coalescing
   # ==========================================================================
   #
-  # correct() can produce "cosmetic seams" — adjacent segments with identical
-  # business attributes split at a boundary. Coalescing merges them into a
-  # single segment.
+  # A correction can make adjacent segments equal: "cosmetic seams", segments with
+  # identical business attributes split at a boundary. They're merged into a single
+  # segment before anything is written, so no seam is ever stored.
   # ==========================================================================
   describe "Category 9: Seam Coalescing" do
 
@@ -1951,16 +1951,17 @@ RSpec.describe "Cascade Correction (#correct method)" do
         ]
       end
 
-      it "corrects another part of the timeline and leaves it as it is" do
+      # A zero-length row holds no version, and every operation closes the ones it finds
+      it "corrects another part of the timeline and closes it" do
         correct_at(corrected_at, employee, valid_from: _02_01, valid_to: _03_01, name: "X")
 
         expect(segments(employee)).to eq [
           [_01_01, _02_01, "A", "E1"],
           [_02_01, _03_01, "X", "E1"],
           [_03_01, _05_01, "A", "E1"],
-          [_05_01, _05_01, "Q", "E1"],
           [_05_01, infinity, "B", "E1"],
         ]
+        expect(written_at(employee, corrected_at)).to eq(closed: 2, inserted: 3, zero_length: 0)
       end
     end
 

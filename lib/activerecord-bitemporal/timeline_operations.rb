@@ -2,6 +2,11 @@
 
 # Fork-added timeline operations: correct, shift_genesis, terminate and their cancels.
 #
+# After any of them the entity's current timeline has no seams (adjacent segments with equal
+# business attributes) and no zero-length rows, whatever upstream writes left there. Rows
+# whose range and values don't change keep their rows, and a call that changes nothing
+# writes nothing and leaves self alone (see perform_timeline_operation).
+#
 # Loaded from fork.rb once ActiveRecord is loaded; the fork's error classes live there.
 module ActiveRecord
   module Bitemporal
@@ -11,8 +16,9 @@ module ActiveRecord
       # A patch over [valid_from, valid_to), like SQL:2011's UPDATE ... FOR PORTION OF: each
       # segment overlapping the span keeps its own attributes there, with only the given ones
       # replaced. Gaps stay gaps, and segments the patch wouldn't change keep their rows. Unlike
-      # the standard, adjacent equal segments are merged anywhere in the timeline, as every
-      # operation here does, so a correction that changes nothing writes only to merge those.
+      # the standard, adjacent equal segments are merged and zero-length rows closed anywhere in
+      # the timeline, as every operation here does, so a correction that changes nothing writes
+      # only to do that, and otherwise nothing.
       #
       # Both times are taken as the valid-time column stores them (see cast_valid_time).
       #
@@ -52,7 +58,8 @@ module ActiveRecord
       # Unlike correct(), this changes *when* the entity existed, not *what* its attributes were.
       #   - Backward: Extends the first segment earlier (entity "existed sooner")
       #   - Forward: Trims/removes segments before the new start (entity "started later")
-      #   - No-op: Returns true without DB changes if new_valid_from equals current genesis
+      #   - No-op: Returns true if new_valid_from equals current genesis, writing only to merge
+      #     seams or close zero-length rows left in the timeline
       #
       # Raises ActiveRecord::RecordNotFound if no current-knowledge records exist.
       # Raises ArgumentError if new_valid_from would erase all segments (>= last valid_to).
@@ -74,6 +81,8 @@ module ActiveRecord
       # Raises ActiveRecord::RecordNotFound if no current-knowledge records exist.
       # Raises ArgumentError if termination_time <= first valid_from or > last valid_to.
       # Re-terminating earlier works; re-terminating later requires cancel_termination first.
+      # Terminating at the current end is a no-op, writing only to merge seams or close
+      # zero-length rows left in the timeline.
       # termination_time is taken as the valid-time column stores it (see cast_valid_time).
       #
       # @param termination_time [Time, Date, String] When the entity stops being valid
@@ -95,7 +104,9 @@ module ActiveRecord
       # an update!, a re-terminate, ...), it refuses instead of discarding that:
       # it raises RecordedSinceTerminationError and writes nothing.
       #
-      # No-op if entity is not currently terminated.
+      # Segments it restores unchanged keep their current rows. No-op if entity is not
+      # currently terminated, writing only to merge seams or close zero-length rows left in
+      # the timeline.
       #
       # @raise [ActiveRecord::RecordNotFound] if no current-knowledge records exist
       # @raise [ActiveRecord::Bitemporal::PreTerminationStateNotFoundError] if
@@ -131,7 +142,9 @@ module ActiveRecord
       # refuses instead of discarding that: it raises RecordedSinceGenesisShiftError
       # and writes nothing.
       #
-      # No-op if the genesis has never been shifted (matches original creation).
+      # Segments it restores unchanged keep their current rows. No-op if the genesis has never
+      # been shifted (matches original creation), writing only to merge seams or close
+      # zero-length rows left in the timeline.
       #
       # @raise [ActiveRecord::RecordNotFound] if no current-knowledge records exist
       # @raise [ActiveRecord::Bitemporal::PreShiftGenesisStateNotFoundError] if
@@ -233,37 +246,6 @@ module ActiveRecord
         type.deserialize(self.class.connection.type_cast(type.serialize(time)))
       end
 
-      def coalesce_adjacent_segments!(current_time)
-        segments = find_all_current_knowledge_segments
-        return if segments.size < 2
-
-        segments.drop(1).each_with_object([segments.first]) do |segment, acc|
-          if acc.last[valid_to_key] == segment[valid_from_key] &&
-             bitemporal_business_attributes(acc.last) == bitemporal_business_attributes(segment)
-            earlier = acc.last
-
-            # Build merged record spanning both ranges
-            merged = timeline_dup(earlier)
-            merged.id = nil
-            merged[valid_to_key] = segment[valid_to_key]
-            merged.transaction_from = current_time
-            merged.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
-
-            # Close both originals, then insert merged record
-            timeline_close(earlier, current_time)
-            timeline_close(segment, current_time)
-            merged.save_without_bitemporal_callbacks!(validate: false)
-
-            # Replace last accumulated with merged for chain handling
-            merged.id = merged.swapped_id
-            merged.clear_changes_information
-            acc[-1] = merged
-          else
-            acc << segment
-          end
-        end
-      end
-
       # Serializes writes to this entity's timeline until the surrounding transaction ends.
       # PostgreSQL only.
       #
@@ -306,17 +288,30 @@ module ActiveRecord
 
       # Shared skeleton of the five timeline operations.
       #
-      # Owns the steps every operation repeats: transaction, lock, timestamp, close,
-      # insert, coalesce, validate and reloading self. The block does the op-specific
-      # part (fetch, guards, build): it receives current_time and returns
-      # [records_to_close, new_records]. Raising in the block, or a `return` from the
-      # calling op (its no-op exits), leaves the transaction before any write.
+      # Owns the steps every operation repeats: transaction, lock, timestamp, fetch,
+      # normalize, close, insert, validate and reloading self. The block does the
+      # op-specific part (guards, build): it receives the current segments and
+      # current_time, and returns [replaced, pieces], the segments the op replaces and the
+      # new pieces it adds. Raising in the block leaves the transaction before any write;
+      # an op's no-op exit replaces nothing ([[], []]).
+      #
+      # The segments leave out zero-length rows (an upstream destroy at a segment's exact
+      # start leaves one), so the guards and builders see only versions that hold a time.
+      #
+      # The result (segments - replaced + pieces) is normalized before anything is
+      # written: zero-length pieces are dropped and equal adjacent neighbours merged,
+      # seams an upstream update! left included. Only its difference from the current rows
+      # is written. A row the result keeps, or a piece with the range and business
+      # attributes of a current row, keeps that row; every other current row, zero-length
+      # ones included, is closed, and every other piece inserted. So after any operation
+      # the timeline has no seams and no zero-length rows, and only the rows that change
+      # are recorded again.
       #
       # current_time is read only once the locks are held, so it is later than every write
       # that committed while this operation waited for them.
       #
-      # Afterwards self is reloaded onto the new timeline (see reload_onto_timeline). An op's
-      # no-op exit writes nothing and leaves self alone.
+      # Afterwards self is reloaded onto the new timeline (see reload_onto_timeline). A call
+      # with nothing to write writes nothing and leaves self alone.
       def perform_timeline_operation
         # The reload at the end would swap in fresh attributes, so refuse up front as update! does
         raise FrozenError, "can't modify frozen attributes" if frozen?
@@ -325,8 +320,20 @@ module ActiveRecord
           lock_timeline!
           current_time = Time.current
 
-          # Fetch, guard and build (op-specific)
-          records_to_close, new_records = yield(current_time)
+          rows = find_all_current_knowledge_segments
+          segments = rows.reject { |row| zero_length?(row) }
+
+          # Guard and build (op-specific)
+          replaced, pieces = yield(segments, current_time)
+
+          # Normalize the resulting timeline, then diff it against the current rows
+          timeline = segments.reject { |segment| replaced.any? { |record| record.equal?(segment) } } + pieces
+          timeline = merge_equal_neighbours(
+            timeline.reject { |piece| zero_length?(piece) }.sort_by { |piece| [piece[valid_from_key], piece[valid_to_key]] },
+            current_time
+          )
+          records_to_close, new_records = timeline_changes(rows, timeline)
+          next true if records_to_close.empty? && new_records.empty?
 
           # CLOSE old records FIRST (critical ordering)
           records_to_close.each do |record|
@@ -338,9 +345,6 @@ module ActiveRecord
             record.save_without_bitemporal_callbacks!(validate: false)
           end
 
-          # Coalesce adjacent identical segments
-          coalesce_adjacent_segments!(current_time)
-
           # Validate the new timeline (post-hoc)
           validate_cascade_correction_timeline!
 
@@ -348,6 +352,44 @@ module ActiveRecord
 
           true
         end
+      end
+
+      def zero_length?(record)
+        record[valid_from_key] == record[valid_to_key]
+      end
+
+      # Merges equal neighbours of a timeline ordered by valid time: a piece ending where the
+      # next one starts, with equal business attributes, takes over the next one's range. A
+      # stored segment is never extended in place: it's closed and replaced by a new piece.
+      def merge_equal_neighbours(timeline, current_time)
+        timeline.each_with_object([]) { |piece, acc|
+          previous = acc.last
+          if previous && previous[valid_to_key] == piece[valid_from_key] &&
+             bitemporal_business_attributes(previous) == bitemporal_business_attributes(piece)
+            acc[-1] = timeline_piece(previous, previous[valid_from_key], previous[valid_to_key], current_time) unless previous.new_record?
+            acc.last[valid_to_key] = piece[valid_to_key]
+          else
+            acc << piece
+          end
+        }
+      end
+
+      # What turns the current rows into timeline: [rows to close, pieces to insert]. A row
+      # the timeline holds is kept. So is a row with a new piece's range and business
+      # attributes, in place of that piece, so an unchanged version isn't recorded again.
+      def timeline_changes(rows, timeline)
+        kept = timeline.reject(&:new_record?)
+        new_records = []
+        timeline.select(&:new_record?).each do |piece|
+          unchanged = rows.find { |row|
+            kept.none? { |record| record.equal?(row) } &&
+              row[valid_from_key] == piece[valid_from_key] && row[valid_to_key] == piece[valid_to_key] &&
+              bitemporal_business_attributes(row) == bitemporal_business_attributes(piece)
+          }
+          unchanged ? kept << unchanged : new_records << piece
+        end
+
+        [rows.reject { |row| kept.any? { |record| record.equal?(row) } }, new_records]
       end
 
       # Leaves self as reload would: on the current version valid at self's valid datetime
@@ -388,9 +430,8 @@ module ActiveRecord
 
       # Cascade Correction: Main implementation
       def _correct_record(valid_from:, valid_to:, attributes:)
-        perform_timeline_operation do |current_time|
-          # 1. Fetch all current-knowledge segments; one must contain valid_from
-          segments = find_all_current_knowledge_segments
+        perform_timeline_operation do |segments, current_time|
+          # 1. One segment must contain valid_from
           containing_record = segments.find { |r|
             r[valid_from_key] <= valid_from && r[valid_to_key] > valid_from
           }
@@ -434,11 +475,8 @@ module ActiveRecord
 
       # Shift Genesis: Main implementation
       def _shift_genesis_record(new_valid_from:)
-        perform_timeline_operation do |current_time|
-          # 1. Fetch all current-knowledge segments
-          segments = find_all_current_knowledge_segments
-
-          # 2. Guard: entity must exist
+        perform_timeline_operation do |segments, current_time|
+          # 1. Guard: entity must exist
           if segments.empty?
             raise ActiveRecord::RecordNotFound.new(
               "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
@@ -449,17 +487,17 @@ module ActiveRecord
 
           genesis = segments.first
 
-          # 3. No-op: same date
-          return true if new_valid_from == genesis[valid_from_key]
+          # 2. No-op: same date, nothing to replace
+          next [[], []] if new_valid_from == genesis[valid_from_key]
 
-          # 4. Guard: forward shift must not erase all segments
+          # 3. Guard: forward shift must not erase all segments
           if new_valid_from >= segments.last[valid_to_key]
             raise ArgumentError,
               "shift_genesis would erase all segments: new_valid_from (#{new_valid_from}) " \
               ">= last segment valid_to (#{segments.last[valid_to_key]})"
           end
 
-          # 5. Build records to close and new records
+          # 4. Build records to replace and new records
           if new_valid_from < genesis[valid_from_key]
             build_genesis_backward_shift(genesis, new_valid_from, current_time)
           else
@@ -523,11 +561,8 @@ module ActiveRecord
 
       # Terminate: Main implementation
       def _terminate_record(termination_time:)
-        perform_timeline_operation do |current_time|
-          # 1. Fetch all current-knowledge segments
-          segments = find_all_current_knowledge_segments
-
-          # 2. Guard: entity must exist
+        perform_timeline_operation do |segments, current_time|
+          # 1. Guard: entity must exist
           if segments.empty?
             raise ActiveRecord::RecordNotFound.new(
               "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
@@ -539,35 +574,32 @@ module ActiveRecord
           first_segment = segments.first
           last_segment = segments.last
 
-          # 3. Guard: termination_time must be after timeline start
+          # 2. Guard: termination_time must be after timeline start
           if termination_time <= first_segment[valid_from_key]
             raise ArgumentError,
               "termination_time (#{termination_time}) must be greater than " \
               "first segment valid_from (#{first_segment[valid_from_key]})"
           end
 
-          # 4. Guard: termination_time must not exceed timeline end
+          # 3. Guard: termination_time must not exceed timeline end
           if termination_time > last_segment[valid_to_key]
             raise ArgumentError,
               "termination_time (#{termination_time}) exceeds last segment " \
               "valid_to (#{last_segment[valid_to_key]})"
           end
 
-          # 5. No-op: already terminated at this exact time
-          return true if termination_time == last_segment[valid_to_key]
+          # 4. No-op: already terminated at this exact time, nothing to replace
+          next [[], []] if termination_time == last_segment[valid_to_key]
 
-          # 6. Build records to close and new records
+          # 5. Build records to replace and new records
           build_termination_records(segments, termination_time, current_time)
         end
       end
 
       # Cancel Termination: Main implementation
       def _cancel_termination_record
-        perform_timeline_operation do |current_time|
-          # 1. Fetch all current-knowledge segments
-          segments = find_all_current_knowledge_segments
-
-          # 2. Guard: entity must exist
+        perform_timeline_operation do |segments, current_time|
+          # 1. Guard: entity must exist
           if segments.empty?
             raise ActiveRecord::RecordNotFound.new(
               "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
@@ -576,10 +608,10 @@ module ActiveRecord
             )
           end
 
-          # 3. No-op: not terminated (last segment extends to infinity)
-          return true if segments.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+          # 2. No-op: not terminated (last segment extends to infinity), nothing to replace
+          next [[], []] if segments.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
 
-          # 4. Find pre-termination state via transaction history
+          # 3. Find pre-termination state via transaction history
           pre_termination_state, terminated_at = find_pre_termination_state
           if pre_termination_state.nil?
             raise PreTerminationStateNotFoundError,
@@ -587,17 +619,18 @@ module ActiveRecord
               "with bitemporal_id=#{bitemporal_id}"
           end
 
-          # 5. Guard: restoring that state would discard anything recorded after the termination
+          # 4. Guard: restoring that state would discard anything recorded after the termination
           if recorded_since?(terminated_at)
             raise RecordedSinceTerminationError,
               "Changes were recorded for #{self.class} with bitemporal_id=#{bitemporal_id} " \
               "after its termination; cancelling it would discard them"
           end
 
-          # 6. Close ALL current segments; recreate pre-termination segments with new transaction_from.
-          #    Must clear deleted_at because historical records have it set (by timeline_close or
-          #    upstream's update_transaction_to), and bitemporal_assign_initialize_value would use it
-          #    to overwrite transaction_to during save.
+          # 5. Replace ALL current segments with the pre-termination ones, as new records with
+          #    this op's transaction_from (the skeleton keeps the rows of those that come back
+          #    unchanged). Must clear deleted_at because historical records have it set (by
+          #    timeline_close or upstream's update_transaction_to), and
+          #    bitemporal_assign_initialize_value would use it to overwrite transaction_to during save.
           new_records = pre_termination_state.map do |old_record|
             new_record = timeline_dup(old_record)
             new_record.id = nil
@@ -639,7 +672,8 @@ module ActiveRecord
       end
 
       # The most recent snapshot with an infinite end, and the change point it ended at:
-      # [segments, change_point], or nil when no snapshot has one.
+      # [segments, change_point], or nil when no snapshot has one. A snapshot's zero-length
+      # rows are no part of it.
       def find_pre_termination_state
         change_points = self.class
           .where(bitemporal_id: bitemporal_id)
@@ -662,6 +696,7 @@ module ActiveRecord
               r.id = r.swapped_id
               r.clear_changes_information
             }
+            .reject { |r| zero_length?(r) }
 
           next if state.empty?
           return [state, cp] if state.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
@@ -673,8 +708,8 @@ module ActiveRecord
       # Whether anything was recorded for this entity after change_point, the moment the
       # operation a cancel undoes took effect: a row inserted after it, or a row closed after
       # it (some writes only close rows, such as a terminate at a segment boundary). Rows that
-      # operation wrote, coalescing included, carry change_point itself, so the bounds are
-      # strict. Any row of the family counts, whatever its valid time.
+      # operation wrote carry change_point itself, so the bounds are strict. Any row of the
+      # family counts, whatever its valid time.
       def recorded_since?(change_point)
         transaction_from = self.class.arel_table[:transaction_from]
         transaction_to = self.class.arel_table[:transaction_to]
@@ -693,16 +728,13 @@ module ActiveRecord
       # Cancel Shift Genesis: Main implementation
       #
       # Algorithm mirrors _cancel_termination_record (perform_timeline_operation does
-      # the lock, close, insert, coalesce, validate and reloading self):
-      # 1. Fetch segments → 2. Guard existence → 3. No-op if genesis matches original →
-      # 4. Find pre-shift state → 5. Refuse if anything was recorded since →
-      # 6. Close current, recreate pre-shift
+      # the lock, fetch, normalize, close, insert, validate and reloading self):
+      # 1. Guard existence → 2. No-op if genesis matches original →
+      # 3. Find pre-shift state → 4. Refuse if anything was recorded since →
+      # 5. Replace current with pre-shift
       def _cancel_shift_genesis_record
-        perform_timeline_operation do |current_time|
-          # 1. Fetch all current-knowledge segments
-          segments = find_all_current_knowledge_segments
-
-          # 2. Guard: entity must exist
+        perform_timeline_operation do |segments, current_time|
+          # 1. Guard: entity must exist
           if segments.empty?
             raise ActiveRecord::RecordNotFound.new(
               "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
@@ -711,12 +743,12 @@ module ActiveRecord
             )
           end
 
-          # 3. No-op: genesis matches original (never shifted, or already canceled)
+          # 2. No-op: genesis matches original (never shifted, or already canceled), nothing to replace
           current_genesis = segments.first[valid_from_key]
           original_genesis = find_original_genesis
-          return true if current_genesis == original_genesis
+          next [[], []] if current_genesis == original_genesis
 
-          # 4. Find pre-shift state via transaction history
+          # 3. Find pre-shift state via transaction history
           pre_shift_state, shifted_at = find_pre_shift_genesis_state(current_genesis)
           if pre_shift_state.nil?
             raise PreShiftGenesisStateNotFoundError,
@@ -724,17 +756,18 @@ module ActiveRecord
               "with bitemporal_id=#{bitemporal_id}"
           end
 
-          # 5. Guard: restoring that state would discard anything recorded after the shift
+          # 4. Guard: restoring that state would discard anything recorded after the shift
           if recorded_since?(shifted_at)
             raise RecordedSinceGenesisShiftError,
               "Changes were recorded for #{self.class} with bitemporal_id=#{bitemporal_id} " \
               "after its genesis shift; cancelling it would discard them"
           end
 
-          # 6. Close ALL current segments; recreate pre-shift segments with new transaction_from.
-          #    Must clear deleted_at because historical records have it set (by timeline_close or
-          #    upstream's update_transaction_to), and bitemporal_assign_initialize_value would use it
-          #    to overwrite transaction_to during save.
+          # 5. Replace ALL current segments with the pre-shift ones, as new records with this
+          #    op's transaction_from (the skeleton keeps the rows of those that come back
+          #    unchanged). Must clear deleted_at because historical records have it set (by
+          #    timeline_close or upstream's update_transaction_to), and
+          #    bitemporal_assign_initialize_value would use it to overwrite transaction_to during save.
           new_records = pre_shift_state.map do |old_record|
             new_record = timeline_dup(old_record)
             new_record.id = nil
@@ -790,6 +823,9 @@ module ActiveRecord
       #   │   t1 genesis = Jan 1 ≠ current (Mar 1) → FOUND! ✅  │
       #   └─────────────────────────────────────────────────────┘
       #
+      # A snapshot's zero-length rows are no part of it, so a snapshot of nothing else is
+      # skipped: there's no timeline in it to restore.
+      #
       # @param current_genesis [Time] the current first segment's valid_from
       # @return [Array(Array<ActiveRecord::Base>, Time), nil] the pre-shift segment records
       #   and the change point they ended at (t2 above), or nil if no prior state with a
@@ -816,6 +852,7 @@ module ActiveRecord
               r.id = r.swapped_id
               r.clear_changes_information
             }
+            .reject { |r| zero_length?(r) }
 
           next if state.empty?
           return [state, cp] if state.first[valid_from_key] != current_genesis
@@ -843,44 +880,30 @@ module ActiveRecord
         end
       end
 
-      # Builds correct's patch over [valid_from, valid_to): returns [records_to_close, new_records].
+      # Builds correct's patch over [valid_from, valid_to): returns [replaced, pieces].
       #
       # Each segment overlapping the span is split at the span's edges and the piece inside gets
-      # `attributes`; a segment the patch wouldn't change is kept as it is. Equal adjacent segments
-      # of the resulting timeline, old seams included, are merged here before anything is written,
-      # so coalescing has no rows of this operation to close again. When nothing changes and
-      # nothing merges, this returns [[], []].
+      # `attributes`; a segment the patch wouldn't change is kept as it is. The pieces aren't
+      # merged here: perform_timeline_operation merges equal neighbours across the whole
+      # resulting timeline, old seams included, before anything is written. When no segment
+      # would change, this returns [[], []].
       def build_correction_records(segments, valid_from, valid_to, attributes, current_time)
-        timeline = segments.flat_map { |segment|
+        segments.each_with_object([[], []]) { |segment, (replaced, pieces)|
           from = segment[valid_from_key]
           to = segment[valid_to_key]
-          next [segment] unless from < valid_to && to > valid_from
+          next unless from < valid_to && to > valid_from
 
           corrected = timeline_piece(segment, [from, valid_from].max, [to, valid_to].min, current_time)
           corrected.assign_attributes(attributes)
-          next [segment] if bitemporal_business_attributes(corrected) == bitemporal_business_attributes(segment)
+          next if bitemporal_business_attributes(corrected) == bitemporal_business_attributes(segment)
 
-          [
+          replaced << segment
+          pieces.concat([
             (timeline_piece(segment, from, valid_from, current_time) if from < valid_from),
             corrected,
             (timeline_piece(segment, valid_to, to, current_time) if to > valid_to),
-          ].compact
+          ].compact)
         }
-
-        merged = timeline.each_with_object([]) { |piece, acc|
-          previous = acc.last
-          if previous && previous[valid_to_key] == piece[valid_from_key] &&
-             bitemporal_business_attributes(previous) == bitemporal_business_attributes(piece)
-            # A stored segment is never extended in place: it's closed and replaced by a new row
-            acc[-1] = timeline_piece(previous, previous[valid_from_key], previous[valid_to_key], current_time) unless previous.new_record?
-            acc.last[valid_to_key] = piece[valid_to_key]
-          else
-            acc << piece
-          end
-        }
-
-        records_to_close = segments.reject { |segment| merged.any? { |piece| piece.equal?(segment) } }
-        [records_to_close, merged.select(&:new_record?)]
       end
 
       # A new current-knowledge row with source's attributes over [from, to)

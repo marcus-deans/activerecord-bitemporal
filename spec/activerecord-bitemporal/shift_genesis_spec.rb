@@ -1438,9 +1438,10 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
 
       # An upstream update! that sets the values the next segment already has leaves a seam:
       #   A |Jan, Mar)  B |Mar, May)  B |May, ∞)
-      # Shifting genesis to Apr trims B |Mar, May) to B |Apr, May), and coalescing merges that
-      # with B |May, ∞), so the shift writes more rows at its own transaction time.
-      context "when the shift's coalescing wrote rows" do
+      # Shifting genesis to Apr trims B |Mar, May) to B |Apr, May) and merges that with
+      # B |May, ∞), so the shift closes all three rows and inserts B |Apr, ∞) at its own
+      # transaction time.
+      context "when the shift merged a seam" do
         let!(:employee_id) {
           id = Timecop.freeze("2020/10/01") {
             employee = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
@@ -1455,15 +1456,18 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         }
         let(:employee) { Employee.find_at_time(_05_01, employee_id) }
 
-        it "doesn't count them as recorded after it" do
-          # The trimmed row, closed again by coalescing, and the merged row
-          expect(all_records(employee).where(transaction_from: shifted_at).pluck(:valid_from, :valid_to, :transaction_to)).to contain_exactly(
-            [_04_01, _05_01, shifted_at],
-            [_04_01, infinity, tt_infinity],
+        it "doesn't count the rows it wrote as recorded after it" do
+          expect(all_records(employee).where(transaction_to: shifted_at).pluck(:valid_from, :valid_to)).to contain_exactly(
+            [_01_01, _03_01],
+            [_03_01, _05_01],
+            [_05_01, infinity],
           )
+          expect(all_records(employee).where(transaction_from: shifted_at).pluck(:valid_from, :valid_to, :transaction_to)).to eq [
+            [_04_01, infinity, tt_infinity],
+          ]
 
           expect(cancel).to be true
-          # The restored seam is merged again by the cancel's own coalescing (under review)
+          # The cancel restores the seam merged, as every operation leaves a timeline
           expect(current_timeline(employee)).to eq [
             [_01_01, _03_01, "A"],
             [_03_01, infinity, "B"],
