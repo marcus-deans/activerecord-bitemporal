@@ -387,6 +387,10 @@ employee.update!(emp_code: "C2")       # builds on the correction
 
 Like `reload`, an operation discards unsaved changes on the record. A call that changes nothing writes nothing and leaves the record as it was. A frozen record raises `FrozenError`, as `update!` does.
 
+### Times You Pass
+
+`correct`, `shift_genesis` and `terminate` take the times you pass as the valid-time column stores them, read in `Time.zone` as `valid_at` reads them. For a date column that's the day, so `Date.new(2024, 3, 1)` or any time that day meets a March 1 boundary in every time zone. For a datetime column it's the time to the column's precision, so the same `Time.current` an `update!` was made at meets the boundary that update wrote. A `correct` whose two times fall on the same day of a date column raises `ArgumentError`.
+
 ---
 
 ## Shifting the Timeline Start

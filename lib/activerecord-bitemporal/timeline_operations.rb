@@ -14,6 +14,8 @@ module ActiveRecord
       # the standard, adjacent equal segments are merged anywhere in the timeline, as every
       # operation here does, so a correction that changes nothing writes only to merge those.
       #
+      # Both times are taken as the valid-time column stores them (see cast_valid_time).
+      #
       # @param valid_from [Time, Date, String] When the correction starts being true
       # @param valid_to [Time, Date, String, nil] When the correction ends (optional)
       #   - If specified: Correct exactly [valid_from, valid_to), resume timeline at valid_to
@@ -25,8 +27,8 @@ module ActiveRecord
       # @raise [ActiveRecord::Bitemporal::ValidDatetimeRangeError] if valid_to is past the timeline's end
       # @return [Boolean] true if successful
       def correct(valid_from:, valid_to: nil, **attributes)
-        valid_from = valid_from.in_time_zone if valid_from.respond_to?(:in_time_zone)
-        valid_to = valid_to.in_time_zone if valid_to.respond_to?(:in_time_zone)
+        valid_from = cast_valid_time(valid_from_key, valid_from)
+        valid_to = cast_valid_time(valid_to_key, valid_to)
 
         if valid_to && valid_to <= valid_from
           raise ArgumentError, "valid_to (#{valid_to}) must be greater than valid_from (#{valid_from})"
@@ -54,11 +56,12 @@ module ActiveRecord
       #
       # Raises ActiveRecord::RecordNotFound if no current-knowledge records exist.
       # Raises ArgumentError if new_valid_from would erase all segments (>= last valid_to).
+      # new_valid_from is taken as the valid-time column stores it (see cast_valid_time).
       #
       # @param new_valid_from [Time, Date, String] The new start date for the entity's timeline
       # @return [Boolean] true if successful
       def shift_genesis(new_valid_from:)
-        new_valid_from = new_valid_from.in_time_zone if new_valid_from.respond_to?(:in_time_zone)
+        new_valid_from = cast_valid_time(valid_from_key, new_valid_from)
         _shift_genesis_record(new_valid_from: new_valid_from)
       end
 
@@ -71,11 +74,12 @@ module ActiveRecord
       # Raises ActiveRecord::RecordNotFound if no current-knowledge records exist.
       # Raises ArgumentError if termination_time <= first valid_from or > last valid_to.
       # Re-terminating earlier works; re-terminating later requires cancel_termination first.
+      # termination_time is taken as the valid-time column stores it (see cast_valid_time).
       #
       # @param termination_time [Time, Date, String] When the entity stops being valid
       # @return [Boolean] true if successful
       def terminate(termination_time:)
-        termination_time = termination_time.in_time_zone if termination_time.respond_to?(:in_time_zone)
+        termination_time = cast_valid_time(valid_to_key, termination_time)
         _terminate_record(termination_time: termination_time)
       end
 
@@ -195,6 +199,32 @@ module ActiveRecord
         record.attributes.slice(*record.class.column_names).except(*excluded)
       end
 
+      # A time as the valid-time column `key` stores it: what reading a row written with it gives
+      # back. A date column keeps the day, a datetime column its precision, microseconds at most.
+      # Operations take their times through this once, on entry, so they compare with stored
+      # boundaries the same values they write.
+      #
+      # The time is read in Time.zone first, as upstream's valid_at reads it (Uniqueness's
+      # scope_relation casts valid_datetime to the column's type the same way). It then goes the
+      # way a write and a read take it: the column's type, the connection, and back through the
+      # type. The connection matters for a datetime column declared without a precision, whose
+      # type keeps nanoseconds while the connection writes microseconds.
+      #
+      # DEFAULT_VALID_TO stays the end of the timeline: it's cast as upstream's attribute default
+      # casts it, without the move into Time.zone that gives the day before in a zone behind UTC.
+      def cast_valid_time(key, time)
+        time =
+          if time == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+            ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+          elsif time.respond_to?(:in_time_zone)
+            time.in_time_zone
+          else
+            time
+          end
+        type = self.class.type_for_attribute(key)
+        type.deserialize(self.class.connection.type_cast(type.serialize(time)))
+      end
+
       def coalesce_adjacent_segments!(current_time)
         segments = find_all_current_knowledge_segments
         return if segments.size < 2
@@ -309,8 +339,8 @@ module ActiveRecord
       # so every reload hook runs (dirty tracking, autosave flags, a model's own resets) and
       # unsaved changes are discarded.
       def reload_onto_timeline
-        # Cast as the database casts it: Ruby compares a Date with a Time as midnight UTC
-        at = self.class.type_for_attribute(valid_from_key).cast(valid_datetime || Time.current)
+        # Cast as the database stores it: Ruby compares a Date with a Time as midnight UTC
+        at = cast_valid_time(valid_from_key, valid_datetime || Time.current)
         # Unscoped, so neither the model's default scope nor a caller's scoping or
         # transaction_at can hide a version, the ones this op just wrote included
         versions = self.class.unscoped
