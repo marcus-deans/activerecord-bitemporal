@@ -373,6 +373,20 @@ rescue ActiveRecord::RecordInvalid
 end
 ```
 
+### The Record After an Operation
+
+`correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` leave the record you called them on as `reload` would: on the current version valid at the time the record was loaded at (now, unless it was loaded with `valid_at`/`find_at_time`), with every attribute fresh and nothing left to save. The model's own `reload` overrides run too. When no version is valid at that time (a timeline ended in the past, or starting in the future), the record takes the latest version starting before it, else the first one.
+
+```ruby
+employee = Employee.find(id)           # name: "B"
+employee.correct(valid_from: may_1, name: "X")
+employee.name                          # => "X"
+employee.changed?                      # => false
+employee.update!(emp_code: "C2")       # builds on the correction
+```
+
+Like `reload`, an operation discards unsaved changes on the record. A call that changes nothing writes nothing and leaves the record as it was.
+
 ---
 
 ## Shifting the Timeline Start

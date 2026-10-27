@@ -9,11 +9,12 @@ This document covers the internal architecture and implementation details of the
 3. [Update Mechanism](#update-mechanism)
 4. [Correction Mechanism](#correction-mechanism)
 5. [Termination Mechanism](#termination-mechanism)
-6. [Uniqueness Validation](#uniqueness-validation)
-7. [ID Swapping Mechanism](#id-swapping-mechanism)
-8. [Query Scoping](#query-scoping)
-9. [Performance Considerations](#performance-considerations)
-10. [Limitations](#limitations)
+6. [Self After an Operation](#self-after-an-operation)
+7. [Uniqueness Validation](#uniqueness-validation)
+8. [ID Swapping Mechanism](#id-swapping-mechanism)
+9. [Query Scoping](#query-scoping)
+10. [Performance Considerations](#performance-considerations)
+11. [Limitations](#limitations)
 
 ---
 
@@ -188,7 +189,8 @@ The `#correct` method implements cascade correction - fixing historical data whi
 6. CLOSE replaced records (set transaction_to = now)
 7. INSERT new timeline records
 8. VALIDATE no overlapping valid times
-9. COMMIT TRANSACTION
+9. RELOAD self (see Self After an Operation)
+10. COMMIT TRANSACTION
 ```
 
 ### Critical Ordering
@@ -288,7 +290,7 @@ Both methods are whole-timeline operations — they fetch all current-knowledge 
 10. INSERT new truncated segment (if a segment was split)
 11. COALESCE adjacent identical segments
 12. VALIDATE no overlapping valid times
-13. UPDATE self to point at the last surviving segment
+13. RELOAD self (see Self After an Operation)
 14. COMMIT TRANSACTION
 ```
 
@@ -310,7 +312,7 @@ Both methods are whole-timeline operations — they fetch all current-knowledge 
    - Clear deleted_at to prevent transaction_to corruption during save
 9. COALESCE adjacent identical segments
 10. VALIDATE no overlapping valid times
-11. UPDATE self to point at the last restored segment
+11. RELOAD self (see Self After an Operation)
 12. COMMIT TRANSACTION
 ```
 
@@ -359,6 +361,18 @@ State after cancel:
                      Jan           Mar            May            ∞
   (Full pre-termination timeline restored)
 ```
+
+---
+
+## Self After an Operation
+
+Every timeline operation (`correct`, `shift_genesis`, `terminate` and the two cancels) ends inside its transaction by reloading `self`, the way `update!` and `reload` treat the record's own valid time:
+
+1. Pick the version: the current-knowledge segment valid at `self.valid_datetime` (the time it was loaded at with `valid_at`/`find_at_time`), or at now when it has none. When none is valid then (a timeline ended before it, a gap, or a timeline starting after it), take the latest segment starting before that time, else the first segment. Zero-length rows are never picked.
+2. Call the real `reload` inside `valid_at!(version.valid_from)` and `transaction_at!(now)`. Forcing both pins the lookup to that version whatever the record or the caller's scopes say.
+3. Set `swapped_id_previously_was` to the row `self` pointed at before, as `update!` does.
+
+Going through `reload` means every reload hook runs: Rails' dirty tracking and autosave flags, and any `reload` override on the model (such as one resetting memoized values). Unsaved changes on `self` are discarded, as `reload` discards them. An operation's no-op exits return before any write and leave `self` alone.
 
 ---
 

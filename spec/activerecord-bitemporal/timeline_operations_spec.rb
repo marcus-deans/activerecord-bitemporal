@@ -123,67 +123,153 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
     end
   end
 
-  # Characterizes where self points after an op when no segment covers now. This is
-  # today's behaviour, kept unchanged by extracting the shared skeleton
-  # (perform_timeline_operation's repoint_fallback); it's expected to change once
-  # repointing self is fixed.
-  describe "repointing self when no segment covers now" do
+  # After an operation self is what reload gives: the current version valid at the time
+  # self was loaded at (now when it has none), every attribute fresh. When no version is
+  # valid then, it's the latest version starting before that time, else the first one.
+  describe "self after an operation" do
     let(:_01_01) { "2020/01/01".in_time_zone }
     let(:_02_01) { "2020/02/01".in_time_zone }
-    let(:_03_01) { "2020/03/01".in_time_zone }
+    let(:_05_01) { "2020/05/01".in_time_zone }
     let(:_06_01) { "2020/06/01".in_time_zone }
 
-    #   A |01-01, 03-01)  B |03-01, ∞)   then terminated at 06-01, so nothing covers now (Oct)
+    #   A |01-01, 05-01)  B |05-01, ∞)   and now is 2020-10
     let!(:employee_id) {
       Timecop.freeze("2020/10/01") do
-        ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+        ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A", emp_code: "C1") }
       end
       Timecop.freeze("2020/10/02") do
-        ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+        ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "B") }
       end
       @employee.id
     }
 
-    it "falls back to the last segment, except cancel_shift_genesis which falls back to the first" do
-      employee = Employee.find(employee_id)
-
-      Timecop.freeze("2020/10/03") { employee.terminate(termination_time: _06_01) }
-      expect([employee.valid_from, employee.valid_to]).to eq [_03_01, _06_01]
-
-      Timecop.freeze("2020/10/04") { employee.shift_genesis(new_valid_from: _02_01) }
-      expect([employee.valid_from, employee.valid_to]).to eq [_03_01, _06_01]
-
-      Timecop.freeze("2020/10/05") { employee.cancel_shift_genesis }
-      expect([employee.valid_from, employee.valid_to]).to eq [_01_01, _03_01]
-
-      Timecop.freeze("2020/10/06") { employee.correct(valid_from: _01_01, name: "A2") }
-      expect([employee.valid_from, employee.valid_to]).to eq [_03_01, _06_01]
+    def version_at(time)
+      Employee.find_at_time(time, employee_id)
     end
 
-    context "with a future-dated timeline" do
-      #   A |2021-01-01, 2021-03-01)  B |2021-03-01, ∞)   while now is 2020-10
-      let(:_2021_01_01) { "2021/01/01".in_time_zone }
-      let(:_2021_03_01) { "2021/03/01".in_time_zone }
-      let(:_2021_06_01) { "2021/06/01".in_time_zone }
-      let(:infinity) { ActiveRecord::Bitemporal::DEFAULT_VALID_TO }
+    def span(record)
+      [record.valid_from, record.valid_to]
+    end
 
-      let!(:employee_id) {
-        Timecop.freeze("2020/10/01") do
-          ActiveRecord::Bitemporal.valid_at(_2021_01_01) { @employee = Employee.create!(name: "A") }
-        end
-        Timecop.freeze("2020/10/02") do
-          ActiveRecord::Bitemporal.valid_at(_2021_03_01) { @employee.update!(name: "B") }
-        end
-        @employee.id
+    it "refreshes every attribute and leaves nothing to save" do
+      employee = Employee.find(employee_id)
+
+      Timecop.freeze("2020/10/05") { employee.correct(valid_from: _05_01, name: "X") }
+
+      expect(employee.name).to eq "X"
+      expect(employee.swapped_id).to eq version_at(_06_01).swapped_id
+      expect(employee.changed?).to be false
+    end
+
+    it "lets a later update! build on the operation" do
+      employee = Employee.find(employee_id)
+
+      Timecop.freeze("2020/10/05") { employee.correct(valid_from: _05_01, name: "X") }
+      Timecop.freeze("2020/10/06") { employee.update!(emp_code: "C2") }
+
+      # update! applies from its own time on, so look at the version valid after it
+      expect(Employee.find(employee_id).attributes.slice("name", "emp_code")).to eq("name" => "X", "emp_code" => "C2")
+    end
+
+    it "stays at the valid time self was loaded at" do
+      employee = Employee.find_at_time(_02_01, employee_id)
+
+      Timecop.freeze("2020/10/05") { employee.correct(valid_from: _01_01, valid_to: _05_01, name: "A2") }
+
+      expect(employee.swapped_id).to eq version_at(_02_01).swapped_id
+      expect([*span(employee), employee.name]).to eq [_01_01, _05_01, "A2"]
+      expect(employee.changed?).to be false
+    end
+
+    it "reloads current knowledge when self was loaded at an earlier transaction time" do
+      employee = ActiveRecord::Bitemporal.transaction_at("2020/10/01 12:00".in_time_zone) {
+        Employee.find_at_time(_02_01, employee_id)
       }
 
-      it "cancel_termination falls back to the last segment" do
-        employee = Employee.ignore_valid_datetime.find_by!(bitemporal_id: employee_id, valid_from: _2021_01_01)
+      Timecop.freeze("2020/10/05") { employee.correct(valid_from: _01_01, valid_to: _05_01, name: "A2") }
 
-        Timecop.freeze("2020/10/03") { employee.terminate(termination_time: _2021_06_01) }
-        Timecop.freeze("2020/10/04") { employee.cancel_termination }
+      expect(employee.swapped_id).to eq version_at(_02_01).swapped_id
+      expect(employee.name).to eq "A2"
+    end
 
-        expect([employee.valid_from, employee.valid_to]).to eq [_2021_03_01, infinity]
+    it "discards unsaved changes, as reload does" do
+      employee = Employee.find(employee_id)
+      employee.emp_code = "PENDING"
+
+      Timecop.freeze("2020/10/05") { employee.correct(valid_from: _05_01, name: "X") }
+
+      expect(employee.emp_code).to eq "C1"
+      expect(employee.changed?).to be false
+    end
+
+    it "runs the model's reload hooks" do
+      reload_counting_class = Class.new(Employee) {
+        def self.name; "ReloadCountingEmployee"; end
+        attr_reader :reloads
+        def reload(*)
+          super.tap { @reloads = (@reloads || 0) + 1 }
+        end
+      }
+      employee = reload_counting_class.find(employee_id)
+
+      Timecop.freeze("2020/10/05") { employee.correct(valid_from: _05_01, name: "X") }
+
+      expect(employee.reloads).to eq 1
+    end
+
+    it "keeps the row self pointed at before as swapped_id_previously_was" do
+      employee = Employee.find(employee_id)
+      before = employee.swapped_id
+
+      Timecop.freeze("2020/10/05") { employee.correct(valid_from: _05_01, name: "X") }
+
+      expect(employee.swapped_id).not_to eq before
+      expect(employee.swapped_id_previously_was).to eq before
+    end
+
+    context "when no version is valid at that time" do
+      it "points at the latest version starting before it, for every operation" do
+        employee = Employee.find(employee_id)
+
+        Timecop.freeze("2020/10/05") { employee.terminate(termination_time: _06_01) }
+        expect(span(employee)).to eq [_05_01, _06_01]
+
+        Timecop.freeze("2020/10/06") { employee.shift_genesis(new_valid_from: _02_01) }
+        expect(span(employee)).to eq [_05_01, _06_01]
+
+        Timecop.freeze("2020/10/07") { employee.cancel_shift_genesis }
+        expect(span(employee)).to eq [_05_01, _06_01]
+
+        Timecop.freeze("2020/10/08") { employee.correct(valid_from: _01_01, name: "A2") }
+        expect(span(employee)).to eq [_05_01, _06_01]
+        expect(employee.name).to eq "B"
+        expect(employee.changed?).to be false
+      end
+
+      context "with a future-dated timeline" do
+        #   A |2021-01-01, 2021-03-01)  B |2021-03-01, ∞)   while now is 2020-10
+        let(:_2021_01_01) { "2021/01/01".in_time_zone }
+        let(:_2021_03_01) { "2021/03/01".in_time_zone }
+        let(:_2021_06_01) { "2021/06/01".in_time_zone }
+
+        let!(:employee_id) {
+          Timecop.freeze("2020/10/01") do
+            ActiveRecord::Bitemporal.valid_at(_2021_01_01) { @employee = Employee.create!(name: "A") }
+          end
+          Timecop.freeze("2020/10/02") do
+            ActiveRecord::Bitemporal.valid_at(_2021_03_01) { @employee.update!(name: "B") }
+          end
+          @employee.id
+        }
+
+        it "points at the first version" do
+          employee = Employee.ignore_valid_datetime.find_by!(bitemporal_id: employee_id, valid_from: _2021_03_01)
+
+          Timecop.freeze("2020/10/03") { employee.terminate(termination_time: _2021_06_01) }
+          Timecop.freeze("2020/10/04") { employee.cancel_termination }
+
+          expect([*span(employee), employee.name]).to eq [_2021_01_01, _2021_03_01, "A"]
+        end
       end
     end
   end
