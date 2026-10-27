@@ -120,12 +120,15 @@ module ActiveRecord
 
       # Predicate: Is this entity's timeline terminated (finite end)?
       #
+      # Zero-length rows don't count, as the operations look past them.
+      #
       # @return [Boolean] true if last segment's valid_to < DEFAULT_VALID_TO
       def terminated?
         last_valid_to = self.class
           .where(bitemporal_id: bitemporal_id)
           .ignore_valid_datetime
           .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+          .where(holding_a_time)
           .maximum(valid_to_key)
         return false if last_valid_to.nil?
         last_valid_to < ActiveRecord::Bitemporal::DEFAULT_VALID_TO
@@ -158,12 +161,15 @@ module ActiveRecord
 
       # Predicate: Has this entity's genesis been shifted from its original value?
       #
+      # Zero-length rows don't count, as the operations look past them.
+      #
       # @return [Boolean] true if current genesis differs from original creation genesis
       def shifted_genesis?
         current_genesis = self.class
           .where(bitemporal_id: bitemporal_id)
           .ignore_valid_datetime
           .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+          .where(holding_a_time)
           .order(valid_from_key => :asc)
           .pick(valid_from_key)
         return false if current_genesis.nil?
@@ -356,6 +362,11 @@ module ActiveRecord
 
       def zero_length?(record)
         record[valid_from_key] == record[valid_to_key]
+      end
+
+      # The condition a row that isn't zero-length meets
+      def holding_a_time
+        self.class.arel_table[valid_from_key].lt(self.class.arel_table[valid_to_key])
       end
 
       # Merges equal neighbours of a timeline ordered by valid time: a piece ending where the

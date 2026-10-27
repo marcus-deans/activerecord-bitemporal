@@ -377,7 +377,7 @@ end
 
 `correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` each leave the entity's current timeline with no seam (two adjacent segments with the same values) and no zero-length row (`valid_from` equal to `valid_to`), whatever they found there. An `update!` that sets the values the next segment already has leaves a seam, and a `destroy` at a segment's exact start leaves a zero-length row. The operation merges or closes them anywhere in the timeline, so on such a timeline it writes to do that even when it otherwise changes nothing: shifting to the current genesis, terminating at the current end, or a cancel with nothing to cancel.
 
-Segments whose range and values don't change keep their rows, so a cancel rewrites only the segments the operation it undoes changed. A zero-length row holds no version, so the operations look past it: an entity whose only current rows are zero-length raises `ActiveRecord::RecordNotFound`.
+Segments whose range and values don't change keep their rows, so a cancel rewrites only the segments the operation it undoes changed. A zero-length row holds no version, so the operations look past it, and so do `terminated?` and `shifted_genesis?`: an entity whose only current rows are zero-length raises `ActiveRecord::RecordNotFound`, and reads as neither terminated nor shifted.
 
 ### The Record After an Operation
 

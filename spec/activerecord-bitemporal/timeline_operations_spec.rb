@@ -1166,6 +1166,33 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
       end
     end
 
+    # The predicates read the timeline the operations act on, so they look past zero-length rows too
+    describe "#shifted_genesis?" do
+      context "with a zero-length row before the genesis" do
+        #   Q |Jan, Jan)  A |Feb, Mar)  B |Mar, Jul)  C |Jul, ∞)
+        let!(:employee_id) { create_employee.tap { |id| insert_zero_length_row(id, _01_01) } }
+
+        it "reads the genesis from the first segment that holds a time" do
+          expect(employee.shifted_genesis?).to be false
+        end
+      end
+
+      # An upstream destroy at the genesis leaves A |Feb, Feb) in front of B
+      context "with a zero-length row at the original genesis" do
+        #   A |Feb, Feb)  B |Mar, Jul)  C |Jul, ∞)
+        let!(:employee_id) {
+          create_employee.tap { |id|
+            Timecop.freeze("2020/10/02") { ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.find(id).destroy } }
+          }
+        }
+        let(:employee) { Employee.find_at_time(_03_01, employee_id) }
+
+        it "reads the genesis from the first segment that holds a time" do
+          expect(employee.shifted_genesis?).to be true
+        end
+      end
+    end
+
     # An upstream destroy at the genesis leaves only A |Feb, Feb): no segment holds a time
     context "when every current row is zero-length" do
       # Self, loaded before the destroy
@@ -1192,6 +1219,11 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           expect { Timecop.freeze(operated_at) { operation.call(employee) } }.to raise_error(ActiveRecord::RecordNotFound)
           expect(history).to eq history_before
         end
+      end
+
+      it "reads as neither terminated nor shifted" do
+        expect(employee.terminated?).to be false
+        expect(employee.shifted_genesis?).to be false
       end
     end
   end
