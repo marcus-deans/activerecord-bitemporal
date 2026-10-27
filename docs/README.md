@@ -296,7 +296,7 @@ Only the attributes you pass change. Each segment in the span keeps its own valu
 
 ### Unbounded Correction (without `valid_to`)
 
-When you omit `valid_to`, the correction extends only to the next change point, fully preserving all future changes:
+When you omit `valid_to`, the correction extends only to the end of the segment containing `valid_from`, fully preserving all future changes. That end counts even when the next segment holds the same values (a seam), since an app may show each future segment as a scheduled change:
 
 ```ruby
 # Before:

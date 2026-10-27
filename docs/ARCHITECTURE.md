@@ -242,7 +242,7 @@ After:  A/E1 X/E1     X/E2 A/E2
         Jan  Feb     Mar  Apr
 ```
 
-**Unbounded** (no `valid_to`): Correction extends to the next change point, fully preserving all future changes.
+**Unbounded** (no `valid_to`): Correction extends to the end of the segment containing `valid_from`, fully preserving all future changes. A seam of equal segments still counts as that end.
 
 ```
 Before: A             B             C

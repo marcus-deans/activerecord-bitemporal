@@ -17,7 +17,8 @@ module ActiveRecord
       # @param valid_from [Time, Date, String] When the correction starts being true
       # @param valid_to [Time, Date, String, nil] When the correction ends (optional)
       #   - If specified: Correct exactly [valid_from, valid_to), resume timeline at valid_to
-      #   - If omitted: Correct from valid_from to next change point, preserve all future changes
+      #   - If omitted: Correct from valid_from to the end of the segment containing it, preserving
+      #     every later segment. That end counts even when the next segment holds equal values.
       # @param attributes [Hash] The corrected attribute values
       # @raise [ArgumentError] if valid_to <= valid_from, or attributes name a bitemporal column
       # @raise [ActiveRecord::RecordNotFound] if no segment contains valid_from
@@ -330,7 +331,7 @@ module ActiveRecord
             )
           end
 
-          # 2. Unbounded corrections end at the next change point
+          # 2. Unbounded corrections end where the containing segment ends, even at a seam
           effective_valid_to = valid_to || containing_record[valid_to_key]
 
           # Guard: correction must not extend past the entity's timeline end

@@ -1899,6 +1899,20 @@ RSpec.describe "Cascade Correction (#correct method)" do
         expect(written_at(employee, corrected_at)).to eq(closed: 2, inserted: 1, zero_length: 0)
       end
 
+      # An app can show the second segment of a seam as a scheduled change, so an
+      # unbounded correction stops there rather than running on to the next actual change
+      it "ends an unbounded correction at the end of the segment it starts in" do
+        correct_at(corrected_at, employee, valid_from: _04_01, name: "X")
+
+        expect(segments(employee)).to eq [
+          [_01_01, _03_01, "A", "E1"],
+          [_03_01, _04_01, "B", "E1"],
+          [_04_01, _05_01, "X", "E1"],
+          [_05_01, infinity, "B", "E1"],
+        ]
+        expect(written_at(employee, corrected_at)).to eq(closed: 1, inserted: 2, zero_length: 0)
+      end
+
       it "merges it when the patch changes another part of the timeline" do
         correct_at(corrected_at, employee, valid_from: _01_01, valid_to: _02_01, name: "X")
 
