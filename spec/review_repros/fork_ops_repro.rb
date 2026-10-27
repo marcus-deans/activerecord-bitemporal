@@ -2,6 +2,11 @@
 
 require 'spec_helper'
 
+# Removed once fixed and covered by real specs (cascade_correction_spec.rb, "patch semantics"):
+# - F3, bounded correct flattening other attributes and filling gaps (D2)
+# - F5 for correct, zero-length rows from coalescing its own inserts (D2 merges before
+#   inserting). That repro's last zero-length row came from its setup: an upstream update!
+#   at the same frozen time as the create!.
 RSpec.describe "Fork review repros" do
   let(:jan) { "2020/01/01".in_time_zone }
   let(:feb) { "2020/02/01".in_time_zone }
@@ -35,15 +40,6 @@ RSpec.describe "Fork review repros" do
         [mar, may, "Alice", "E002"],
         [may, inf, "Bob", "E002"],
       ])
-    end
-
-    it "bounded across segments: emp_code in [Mar,Apr) silently rewritten E002 -> E001 although only name was corrected" do
-      e = Employee.find(@e.id)
-      Timecop.freeze("2020/10/06") { e.correct(valid_from: feb, valid_to: apr, name: "X") }
-      tl = timeline(Employee, e.id, :name, :emp_code)
-      puts "\n[bounded multi-segment] #{tl.map { |a, b, n, c| "#{a.to_date}..#{b.to_date} #{n}/#{c}" }.join(' | ')}"
-      at_mid_march = ActiveRecord::Bitemporal.valid_at("2020/03/15") { Employee.find(e.id) }
-      expect(at_mid_march.emp_code).to eq("E002") # what a user correcting only `name` would expect
     end
   end
 
@@ -107,15 +103,6 @@ RSpec.describe "Fork review repros" do
       Timecop.freeze("2020/10/02") { Employee.find_at_time(mar, @e.id).destroy }
     end
 
-    it "bounded correct across a gap silently fills it (fabricates existence)" do
-      before_tl = timeline(Employee, @e.id, :name)
-      Timecop.freeze("2020/10/03") { Employee.find_at_time(feb, @e.id).correct(valid_from: feb, valid_to: jun, name: "X") }
-      after_tl = timeline(Employee, @e.id, :name)
-      fmt = ->(tl) { tl.map { |a, b, n| "#{a.to_date}..#{b == inf ? 'inf' : b.to_date} #{n}" }.join(' | ') }
-      puts "\n[gap] before: #{fmt.(before_tl)}\n[gap] after:  #{fmt.(after_tl)}"
-      expect(ActiveRecord::Bitemporal.valid_at("2020/04/01") { Employee.find_by(bitemporal_id: @e.id) }).to be_nil
-    end
-
     it "terminate inside a gap ends timeline at gap start, not at requested time" do
       Timecop.freeze("2020/10/03") { Employee.find_at_time(feb, @e.id).terminate(termination_time: apr) }
       puts "\n[terminate in gap] last valid_to=#{timeline(Employee, @e.id).last[1].to_date} (requested 2020-04-01)"
@@ -159,20 +146,6 @@ RSpec.describe "Fork review repros" do
       before = Employee.call_after_save_count
       Employee.find(@e.id).correct(valid_from: feb, valid_to: apr, name: "X")
       puts "\n[callbacks] after_save fired #{Employee.call_after_save_count - before} times for one correct()"
-    end
-  end
-
-  describe "coalesce" do
-    it "leaves zero-length transaction rows that fail the model's own validation" do
-      Timecop.freeze("2020/10/01") do
-        ActiveRecord::Bitemporal.valid_at(jan) { @e = Employee.create!(name: "A") }
-        ActiveRecord::Bitemporal.valid_at(mar) { @e.update!(name: "B") }
-      end
-      Timecop.freeze("2020/10/06") { Employee.find(@e.id).correct(valid_from: mar, name: "A") }
-      zero = Employee.ignore_valid_datetime.within_deleted.where(bitemporal_id: @e.id)
-        .where("transaction_from = transaction_to").to_a
-      puts "\n[coalesce] zero-length tx rows: #{zero.size}; valid? => #{zero.map(&:valid?).inspect}; errors=#{zero.first&.errors&.full_messages.inspect}"
-      expect(zero).to be_empty
     end
   end
 

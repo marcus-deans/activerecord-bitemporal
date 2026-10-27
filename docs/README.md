@@ -288,13 +288,15 @@ employee.correct(valid_from: feb_1, valid_to: apr_1, name: "X")
 
 **What happens:**
 1. Record A is trimmed to end at Feb 1
-2. The correction "X" is inserted for [Feb 1, Apr 1)
+2. Each segment's part in [Feb 1, Apr 1) gets name "X". The parts cut from A and B are now equal, so they're stored as one segment
 3. Record B is trimmed to start at Apr 1 (was Mar, now Apr)
 4. Record C is **preserved unchanged** (CASCADE)
 
+Only the attributes you pass change. Each segment in the span keeps its own values for the rest, so a change of another attribute inside the span stays where it was (a patch, like SQL:2011's `UPDATE ... FOR PORTION OF`). A gap inside the span stays a gap. A segment that already has the given values isn't rewritten. Adjacent segments with equal values are merged anywhere in the timeline, so a correction that changes nothing writes only to merge such a seam (an upstream `update!` can leave one). Passing a bitemporal column (`bitemporal_id`, `transaction_from`, ...), or an alias of one, raises `ArgumentError`.
+
 ### Unbounded Correction (without `valid_to`)
 
-When you omit `valid_to`, the correction extends only to the next change point, fully preserving all future changes:
+When you omit `valid_to`, the correction extends only to the end of the segment containing `valid_from`, fully preserving all future changes. That end counts even when the next segment holds the same values (a seam), since an app may show each future segment as a scheduled change:
 
 ```ruby
 # Before:

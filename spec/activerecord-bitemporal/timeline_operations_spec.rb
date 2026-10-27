@@ -304,10 +304,14 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
         paused = Queue.new
         resume = Queue.new
         record = Employee.find_at_time(start, employee.id)
-        # Holds the operation right after it has taken its locks
-        allow(record).to receive(:find_affected_records_for_correction).and_wrap_original { |original, *args|
-          paused << true
-          resume.pop
+        # Holds the operation right after it has taken its locks, at its first read
+        first_read = true
+        allow(record).to receive(:find_all_current_knowledge_segments).and_wrap_original { |original, *args|
+          if first_read
+            first_read = false
+            paused << true
+            resume.pop
+          end
           original.call(*args)
         }
         operation = in_thread { record.correct(valid_from: start + 30.days, name: "X") }
