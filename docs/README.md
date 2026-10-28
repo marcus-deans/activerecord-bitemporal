@@ -393,6 +393,42 @@ employee.update!(emp_code: "C2")       # builds on the correction
 
 Like `reload`, an operation discards unsaved changes on the record. A call that changes nothing writes nothing and leaves the record as it was. A frozen record raises `FrozenError`, as `update!` does.
 
+### Validations and Callbacks During an Operation
+
+`correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` insert each new row with `save_without_bitemporal_callbacks!(validate: false)`, as upstream inserts the rows of an `update!` or `destroy`, and close each old row with `update_columns`.
+
+#### Validations
+
+The model's validations never run on the rows an operation writes, and neither do `before_validation` and `after_validation`. The only check is the operation's own: if the entity's current rows overlap once it has written its rows, it raises `ActiveRecord::RecordInvalid` and rolls back.
+
+Validating the new values is the caller's job. Assign them to the record and validate it before you call `correct`:
+
+```ruby
+attributes = { salary: 55_000 }
+employee.assign_attributes(attributes)
+employee.validate!                     # raises ActiveRecord::RecordInvalid if they're invalid
+employee.correct(valid_from: jan_1, **attributes)
+```
+
+The gem doesn't validate the rows itself because `correct` is a patch: each segment in the span keeps its own values for the attributes you don't pass. Validating every row would hold your correction to data you never touched, such as an older value that a validation added later rejects. `terminate`, `shift_genesis` and the cancels write only values already stored.
+
+#### Callbacks
+
+| When | What runs |
+|------|-----------|
+| A row is inserted | The model's save and create callbacks (`before_save`, `around_save`, `before_create`, `around_create`, `after_create`, `after_save`), once per row: a `correct` that writes three rows runs them three times |
+| A row is closed | Nothing: `update_columns` runs no update or save callback |
+| The operation as a whole | No validation, update or destroy callback, and none of upstream's `bitemporal_create`, `bitemporal_update` or `bitemporal_destroy` |
+| On commit | `after_commit`, `after_create_commit` and `after_save_commit` once for the entity, however many rows the operation inserted. Never `after_update_commit` or `after_destroy_commit` |
+
+The commit callbacks run once because upstream's `after_create` sets each inserted row's `id` to the entity's `bitemporal_id`. Every row the operation inserts then has the same class and `id`, and Rails runs commit callbacks on only one instance per class and `id` in a transaction (which one follows Rails' `run_commit_callbacks_on_first_saved_instances_in_transaction`). So an app can hang expensive work off `after_commit` without it running once per row.
+
+- Every row an operation inserts is a create, so create callbacks such as `after_create` and `after_create_commit` run for a correction, a termination or a cancel too, not only when the entity is first created.
+- Callbacks run on the inserted rows, each a new copy of a version with its own valid range, not on the record you called the operation on.
+- On an inserted row, `saved_change_to_<attribute>?` is true for every column that holds a value, not only for the attributes the operation changed, because the row is a fresh copy. A `correct` of `name` reports `salary` as changed too.
+- A call that writes nothing (it changes nothing, and finds no seam or zero-length row to fix) runs no callback, `after_commit` included.
+- An operation that only closes rows, such as a `terminate` at a segment's end or a `shift_genesis` forward to a segment's start, saves no row, so it runs no callback either, `after_commit` included.
+
 ### Times You Pass
 
 `correct`, `shift_genesis` and `terminate` take the times you pass as the valid-time column stores them, read in `Time.zone` as `valid_at` reads them. For a date column that's the day, so `Date.new(2024, 3, 1)` or any time that day meets a March 1 boundary in every time zone. For a datetime column it's the time to the column's precision, so the same `Time.current` an `update!` was made at meets the boundary that update wrote. A `correct` whose two times fall on the same day of a date column raises `ArgumentError`.
