@@ -588,7 +588,7 @@ employee.terminate(termination_time: apr_1)
 1. Segments entirely before the termination point are **untouched** (Alice)
 2. A segment spanning the termination point is **truncated** (Bob's `valid_to` set to Apr)
 3. Segments entirely after the termination point are **removed** (Carol)
-4. All changes are wrapped in a transaction with row-level locking
+4. All changes are wrapped in a transaction that holds the entity's timeline locks (see [Concurrency](#concurrency))
 
 ### Cancel Termination
 
@@ -718,6 +718,52 @@ end
 Employee.find_at_time(may_1, employee.id)
 # => nil (after termination, May is no longer valid)
 ```
+
+---
+
+## Concurrency
+
+`correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` lock the entity's timeline before they read it, and hold the locks until the surrounding transaction ends. They need PostgreSQL: the locks use its advisory lock functions.
+
+Each operation takes, in this order:
+
+1. **An advisory lock on the entity**, with this key:
+
+   ```sql
+   SELECT pg_advisory_xact_lock(hashtext('<table_name>'), hashtext('<bitemporal_id as text>'))
+   ```
+
+   Two operations on the same entity wait for each other. Unlike a row lock, this holds even when the entity has no row valid now.
+2. **The row valid now** (`FOR UPDATE`), by the same statement `save` and `save!` lock with. They lock that row first and then close the row valid at the record's own time, which for a future-dated `update!` is another row. Taking the row valid now first means such an `update!` waits for the operation while holding nothing, so the two can't deadlock.
+3. **Every current-knowledge row** of the entity (`FOR UPDATE`), whatever its valid time. An `update!` or `destroy` already writing any of them commits before the operation reads the timeline.
+
+### Holding the Lock Yourself
+
+The advisory lock's key is part of the public API. Code holding the same lock in its transaction and the operations wait for each other, and an operation called while you hold it re-enters it:
+
+```ruby
+Employee.transaction do
+  Employee.connection.execute(Employee.sanitize_sql_array([
+    "SELECT pg_advisory_xact_lock(hashtext(?), hashtext(?))",
+    Employee.table_name, employee.bitemporal_id.to_s
+  ]))
+
+  record = Employee.find_at_time(jun_1, employee.id)
+  record.valid_at(jun_1) { record.update!(name: "B") }
+  employee.correct(valid_from: feb_1, name: "X")
+end
+```
+
+Take it before the transaction's first write to the entity. A transaction that row-locks the entity with `update!` first and takes the advisory lock after (directly or through an operation) can deadlock with another holder; PostgreSQL then aborts one of the two.
+
+### What the Locks Don't Cover
+
+`save` and `destroy` don't take the advisory lock, and two kinds of write read the timeline before they lock a row an operation holds:
+
+- `save`/`update!` on an entity with no row valid now (its timeline starts in the future or has ended): the lock on the row valid now covers no row.
+- `destroy`: it reads the version it keeps as history before it locks the row it closes.
+
+Such a write can read the timeline before an operation commits and write after it, on top of what it read. To serialize it with the operations, hold the advisory lock around it as above.
 
 ---
 

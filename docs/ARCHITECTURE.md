@@ -174,7 +174,8 @@ The `#correct` method implements cascade correction - fixing historical data whi
 
 ```
 1. BEGIN TRANSACTION
-2. LOCK all records for the entity (prevent concurrent modifications)
+2. LOCK the timeline: advisory lock, then the row valid now, then every
+   current-knowledge row (see Locking Strategy)
 3. FIND containing record at valid_from (none, e.g. inside a gap: RecordNotFound)
 4. END the span at valid_to, or at the containing record's end when unbounded
    (past the timeline's end: ValidDatetimeRangeError)
@@ -200,7 +201,7 @@ The key insight is that validation must happen AFTER closing old records:
 
 ```ruby
 # CORRECT ORDER:
-1. Lock all records for entity
+1. Lock the timeline (advisory lock, row valid now, every current-knowledge row)
 2. Find affected records
 3. Build new timeline
 4. CLOSE old records FIRST (set transaction_to)
@@ -277,7 +278,8 @@ Both methods are whole-timeline operations — they fetch all current-knowledge 
 
 ```
 1. BEGIN TRANSACTION
-2. LOCK all records for the entity (SELECT ... FOR UPDATE)
+2. LOCK the timeline: advisory lock, then SELECT ... FOR UPDATE on the row valid now,
+   then on every current-knowledge row (see Locking Strategy)
 3. FETCH all current-knowledge segments (transaction_to = ∞), ordered by valid_from
 4. GUARD: Raise RecordNotFound if no segments exist
 5. GUARD: Raise ArgumentError if termination_time <= first segment's valid_from
@@ -299,7 +301,8 @@ Both methods are whole-timeline operations — they fetch all current-knowledge 
 
 ```
 1. BEGIN TRANSACTION
-2. LOCK all records for the entity
+2. LOCK the timeline: advisory lock, then the row valid now, then every
+   current-knowledge row (see Locking Strategy)
 3. FETCH all current-knowledge segments
 4. GUARD: Raise RecordNotFound if no segments exist
 5. NO-OP: Return true if last segment's valid_to = ∞ (not terminated)
@@ -557,16 +560,25 @@ WHERE valid_from <= ? AND valid_to > ?
 
 ### Locking Strategy
 
-Updates use `FOR UPDATE` locks:
+Upstream's `save` and `save!` lock the row valid now (through the default scope) before they write:
 
 ```ruby
 self.class.where(bitemporal_id: self.id).lock!.pluck(:id) if self.id
 ```
 
+They then close the row valid at the record's own time, which for a future-dated update is another row. `destroy` takes no lock first: it reads the version it keeps as history, then updates the row it closes.
+
+The timeline operations (`lock_timeline!`, PostgreSQL only) take three locks, in this order, before they read the timeline:
+
+1. **Advisory lock**: `pg_advisory_xact_lock(hashtext(<table_name>), hashtext(<bitemporal_id as text>))`, held until the transaction ends. The key is a public contract: a caller holding it in the same transaction and the operations wait for each other, and an operation called while holding it re-enters it. Unlike a row lock, it holds even when the entity has no row valid now.
+2. **Row valid now**: upstream's statement above. Every upstream save locks that row before any other, so an operation holding it makes the save wait while holding nothing. Locking another row first could deadlock with a future-dated save that holds the row valid now and waits for that other row.
+3. **Every current-knowledge row**: `FOR UPDATE` with `ignore_valid_datetime` and `transaction_to = ∞`, so an upstream write already in flight on any of them commits before the operation reads the timeline.
+
+**Not covered**: a `save` on an entity with no row valid now locks no row first, and `destroy` reads before it locks. Either can read the timeline before an operation commits and write after it. Callers serialize such writes by holding the same advisory lock, taken before the transaction's first write to the entity.
+
 **Impact**:
 
-- Serializes updates to same logical entity
-- Prevents race conditions
+- Serializes writes to the same logical entity, within the limits above
 - Can cause contention under high concurrency
 
 ### Storage Overhead
