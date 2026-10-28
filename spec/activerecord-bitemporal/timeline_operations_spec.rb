@@ -227,6 +227,153 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
       expect(employee.swapped_id_previously_was).to eq before
     end
 
+    it "brings a strict-loading record's preloaded associations back at the time self was loaded at" do
+      #   C-old |01-01, 06-01)  C-new |06-01, ∞)
+      company = Timecop.freeze("2020/09/01") {
+        ActiveRecord::Bitemporal.valid_at(_01_01) { Company.create!(name: "C-old") }
+      }
+      Timecop.freeze("2020/09/02") {
+        ActiveRecord::Bitemporal.valid_at(_06_01) { Company.find(company.id).update!(name: "C-new") }
+      }
+      Employee.unscoped.where(bitemporal_id: employee_id).update_all(company_id: company.id)
+      employee = Employee.strict_loading.includes(:company).find(employee_id)
+
+      Timecop.freeze("2020/10/05") { employee.correct(valid_from: _01_01, valid_to: _02_01, name: "A2") }
+
+      expect(employee.company.name).to eq "C-new"
+    end
+
+    it "is not moved by ignore_* options stored on self" do
+      employee = Employee.find(employee_id)
+      employee.bitemporal_option_merge!(ignore_transaction_datetime: true)
+
+      Timecop.freeze("2020/10/05") { employee.correct(valid_from: _05_01, name: "X") }
+
+      expect(employee.name).to eq "X"
+      expect(employee.swapped_id).to eq version_at(_06_01).swapped_id
+    end
+
+    it "refuses a frozen receiver before writing, as update! does" do
+      employee = Employee.find(employee_id).freeze
+
+      expect {
+        Timecop.freeze("2020/10/05") { employee.terminate(termination_time: _06_01) }
+      }.to raise_error(FrozenError)
+      expect(employee).to be_frozen
+      expect(version_at(_06_01).valid_to).to eq ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+    end
+
+    context "when the caller's scopes hide rows" do
+      let(:unarchived_employee_class) {
+        Class.new(Employee) {
+          def self.name; "UnarchivedEmployee"; end
+          default_scope { where(archived_at: nil) }
+        }
+      }
+
+      it "finds the version a default scope hides after the operation" do
+        employee = unarchived_employee_class.find(employee_id)
+
+        Timecop.freeze("2020/10/05") { employee.correct(valid_from: _05_01, archived_at: Time.current) }
+
+        expect(employee.name).to eq "B"
+        expect(employee.archived_at).to be_present
+      end
+
+      it "finds a version when a default scope hides all of them after the operation" do
+        employee = unarchived_employee_class.find(employee_id)
+
+        Timecop.freeze("2020/10/05") {
+          employee.correct(valid_from: _01_01, valid_to: ActiveRecord::Bitemporal::DEFAULT_VALID_TO, archived_at: Time.current)
+        }
+
+        expect(unarchived_employee_class.where(bitemporal_id: employee_id)).not_to exist
+        expect(employee.name).to eq "B"
+        expect(employee.archived_at).to be_present
+      end
+
+      it "is not held to a scoping(all_queries: true) block built before the operation" do
+        employee = Employee.find(employee_id)
+        scope = Timecop.freeze("2020/10/04") { Employee.where(emp_code: "C1") }
+
+        scope.scoping(all_queries: true) {
+          Timecop.freeze("2020/10/05") { employee.correct(valid_from: _05_01, name: "X") }
+        }
+
+        expect(employee.name).to eq "X"
+        expect(employee.swapped_id).to eq version_at(_06_01).swapped_id
+      end
+
+      it "reads current knowledge inside a global transaction_at" do
+        employee = Employee.find(employee_id)
+
+        Timecop.freeze("2020/10/05") do
+          ActiveRecord::Bitemporal.transaction_at("2020/10/03".in_time_zone) {
+            employee.correct(valid_from: _05_01, name: "X")
+          }
+        end
+
+        expect(employee.name).to eq "X"
+        expect(employee.swapped_id).to eq version_at(_06_01).swapped_id
+      end
+    end
+
+    # Ruby compares a Date with a Time as midnight UTC, while the database casts the time to a
+    # date in Time.zone, so outside UTC the two disagree near a boundary
+    context "with a date valid time outside UTC" do
+      #   A |2020-01-01, 2020-05-01)  B |2020-05-01, ∞)
+      let!(:department_id) {
+        Timecop.freeze("2019/12/01") do
+          ActiveRecord::Bitemporal.valid_at(Date.new(2020, 1, 1)) { @department = Department.create!(name: "A") }
+        end
+        Timecop.freeze("2019/12/02") do
+          ActiveRecord::Bitemporal.valid_at(Date.new(2020, 5, 1)) { @department.update!(name: "B") }
+        end
+        @department.id
+      }
+
+      def correct_inside_a(department)
+        department.correct(valid_from: Date.new(2020, 1, 15), valid_to: Date.new(2020, 2, 1), name: "A2")
+      end
+
+      context "east of UTC" do
+        around { |example| Time.use_zone("Tokyo", &example) }
+
+        it "stays on the version valid on the date self was loaded at" do
+          department = Department.find_at_time(Date.new(2020, 5, 1), department_id)
+
+          Timecop.freeze("2020/10/01") { correct_inside_a(department) }
+
+          expect([department.valid_from, department.name]).to eq [Date.new(2020, 5, 1), "B"]
+        end
+
+        it "takes the last version on the day the timeline ends, while UTC is still on the day before" do
+          department = Timecop.freeze(Time.zone.local(2020, 4, 30, 12)) {
+            Department.create!(name: "A", valid_from: Date.new(2020, 1, 1), valid_to: Date.new(2020, 5, 1))
+          }
+
+          Timecop.freeze(Time.zone.local(2020, 5, 1, 5)) { correct_inside_a(department) } # 2020-04-30 20:00 UTC
+
+          expect([department.valid_from, department.valid_to, department.name])
+            .to eq [Date.new(2020, 2, 1), Date.new(2020, 5, 1), "A"]
+        end
+      end
+
+      context "west of UTC" do
+        around { |example| Time.use_zone("America/New_York", &example) }
+
+        it "stays on today's version late on the day before a boundary" do
+          Timecop.freeze(Time.zone.local(2020, 4, 30, 22)) do # 2020-05-01 02:00 UTC
+            department = Department.find(department_id)
+
+            correct_inside_a(department)
+
+            expect([department.valid_from, department.name]).to eq [Date.new(2020, 2, 1), "A"]
+          end
+        end
+      end
+    end
+
     context "when no version is valid at that time" do
       it "points at the latest version starting before it, for every operation" do
         employee = Employee.find(employee_id)

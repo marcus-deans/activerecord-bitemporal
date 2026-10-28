@@ -271,6 +271,9 @@ module ActiveRecord
       # Afterwards self is reloaded onto the new timeline (see reload_onto_timeline). An op's
       # no-op exit writes nothing and leaves self alone.
       def perform_timeline_operation
+        # The reload at the end would swap in fresh attributes, so refuse up front as update! does
+        raise FrozenError, "can't modify frozen attributes" if frozen?
+
         ActiveRecord::Base.transaction(requires_new: true) do
           lock_timeline!
           current_time = Time.current
@@ -294,8 +297,7 @@ module ActiveRecord
           # Validate the new timeline (post-hoc)
           validate_cascade_correction_timeline!
 
-          # Query DB since untouched segments aren't in new_records
-          reload_onto_timeline(find_all_current_knowledge_segments)
+          reload_onto_timeline
 
           true
         end
@@ -306,18 +308,33 @@ module ActiveRecord
       # starting before it, else the first one. Runs the real reload pinned to that version,
       # so every reload hook runs (dirty tracking, autosave flags, a model's own resets) and
       # unsaved changes are discarded.
-      def reload_onto_timeline(segments)
-        at = valid_datetime || Time.current
-        versions = segments.reject { |r| r[valid_from_key] == r[valid_to_key] }
-        version = versions.find { |r| r[valid_from_key] <= at && at < r[valid_to_key] } ||
+      def reload_onto_timeline
+        # Cast as the database casts it: Ruby compares a Date with a Time as midnight UTC
+        at = self.class.type_for_attribute(valid_from_key).cast(valid_datetime || Time.current)
+        # Unscoped, so neither the model's default scope nor a caller's scoping or
+        # transaction_at can hide a version, the ones this op just wrote included
+        versions = self.class.unscoped
+          .where(bitemporal_id: bitemporal_id, transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+          .order(valid_from_key => :asc)
+          .reject { |r| r[valid_from_key] == r[valid_to_key] }
+        covering = versions.find { |r| r[valid_from_key] <= at && at < r[valid_to_key] }
+        version = covering ||
           versions.reverse.find { |r| r[valid_from_key] <= at } ||
           versions.first
 
         # Forced, so neither the times self was loaded at nor a caller's valid_at!,
-        # transaction_at! or ignore_* block can move the lookup off that version
+        # transaction_at! or ignore_* block can move the lookup off that version. Pinned at
+        # `at` when the version covers it, so a strict-loading record's associations, which
+        # reload preloads under this pin, load at the time reload would load them at.
+        # Unscoped as above, and with self's own ignore_* options off, since they'd win over
+        # the forced ones.
         previous_swapped_id = swapped_id
-        ActiveRecord::Bitemporal.valid_at!(version[valid_from_key]) do
-          ActiveRecord::Bitemporal.transaction_at!(Time.current) { reload }
+        ActiveRecord::Bitemporal.valid_at!(covering ? at : version[valid_from_key]) do
+          ActiveRecord::Bitemporal.transaction_at!(Time.current) do
+            with_bitemporal_option(ignore_valid_datetime: false, ignore_transaction_datetime: false) do
+              reload(unscoped: true)
+            end
+          end
         end
         @_swapped_id_previously_was = previous_swapped_id
       end

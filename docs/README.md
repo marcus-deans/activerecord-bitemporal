@@ -385,7 +385,7 @@ employee.changed?                      # => false
 employee.update!(emp_code: "C2")       # builds on the correction
 ```
 
-Like `reload`, an operation discards unsaved changes on the record. A call that changes nothing writes nothing and leaves the record as it was.
+Like `reload`, an operation discards unsaved changes on the record. A call that changes nothing writes nothing and leaves the record as it was. A frozen record raises `FrozenError`, as `update!` does.
 
 ---
 

@@ -368,11 +368,11 @@ State after cancel:
 
 Every timeline operation (`correct`, `shift_genesis`, `terminate` and the two cancels) ends inside its transaction by reloading `self`, the way `update!` and `reload` treat the record's own valid time:
 
-1. Pick the version: the current-knowledge segment valid at `self.valid_datetime` (the time it was loaded at with `valid_at`/`find_at_time`), or at now when it has none. When none is valid then (a timeline ended before it, a gap, or a timeline starting after it), take the latest segment starting before that time, else the first segment. Zero-length rows are never picked.
-2. Call the real `reload` inside `valid_at!(version.valid_from)` and `transaction_at!(now)`. Forcing both pins the lookup to that version whatever the record or the caller's scopes say.
+1. Pick the version: the current-knowledge segment valid at `self.valid_datetime` (the time it was loaded at with `valid_at`/`find_at_time`), or at now when it has none. That time is first cast to the valid-time column's type, so a date column compares days the way the database does. When none is valid then (a timeline ended before it, a gap, or a timeline starting after it), take the latest segment starting before that time, else the first segment. Zero-length rows are never picked. The segments are read unscoped, so neither the model's default scope nor a caller's `scoping` or `transaction_at` can hide one.
+2. Call the real `reload(unscoped: true)` inside `valid_at!` and `transaction_at!(now)`, with the record's own `ignore_*` options off. The valid time is that same time when the version covers it, else the version's `valid_from`. Forcing both pins the lookup to that version whatever the record or the caller's scopes say. Pinning at the record's own time when possible means a strict-loading record's associations, which `reload` preloads under the pin, load at the time `reload` would load them at.
 3. Set `swapped_id_previously_was` to the row `self` pointed at before, as `update!` does.
 
-Going through `reload` means every reload hook runs: Rails' dirty tracking and autosave flags, and any `reload` override on the model (such as one resetting memoized values). Unsaved changes on `self` are discarded, as `reload` discards them. An operation's no-op exits return before any write and leave `self` alone.
+Going through `reload` means every reload hook runs: Rails' dirty tracking and autosave flags, and any `reload` override on the model (such as one resetting memoized values). Unsaved changes on `self` are discarded, as `reload` discards them. An operation's no-op exits return before any write and leave `self` alone. A frozen `self` raises `FrozenError` before anything is written, as `update!` does.
 
 ---
 
