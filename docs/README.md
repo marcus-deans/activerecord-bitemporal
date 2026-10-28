@@ -393,6 +393,24 @@ employee.update!(emp_code: "C2")       # builds on the correction
 
 Like `reload`, an operation discards unsaved changes on the record. A call that changes nothing writes nothing and leaves the record as it was. A frozen record raises `FrozenError`, as `update!` does.
 
+### Blocks and Scopes Around an Operation
+
+`correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` always work on the entity's whole current timeline, as `update!` records at now. They read its rows unscoped, so a `transaction_at`, `valid_at` or `bitemporal_at` block around the call (with `!` or without), a `scoping` block, or the model's own `default_scope` hides none of them:
+
+```ruby
+ActiveRecord::Bitemporal.transaction_at(last_week) do
+  # Patches the timeline as it is now, rows recorded since last week included
+  employee.correct(valid_from: feb_1, name: "X")
+end
+
+Employee.where(archived_at: nil).scoping do
+  # Ends the timeline at June 1, archived segments included
+  employee.terminate(termination_time: jun_1)
+end
+```
+
+The history a cancel walks back through, and `terminated?` and `shifted_genesis?`, are read the same way. The record you call the operation on is then reloaded onto the current timeline at its own valid time (see The Record After an Operation), which a `valid_at` block sets: inside `valid_at(feb_1)`, onto the version valid on February 1.
+
 ### Validations and Callbacks During an Operation
 
 `correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` insert each new row with `save_without_bitemporal_callbacks!(validate: false)`, as upstream inserts the rows of an `update!` or `destroy`, and close each old row with `update_columns`.
@@ -797,8 +815,8 @@ Each operation takes, in this order:
    ```
 
    Two operations on the same entity wait for each other. Unlike a row lock, this holds even when the entity has no row valid now.
-2. **The row valid now** (`FOR UPDATE`), by the same statement `save` and `save!` lock with. They lock that row first and then close the row valid at the record's own time, which for a future-dated `update!` is another row. Taking the row valid now first means such an `update!` waits for the operation while holding nothing, so the two can't deadlock.
-3. **Every current-knowledge row** of the entity (`FOR UPDATE`), whatever its valid time. An `update!` or `destroy` already writing any of them commits before the operation reads the timeline.
+2. **The row valid now** (`FOR UPDATE`), by the same statement `save` and `save!` lock with outside any block, whatever block the operation is called in. They lock that row first and then close the row valid at the record's own time, which for a future-dated `update!` is another row. Taking the row valid now first means such an `update!` waits for the operation while holding nothing, so the two can't deadlock.
+3. **Every current-knowledge row** of the entity (`FOR UPDATE`), whatever its valid time or the caller's scopes. An `update!` or `destroy` already writing any of them commits before the operation reads the timeline.
 
 ### Holding the Lock Yourself
 
@@ -827,6 +845,18 @@ Take it before the transaction's first write to the entity. A transaction that r
 - `destroy`: it reads the version it keeps as history before it locks the row it closes.
 
 Such a write can read the timeline before an operation commits and write after it, on top of what it read. To serialize it with the operations, hold the advisory lock around it as above.
+
+### Clocks on Different Hosts
+
+Every write records its own host's clock as transaction time. An operation reads the time once it holds the locks, so on one host it's later than every write that committed before. A host whose clock runs ahead, though, records rows with a `transaction_from` later than another host's now, and closing such a row at that now would end it before it starts. So an operation that finds a current row recorded after its own time raises `ActiveRecord::Bitemporal::TransactionTimeSkewError` before it writes anything, naming the row and how many seconds ahead of the operation it was recorded:
+
+```ruby
+employee.terminate(termination_time: jun_1)
+# => ActiveRecord::Bitemporal::TransactionTimeSkewError
+#    (another host recorded a current row after this host's now)
+```
+
+The call succeeds once this host's clock has passed that row's time. Clock skew between hosts is otherwise out of scope, as it is for upstream's writes.
 
 ---
 
@@ -908,7 +938,7 @@ WHERE valid_from <= NOW()
   AND transaction_to > NOW()
 ```
 
-⚠️ **Note:** This is NOT implemented via `default_scope`, so `.unscoped` will NOT remove these filters.
+⚠️ **Note:** These filters are the model's `default_scope`, so `.unscoped` removes them, along with any default scope of your own.
 
 ### Overriding Default Filters
 

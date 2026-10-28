@@ -7,6 +7,10 @@
 # whose range and values don't change keep their rows, and a call that changes nothing
 # writes nothing and leaves self alone (see perform_timeline_operation).
 #
+# They read the entity's rows unscoped (see timeline_rows), so a transaction_at, valid_at or
+# bitemporal_at block around the call, a scoping block or the model's default scope can't
+# hide a row from them.
+#
 # Loaded from fork.rb once ActiveRecord is loaded; the fork's error classes live there.
 module ActiveRecord
   module Bitemporal
@@ -120,16 +124,12 @@ module ActiveRecord
 
       # Predicate: Is this entity's timeline terminated (finite end)?
       #
-      # Zero-length rows don't count, as the operations look past them.
+      # Zero-length rows don't count, as the operations look past them. Like them, it reads
+      # the current timeline whatever block or scope it's called in.
       #
       # @return [Boolean] true if last segment's valid_to < DEFAULT_VALID_TO
       def terminated?
-        last_valid_to = self.class
-          .where(bitemporal_id: bitemporal_id)
-          .ignore_valid_datetime
-          .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
-          .where(holding_a_time)
-          .maximum(valid_to_key)
+        last_valid_to = current_knowledge_rows.where(holding_a_time).maximum(valid_to_key)
         return false if last_valid_to.nil?
         last_valid_to < ActiveRecord::Bitemporal::DEFAULT_VALID_TO
       end
@@ -161,14 +161,12 @@ module ActiveRecord
 
       # Predicate: Has this entity's genesis been shifted from its original value?
       #
-      # Zero-length rows don't count, as the operations look past them.
+      # Zero-length rows don't count, as the operations look past them. Like them, it reads
+      # the whole timeline whatever block or scope it's called in.
       #
       # @return [Boolean] true if current genesis differs from original creation genesis
       def shifted_genesis?
-        current_genesis = self.class
-          .where(bitemporal_id: bitemporal_id)
-          .ignore_valid_datetime
-          .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+        current_genesis = current_knowledge_rows
           .where(holding_a_time)
           .order(valid_from_key => :asc)
           .pick(valid_from_key)
@@ -252,6 +250,21 @@ module ActiveRecord
         type.deserialize(self.class.connection.type_cast(type.serialize(time)))
       end
 
+      # Every row of this entity, in every valid and transaction time. Unscoped, so neither a
+      # transaction_at, valid_at or bitemporal_at block around the call, a caller's scoping
+      # block nor the model's default scope can hide a row: an operation works on the whole
+      # timeline, as upstream's uniqueness validation reads it. (Upstream's
+      # ignore_valid_datetime and within_deleted have no condition to remove from it.) An STI
+      # subclass still reads only its own type: that condition comes from the class.
+      def timeline_rows
+        self.class.unscoped.where(bitemporal_id: bitemporal_id)
+      end
+
+      # The rows of current knowledge: those not closed in transaction time
+      def current_knowledge_rows
+        timeline_rows.where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+      end
+
       # Serializes writes to this entity's timeline until the surrounding transaction ends.
       # PostgreSQL only.
       #
@@ -262,9 +275,10 @@ module ActiveRecord
       #    it re-enters it instead of deadlocking. Unlike a row lock it holds even when the
       #    entity has no row valid now.
       # 2. FOR UPDATE on the row valid now, by the statement upstream's save and save! lock
-      #    with. They lock that row first and then close the row valid at the record's own
-      #    time, another row for a future-dated update. Taking any other row before this one
-      #    could deadlock with them; taking this one first makes them wait holding nothing.
+      #    with outside any block. They lock that row first and then close the row valid at
+      #    the record's own time, another row for a future-dated update. Taking any other row
+      #    before this one could deadlock with them; taking this one first makes them wait
+      #    holding nothing. It's pinned to now, whatever block or scope the caller is in.
       # 3. FOR UPDATE on every current-knowledge row, not just the one valid now. Upstream's
       #    save and destroy lock rows but never take the advisory lock, so this makes an
       #    upstream write already in flight on any of these rows commit before this
@@ -282,14 +296,15 @@ module ActiveRecord
         lock = Arel::Nodes::NamedFunction.new("pg_advisory_xact_lock", keys)
         self.class.connection.execute(Arel::SelectManager.new.project(lock).to_sql)
 
-        self.class.where(bitemporal_id: bitemporal_id).lock!.pluck(:id)
-
-        self.class
+        # save!'s statement as the default scope builds it at now
+        now = Time.current
+        self.class.unscoped
+          .transaction_from_lteq(now).transaction_to_gt(now)
+          .valid_from_lteq(now).valid_to_gt(now)
           .where(bitemporal_id: bitemporal_id)
-          .ignore_valid_datetime
-          .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
-          .lock!
-          .pluck(:id)
+          .lock!.pluck(:id)
+
+        current_knowledge_rows.lock!.pluck(:id)
       end
 
       # Shared skeleton of the five timeline operations.
@@ -314,7 +329,9 @@ module ActiveRecord
       # are recorded again.
       #
       # current_time is read only once the locks are held, so it is later than every write
-      # that committed while this operation waited for them.
+      # that committed while this operation waited for them. A current row recorded after it
+      # all the same, by a host whose clock runs ahead, raises before anything is written
+      # (see refuse_rows_recorded_later!).
       #
       # Afterwards self is reloaded onto the new timeline (see reload_onto_timeline). A call
       # with nothing to write writes nothing and leaves self alone.
@@ -327,6 +344,7 @@ module ActiveRecord
           current_time = Time.current
 
           rows = find_all_current_knowledge_segments
+          refuse_rows_recorded_later!(rows, current_time)
           segments = rows.reject { |row| zero_length?(row) }
 
           # Guard and build (op-specific)
@@ -358,6 +376,27 @@ module ActiveRecord
 
           true
         end
+      end
+
+      # Raises TransactionTimeSkewError when a current row was recorded after current_time.
+      # A host whose clock runs ahead of this one records such a row, and closing it at
+      # current_time would set its transaction_to before its transaction_from. Clock skew
+      # between hosts is otherwise out of scope, as it is for upstream's writes.
+      #
+      # current_time is compared as read, not as the column would store it: a stored time is
+      # cut to the column's precision, never rounded up. So a row recorded at or before
+      # current_time never reads as later than it, and a row that does is later than the
+      # transaction_to a close would store too.
+      def refuse_rows_recorded_later!(rows, current_time)
+        latest = rows.max_by(&:transaction_from)
+        return unless latest && latest.transaction_from > current_time
+
+        raise TransactionTimeSkewError,
+          "#{self.class} with bitemporal_id=#{bitemporal_id} has a current row (id=#{latest.id}) " \
+          "with transaction_from #{latest.transaction_from.iso8601(6)}, " \
+          "#{(latest.transaction_from - current_time).round(6)} seconds after this operation's " \
+          "time #{current_time.iso8601(6)}. Closing it would set its transaction_to before its " \
+          "transaction_from; the host that recorded it may have a clock running ahead"
       end
 
       def zero_length?(record)
@@ -411,10 +450,9 @@ module ActiveRecord
       def reload_onto_timeline
         # Cast as the database stores it: Ruby compares a Date with a Time as midnight UTC
         at = cast_valid_time(valid_from_key, valid_datetime || Time.current)
-        # Unscoped, so neither the model's default scope nor a caller's scoping or
-        # transaction_at can hide a version, the ones this op just wrote included
-        versions = self.class.unscoped
-          .where(bitemporal_id: bitemporal_id, transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+        # Unscoped, so no scope or block of the caller's can hide a version, the ones this op
+        # just wrote included
+        versions = current_knowledge_rows
           .order(valid_from_key => :asc)
           .reject { |r| r[valid_from_key] == r[valid_to_key] }
         covering = versions.find { |r| r[valid_from_key] <= at && at < r[valid_to_key] }
@@ -518,10 +556,7 @@ module ActiveRecord
       end
 
       def find_all_current_knowledge_segments
-        self.class
-          .where(bitemporal_id: bitemporal_id)
-          .ignore_valid_datetime
-          .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+        current_knowledge_rows
           # valid_to breaks ties, so a zero-length row comes before the segment it shares a start with
           .order(valid_from_key => :asc, valid_to_key => :asc)
           .to_a
@@ -686,19 +721,13 @@ module ActiveRecord
       # [segments, change_point], or nil when no snapshot has one. A snapshot's zero-length
       # rows are no part of it.
       def find_pre_termination_state
-        change_points = self.class
-          .where(bitemporal_id: bitemporal_id)
-          .ignore_valid_datetime
-          .within_deleted
+        change_points = timeline_rows
           .where.not(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
           .distinct.pluck(:transaction_to)
           .sort.reverse
 
         change_points.each do |cp|
-          state = self.class
-            .where(bitemporal_id: bitemporal_id)
-            .ignore_valid_datetime
-            .within_deleted
+          state = timeline_rows
             .where(self.class.arel_table[:transaction_from].lt(cp))
             .where(self.class.arel_table[:transaction_to].gteq(cp))
             .order(valid_from_key => :asc)
@@ -724,10 +753,7 @@ module ActiveRecord
       def recorded_since?(change_point)
         transaction_from = self.class.arel_table[:transaction_from]
         transaction_to = self.class.arel_table[:transaction_to]
-        self.class
-          .where(bitemporal_id: bitemporal_id)
-          .ignore_valid_datetime
-          .within_deleted
+        timeline_rows
           .where(
             transaction_from.gt(change_point).or(
               transaction_to.gt(change_point).and(transaction_to.not_eq(ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO))
@@ -800,10 +826,7 @@ module ActiveRecord
       #
       # @return [Time, nil] the original genesis time, or nil if no records exist
       def find_original_genesis
-        self.class
-          .where(bitemporal_id: bitemporal_id)
-          .ignore_valid_datetime
-          .within_deleted
+        timeline_rows
           .order(transaction_from: :asc, valid_from_key => :asc)
           .pick(valid_from_key)
       end
@@ -842,19 +865,13 @@ module ActiveRecord
       #   and the change point they ended at (t2 above), or nil if no prior state with a
       #   different genesis can be found
       def find_pre_shift_genesis_state(current_genesis)
-        change_points = self.class
-          .where(bitemporal_id: bitemporal_id)
-          .ignore_valid_datetime
-          .within_deleted
+        change_points = timeline_rows
           .where.not(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
           .distinct.pluck(:transaction_to)
           .sort.reverse
 
         change_points.each do |cp|
-          state = self.class
-            .where(bitemporal_id: bitemporal_id)
-            .ignore_valid_datetime
-            .within_deleted
+          state = timeline_rows
             .where(self.class.arel_table[:transaction_from].lt(cp))
             .where(self.class.arel_table[:transaction_to].gteq(cp))
             .order(valid_from_key => :asc)
@@ -874,10 +891,7 @@ module ActiveRecord
 
       def validate_cascade_correction_timeline!
         # Check for overlapping valid times at current transaction time
-        records = self.class
-          .where(bitemporal_id: bitemporal_id)
-          .ignore_valid_datetime
-          .where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
+        records = current_knowledge_rows
           .order(valid_from_key => :asc, valid_to_key => :asc)
           .to_a
 

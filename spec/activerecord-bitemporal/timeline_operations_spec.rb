@@ -353,6 +353,13 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
             expect(employee.name).to eq "X"
             expect(employee.swapped_id).to eq version_at(_06_01).swapped_id
           end
+
+          it "lands on the version valid at a global valid_at's time, which self's own valid time reads" do
+            ActiveRecord::Bitemporal.valid_at(_02_01) { correct }
+
+            expect(employee.name).to eq "A"
+            expect(employee.swapped_id).to eq version_at(_02_01).swapped_id
+          end
         end
       end
 
@@ -2008,6 +2015,605 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
       Timecop.freeze("2020/10/06") { employee.shift_genesis(new_valid_from: now) }
 
       expect(rows(employee)).to match [b]
+    end
+  end
+
+  # An operation works on the entity's whole current timeline, as upstream's own writes
+  # record at now, whatever block or scope the caller runs it in.
+  describe "the caller's blocks and scopes" do
+    let(:_02_01) { "2020/02/01".in_time_zone }
+    let(:_03_01) { "2020/03/01".in_time_zone }
+    let(:_04_01) { "2020/04/01".in_time_zone }
+    let(:_05_01) { "2020/05/01".in_time_zone }
+    let(:_06_01) { "2020/06/01".in_time_zone }
+    let(:infinity) { ActiveRecord::Bitemporal::DEFAULT_VALID_TO }
+
+    # Runs the operation as the caller does: outside any block, unless a context says otherwise
+    let(:callers_block) { ->(operation) { operation.call } }
+
+    def in_callers_block(&operation)
+      callers_block.call(operation)
+    end
+
+    # [valid_from, valid_to, name, *attributes] of every current-knowledge row, read outside
+    # the caller's block
+    def timeline(bitemporal_id, *attributes)
+      Employee.ignore_valid_datetime
+        .where(bitemporal_id: bitemporal_id, transaction_to: tt_infinity)
+        .order(:valid_from)
+        .pluck(:valid_from, :valid_to, :name, *attributes)
+    end
+
+    describe "a transaction_at, valid_at or scoping block" do
+      # A transaction time from before B was re-recorded
+      let(:past) { "2020/10/02".in_time_zone }
+
+      #   A |02-01, 03-01)  B |03-01, 05-01)  C |05-01, ∞)   recorded on 2020-10-01,
+      #   then B re-recorded in place as B2 on 2020-10-03
+      let!(:employee_id) {
+        Timecop.freeze("2020/10/01") do
+          @employee = ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
+        end
+        Timecop.freeze("2020/10/03") do
+          b = Employee.find_at_time(_03_01, @employee.id)
+          b.force_update { b.update!(name: "B2") }
+        end
+        @employee.id
+      }
+      # Loaded before the block, as the caller's record is
+      let!(:employee) { Employee.find_at_time(_03_01, employee_id) }
+
+      shared_examples "in or out of the caller's blocks" do |examples|
+        context "outside any block" do
+          include_examples examples
+        end
+
+        context "in a transaction_at block from before B2 was recorded" do
+          let(:callers_block) { ->(operation) { ActiveRecord::Bitemporal.transaction_at(past) { operation.call } } }
+
+          include_examples examples
+        end
+
+        context "in a transaction_at! block from before B2 was recorded" do
+          let(:callers_block) { ->(operation) { ActiveRecord::Bitemporal.transaction_at!(past) { operation.call } } }
+
+          include_examples examples
+        end
+
+        context "in a bitemporal_at block from before B2 was recorded" do
+          let(:callers_block) { ->(operation) { ActiveRecord::Bitemporal.bitemporal_at(past) { operation.call } } }
+
+          include_examples examples
+        end
+
+        context "in a valid_at! block at a time only A covers" do
+          let(:callers_block) { ->(operation) { ActiveRecord::Bitemporal.valid_at!(_02_01) { operation.call } } }
+
+          include_examples examples
+        end
+
+        context "in a scoping block only C matches" do
+          let(:callers_block) { ->(operation) { Employee.where(name: "C").scoping { operation.call } } }
+
+          include_examples examples
+        end
+      end
+
+      describe "#correct" do
+        subject(:correct) {
+          Timecop.freeze("2020/10/05") {
+            in_callers_block { employee.correct(valid_from: _02_01, valid_to: _06_01, name: "X") }
+          }
+        }
+
+        shared_examples "patching every current segment in the range" do
+          it "patches every current segment in the range" do
+            correct
+
+            expect(timeline(employee_id)).to eq [[_02_01, _06_01, "X"], [_06_01, infinity, "C"]]
+          end
+        end
+
+        it_behaves_like "in or out of the caller's blocks", "patching every current segment in the range"
+      end
+
+      describe "#terminate" do
+        subject(:terminate) {
+          Timecop.freeze("2020/10/05") { in_callers_block { employee.terminate(termination_time: _04_01) } }
+        }
+
+        shared_examples "ending the current timeline" do
+          it "ends the current timeline there" do
+            terminate
+
+            expect(timeline(employee_id)).to eq [[_02_01, _03_01, "A"], [_03_01, _04_01, "B2"]]
+          end
+        end
+
+        it_behaves_like "in or out of the caller's blocks", "ending the current timeline"
+      end
+
+      describe "#shift_genesis" do
+        subject(:shift_genesis) {
+          Timecop.freeze("2020/10/05") { in_callers_block { employee.shift_genesis(new_valid_from: _04_01) } }
+        }
+
+        shared_examples "starting the current timeline later" do
+          it "starts the current timeline there" do
+            shift_genesis
+
+            expect(timeline(employee_id)).to eq [[_04_01, _05_01, "B2"], [_05_01, infinity, "C"]]
+          end
+        end
+
+        it_behaves_like "in or out of the caller's blocks", "starting the current timeline later"
+      end
+
+      describe "#cancel_termination" do
+        subject(:cancel_termination) { Timecop.freeze("2020/10/05") { in_callers_block { employee.cancel_termination } } }
+
+        before { Timecop.freeze("2020/10/04") { employee.terminate(termination_time: _04_01) } }
+
+        shared_examples "restoring the current timeline" do
+          it "restores the current timeline from before the termination" do
+            cancel_termination
+
+            expect(timeline(employee_id)).to eq [[_02_01, _03_01, "A"], [_03_01, _05_01, "B2"], [_05_01, infinity, "C"]]
+          end
+        end
+
+        it_behaves_like "in or out of the caller's blocks", "restoring the current timeline"
+      end
+
+      describe "#cancel_shift_genesis" do
+        subject(:cancel_shift_genesis) { Timecop.freeze("2020/10/05") { in_callers_block { employee.cancel_shift_genesis } } }
+
+        before { Timecop.freeze("2020/10/04") { employee.shift_genesis(new_valid_from: _04_01) } }
+
+        shared_examples "restoring the current timeline" do
+          it "restores the current timeline from before the shift" do
+            cancel_shift_genesis
+
+            expect(timeline(employee_id)).to eq [[_02_01, _03_01, "A"], [_03_01, _05_01, "B2"], [_05_01, infinity, "C"]]
+          end
+        end
+
+        it_behaves_like "in or out of the caller's blocks", "restoring the current timeline"
+      end
+
+      describe "#terminated?" do
+        subject(:terminated) { in_callers_block { employee.terminated? } }
+
+        context "after a termination" do
+          before { Timecop.freeze("2020/10/04") { employee.terminate(termination_time: _04_01) } }
+
+          shared_examples "terminated" do
+            it { is_expected.to be true }
+          end
+
+          it_behaves_like "in or out of the caller's blocks", "terminated"
+        end
+
+        context "after a termination and its cancel, both recorded after the block's time" do
+          before do
+            Timecop.freeze("2020/10/04") { employee.terminate(termination_time: _04_01) }
+            Timecop.freeze("2020/10/05") { employee.cancel_termination }
+          end
+
+          shared_examples "not terminated" do
+            it { is_expected.to be false }
+          end
+
+          it_behaves_like "in or out of the caller's blocks", "not terminated"
+        end
+      end
+
+      describe "#shifted_genesis?" do
+        subject(:shifted_genesis) { in_callers_block { employee.shifted_genesis? } }
+
+        context "after a genesis shift" do
+          before { Timecop.freeze("2020/10/04") { employee.shift_genesis(new_valid_from: _04_01) } }
+
+          shared_examples "shifted" do
+            it { is_expected.to be true }
+          end
+
+          it_behaves_like "in or out of the caller's blocks", "shifted"
+        end
+
+        context "after a genesis shift and its cancel, both recorded after the block's time" do
+          before do
+            Timecop.freeze("2020/10/04") { employee.shift_genesis(new_valid_from: _04_01) }
+            Timecop.freeze("2020/10/05") { employee.cancel_shift_genesis }
+          end
+
+          shared_examples "not shifted" do
+            it { is_expected.to be false }
+          end
+
+          it_behaves_like "in or out of the caller's blocks", "not shifted"
+        end
+      end
+
+      describe "the lock on the row valid now" do
+        subject(:row_locks) {
+          Timecop.freeze("2020/10/05") {
+            row_locks_during { in_callers_block { employee.correct(valid_from: _05_01, name: "X") } }
+          }
+        }
+
+        # Every FOR UPDATE statement the block runs, with the values bound to it
+        def row_locks_during(&block)
+          locks = []
+          callback = ->(*, payload) {
+            next unless payload[:sql].include?("FOR UPDATE")
+
+            binds = payload[:type_casted_binds]
+            locks << [payload[:sql], binds.respond_to?(:call) ? binds.call : binds]
+          }
+          ActiveSupport::Notifications.subscribed(callback, "sql.active_record", &block)
+          locks
+        end
+
+        shared_examples "save!'s lock" do
+          it "is the lock upstream's save! takes outside any block, at the same time" do
+            locks = row_locks
+            save_lock = Timecop.freeze("2020/10/05") { row_locks_during { Employee.find(employee_id).save! } }.sole
+
+            expect(locks.first).to eq save_lock
+          end
+        end
+
+        it_behaves_like "in or out of the caller's blocks", "save!'s lock"
+      end
+
+      context "across connections", use_truncation: true do
+        def in_thread(&block)
+          Thread.new { ActiveRecord::Base.connection_pool.with_connection(&block) }
+        end
+
+        shared_examples "row-locking every current row" do
+          it "row-locks every current row, the one the block hides included" do
+            paused = Queue.new
+            resume = Queue.new
+            # Holds the operation right after it has taken its locks, at its first read
+            first_read = true
+            allow(employee).to receive(:find_all_current_knowledge_segments).and_wrap_original { |original, *args|
+              if first_read
+                first_read = false
+                paused << true
+                resume.pop
+              end
+              original.call(*args)
+            }
+            run_in_callers_block = callers_block
+            operation = in_thread { run_in_callers_block.call(-> { employee.correct(valid_from: _05_01, name: "X") }) }
+            paused.pop
+
+            begin
+              # B2: not valid now, so save!'s lock doesn't cover it
+              expect {
+                Employee.ignore_valid_datetime
+                  .where(bitemporal_id: employee_id, name: "B2")
+                  .lock("FOR UPDATE NOWAIT")
+                  .to_a
+              }.to raise_error(ActiveRecord::LockWaitTimeout)
+            ensure
+              resume << true
+              operation.join
+            end
+          end
+        end
+
+        it_behaves_like "in or out of the caller's blocks", "row-locking every current row"
+      end
+    end
+
+    describe "a default scope or a scoping block that hides rows" do
+      let(:archived_at) { "2020/09/01".in_time_zone }
+
+      #   A |02-01, 03-01) archived  B |03-01, 05-01)  C |05-01, ∞) archived   recorded on 2020-10-01
+      let!(:employee_id) {
+        Timecop.freeze("2020/10/01") do
+          @employee = ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.create!(name: "A", archived_at: archived_at) }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B", archived_at: nil) }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C", archived_at: archived_at) }
+        end
+        @employee.id
+      }
+
+      # The whole timeline, unchanged
+      let(:recorded_timeline) {
+        [[_02_01, _03_01, "A", archived_at], [_03_01, _05_01, "B", nil], [_05_01, infinity, "C", archived_at]]
+      }
+
+      shared_examples "with a default scope or in a scoping block" do |examples|
+        context "with the model's default scope" do
+          let(:unarchived_employee_class) {
+            Class.new(Employee) {
+              def self.name; "UnarchivedEmployee"; end
+              default_scope { where(archived_at: nil) }
+            }
+          }
+          # Loaded through that scope, before the operation
+          let!(:employee) { unarchived_employee_class.find_at_time(_03_01, employee_id) }
+
+          include_examples examples
+        end
+
+        context "in a scoping block" do
+          let!(:employee) { Employee.find_at_time(_03_01, employee_id) }
+          let(:callers_block) { ->(operation) { Employee.where(archived_at: nil).scoping { operation.call } } }
+
+          include_examples examples
+        end
+      end
+
+      describe "#correct" do
+        subject(:correct) {
+          Timecop.freeze("2020/10/05") {
+            in_callers_block { employee.correct(valid_from: _02_01, valid_to: _06_01, name: "X") }
+          }
+        }
+
+        shared_examples "patching the hidden rows too" do
+          it "patches every current segment in the range, the hidden ones included" do
+            correct
+
+            expect(timeline(employee_id, :archived_at)).to eq [
+              [_02_01, _03_01, "X", archived_at],
+              [_03_01, _05_01, "X", nil],
+              [_05_01, _06_01, "X", archived_at],
+              [_06_01, infinity, "C", archived_at],
+            ]
+          end
+        end
+
+        it_behaves_like "with a default scope or in a scoping block", "patching the hidden rows too"
+      end
+
+      describe "#terminate" do
+        subject(:terminate) {
+          Timecop.freeze("2020/10/05") { in_callers_block { employee.terminate(termination_time: _04_01) } }
+        }
+
+        shared_examples "closing the hidden rows too" do
+          it "ends the whole current timeline there" do
+            terminate
+
+            expect(timeline(employee_id, :archived_at)).to eq [[_02_01, _03_01, "A", archived_at], [_03_01, _04_01, "B", nil]]
+          end
+        end
+
+        it_behaves_like "with a default scope or in a scoping block", "closing the hidden rows too"
+      end
+
+      describe "#shift_genesis" do
+        subject(:shift_genesis) {
+          Timecop.freeze("2020/10/05") { in_callers_block { employee.shift_genesis(new_valid_from: _04_01) } }
+        }
+
+        shared_examples "closing the hidden rows too" do
+          it "starts the whole current timeline there" do
+            shift_genesis
+
+            expect(timeline(employee_id, :archived_at)).to eq [[_04_01, _05_01, "B", nil], [_05_01, infinity, "C", archived_at]]
+          end
+        end
+
+        it_behaves_like "with a default scope or in a scoping block", "closing the hidden rows too"
+      end
+
+      describe "#cancel_termination" do
+        subject(:cancel_termination) { Timecop.freeze("2020/10/06") { in_callers_block { employee.cancel_termination } } }
+
+        context "after a termination" do
+          before { Timecop.freeze("2020/10/04") { Employee.find_at_time(_03_01, employee_id).terminate(termination_time: _04_01) } }
+
+          shared_examples "restoring the hidden rows too" do
+            it "restores the whole timeline" do
+              cancel_termination
+
+              expect(timeline(employee_id, :archived_at)).to eq recorded_timeline
+            end
+          end
+
+          it_behaves_like "with a default scope or in a scoping block", "restoring the hidden rows too"
+        end
+
+        context "when a hidden row was re-recorded since the termination" do
+          before do
+            Timecop.freeze("2020/10/04") { Employee.find_at_time(_03_01, employee_id).terminate(termination_time: _06_01) }
+            Timecop.freeze("2020/10/05") do
+              c = Employee.find_at_time(_05_01, employee_id)
+              c.force_update { c.update!(name: "C2") }
+            end
+          end
+
+          shared_examples "refusing" do
+            it "refuses and keeps the re-recorded row" do
+              expect { cancel_termination }.to raise_error(ActiveRecord::Bitemporal::RecordedSinceTerminationError)
+              expect(timeline(employee_id, :archived_at)).to eq [
+                [_02_01, _03_01, "A", archived_at],
+                [_03_01, _05_01, "B", nil],
+                [_05_01, _06_01, "C2", archived_at],
+              ]
+            end
+          end
+
+          it_behaves_like "with a default scope or in a scoping block", "refusing"
+        end
+      end
+
+      describe "#cancel_shift_genesis" do
+        subject(:cancel_shift_genesis) { Timecop.freeze("2020/10/05") { in_callers_block { employee.cancel_shift_genesis } } }
+
+        # Moves the genesis off the hidden row A
+        before { Timecop.freeze("2020/10/04") { Employee.find_at_time(_03_01, employee_id).shift_genesis(new_valid_from: _03_01) } }
+
+        shared_examples "restoring the hidden genesis" do
+          it "restores the whole timeline" do
+            cancel_shift_genesis
+
+            expect(timeline(employee_id, :archived_at)).to eq recorded_timeline
+          end
+        end
+
+        it_behaves_like "with a default scope or in a scoping block", "restoring the hidden genesis"
+      end
+
+      describe "#terminated?" do
+        subject(:terminated) { in_callers_block { employee.terminated? } }
+
+        shared_examples "not terminated" do
+          it { is_expected.to be false }
+        end
+
+        it_behaves_like "with a default scope or in a scoping block", "not terminated"
+      end
+
+      describe "#shifted_genesis?" do
+        subject(:shifted_genesis) { in_callers_block { employee.shifted_genesis? } }
+
+        # Moves the genesis off the hidden row A
+        before { Timecop.freeze("2020/10/04") { Employee.find_at_time(_03_01, employee_id).shift_genesis(new_valid_from: _03_01) } }
+
+        shared_examples "shifted" do
+          it { is_expected.to be true }
+        end
+
+        it_behaves_like "with a default scope or in a scoping block", "shifted"
+      end
+    end
+  end
+
+  # A host whose clock runs ahead of this one records rows later than this host's now, and
+  # closing such a row at now would end it before it starts in transaction time
+  describe "a current row recorded after the operation's time" do
+    let(:_02_01) { "2020/02/01".in_time_zone }
+    let(:_05_01) { "2020/05/01".in_time_zone }
+    let(:_06_01) { "2020/06/01".in_time_zone }
+    let(:infinity) { ActiveRecord::Bitemporal::DEFAULT_VALID_TO }
+    # This host's time when it runs the operation
+    let(:now) { "2020/10/05 12:00:00".in_time_zone }
+    # The other host's at that moment
+    let(:ahead) { now + 5.seconds }
+
+    #   A |02-01, 05-01)  B |05-01, ∞)   recorded on 2020-10-01
+    let!(:employee_id) {
+      Timecop.freeze("2020/10/01") do
+        @employee = ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.create!(name: "A") }
+        ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "B") }
+      end
+      @employee.id
+    }
+    # Loaded before the other host writes
+    let!(:employee) { Employee.find_at_time(_05_01, employee_id) }
+
+    # Every row of the entity, as stored
+    def history
+      all_rows(Employee, employee_id).order(:transaction_from, :valid_from).map(&:attributes)
+    end
+
+    # The row the other host recorded
+    let(:later_row_id) { Employee.ignore_valid_datetime.find_by!(bitemporal_id: employee_id, transaction_from: ahead).swapped_id }
+    let(:message) {
+      "Employee with bitemporal_id=#{employee_id} has a current row (id=#{later_row_id}) " \
+        "with transaction_from 2020-10-05T12:00:05.000000Z, 5.0 seconds after this operation's " \
+        "time 2020-10-05T12:00:00.000000Z. Closing it would set its transaction_to before its " \
+        "transaction_from; the host that recorded it may have a clock running ahead"
+    }
+
+    context "when a host whose clock runs ahead re-recorded B" do
+      before do
+        Timecop.freeze(ahead) do
+          b = Employee.find_at_time(_05_01, employee_id)
+          b.force_update { b.update!(name: "B2") }
+        end
+      end
+
+      {
+        "correct" => ->(e) { e.correct(valid_from: "2020/06/01".in_time_zone, name: "X") },
+        "terminate" => ->(e) { e.terminate(termination_time: "2020/06/01".in_time_zone) },
+        "shift_genesis" => ->(e) { e.shift_genesis(new_valid_from: "2020/03/01".in_time_zone) },
+      }.each do |name, operation|
+        it "#{name} raises before it writes" do
+          recorded = history
+          before_operation = employee.attributes
+
+          expect {
+            Timecop.freeze(now) { operation.call(employee) }
+          }.to raise_error(ActiveRecord::Bitemporal::TransactionTimeSkewError, message)
+          expect(history).to eq recorded
+          expect(employee.attributes).to eq before_operation
+        end
+      end
+
+      context "once this host's clock has passed that row's time" do
+        it "builds on it" do
+          Timecop.freeze(ahead + 1.second) { employee.correct(valid_from: _06_01, name: "X") }
+
+          expect(rows(employee)).to match [
+            [_02_01, _05_01, "A", Integer],
+            [_05_01, _06_01, "B2", Integer],
+            [_06_01, infinity, "X", Integer],
+          ]
+        end
+      end
+    end
+
+    context "when a host whose clock runs ahead recorded the operation a cancel undoes" do
+      {
+        "cancel_termination" => [->(e) { e.terminate(termination_time: "2020/06/01".in_time_zone) }, :cancel_termination.to_proc],
+        "cancel_shift_genesis" => [->(e) { e.shift_genesis(new_valid_from: "2020/03/01".in_time_zone) }, :cancel_shift_genesis.to_proc],
+      }.each do |name, (undone, cancel)|
+        it "#{name} raises before it writes" do
+          Timecop.freeze(ahead) { undone.call(Employee.find_at_time(_05_01, employee_id)) }
+          recorded = history
+          before_operation = employee.attributes
+
+          expect {
+            Timecop.freeze(now) { cancel.call(employee) }
+          }.to raise_error(ActiveRecord::Bitemporal::TransactionTimeSkewError, message)
+          expect(history).to eq recorded
+          expect(employee.attributes).to eq before_operation
+        end
+      end
+    end
+
+    context "when another host re-recorded B at the operation's own time" do
+      before do
+        Timecop.freeze(now) do
+          b = Employee.find_at_time(_05_01, employee_id)
+          b.force_update { b.update!(name: "B2") }
+        end
+      end
+
+      it "builds on it" do
+        Timecop.freeze(now) { employee.correct(valid_from: _06_01, name: "X") }
+
+        expect(rows(employee)).to match [
+          [_02_01, _05_01, "A", Integer],
+          [_05_01, _06_01, "B2", Integer],
+          [_06_01, infinity, "X", Integer],
+        ]
+      end
+
+      context "at a time with a fraction of a microsecond, which the column cuts off" do
+        let(:now) { "2020/10/05 12:00:00.1234567".in_time_zone }
+
+        it "builds on it" do
+          Timecop.freeze(now) { employee.correct(valid_from: _06_01, name: "X") }
+
+          expect(rows(employee)).to match [
+            [_02_01, _05_01, "A", Integer],
+            [_05_01, _06_01, "B2", Integer],
+            [_06_01, infinity, "X", Integer],
+          ]
+        end
+      end
     end
   end
 
