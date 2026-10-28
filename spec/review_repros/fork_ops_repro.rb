@@ -10,6 +10,9 @@ require 'spec_helper'
 #   upstream update! at the same frozen time as the create!.
 # - F4, self left stale and dirty after an op (D5; timeline_operations_spec.rb, "self after
 #   an operation")
+# - F8, op times compared unlike the column stores them, e.g. a Date column outside UTC
+#   (the ops cast them on entry; "times the valid-time column stores differently" in
+#   cascade_correction_spec.rb, terminate_spec.rb and shift_genesis_spec.rb)
 RSpec.describe "Fork review repros" do
   let(:jan) { "2020/01/01".in_time_zone }
   let(:feb) { "2020/02/01".in_time_zone }
@@ -132,24 +135,6 @@ RSpec.describe "Fork review repros" do
       before = Employee.call_after_save_count
       Employee.find(@e.id).correct(valid_from: feb, valid_to: apr, name: "X")
       puts "\n[callbacks] after_save fired #{Employee.call_after_save_count - before} times for one correct()"
-    end
-  end
-
-  describe "date-typed valid time in non-UTC zone (Department)" do
-    %w[Tokyo America/New_York].each do |zone|
-      it "correct at an exact segment boundary (#{zone})" do
-        Time.use_zone(zone) do
-          d = nil
-          Timecop.freeze("2020/10/01") do
-            ActiveRecord::Bitemporal.valid_at("2020/01/01") { d = Department.create!(name: "A") }
-            ActiveRecord::Bitemporal.valid_at("2020/03/01") { d.update!(name: "B") }
-          end
-          Timecop.freeze("2020/10/06") { Department.find(d.id).correct(valid_from: Date.new(2020, 3, 1), name: "X") }
-          tl = Department.ignore_valid_datetime.where(bitemporal_id: d.id).where(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO).order(:valid_from, :valid_to).pluck(:valid_from, :valid_to, :name)
-          puts "\n[date/#{zone}] #{tl.map { |a, b, n| "#{a}..#{b} #{n}" }.join(' | ')}"
-          expect(tl).to eq([[Date.new(2020, 1, 1), Date.new(2020, 3, 1), "A"], [Date.new(2020, 3, 1), Date.new(9999, 12, 31), "X"]])
-        end
-      end
     end
   end
 end

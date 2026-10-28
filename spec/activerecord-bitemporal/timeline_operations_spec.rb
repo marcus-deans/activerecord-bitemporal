@@ -2,6 +2,24 @@
 
 require 'spec_helper'
 
+ActiveRecord::Schema.define(version: 1) do
+  create_table :precisionless_employees, force: true do |t|
+    t.string :name
+
+    t.integer :bitemporal_id
+    t.datetime :valid_from, precision: nil
+    t.datetime :valid_to, precision: nil
+    t.datetime :transaction_from, precision: 6
+    t.datetime :transaction_to, precision: 6
+
+    t.timestamps
+  end
+end
+
+class PrecisionlessEmployee < ActiveRecord::Base
+  include ActiveRecord::Bitemporal
+end
+
 # timeline_dup and timeline_close mirror upstream's refinements in bitemporal.rb:
 # the `dup` refined on ActiveRecord::Base and the `update_transaction_to` refined on
 # Persistence. Refinements are active only inside that file, so the fork's timeline
@@ -347,6 +365,16 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           expect([department.valid_from, department.name]).to eq [Date.new(2020, 5, 1), "B"]
         end
 
+        it "stays on today's version early on a boundary day, while UTC is still on the day before" do
+          Timecop.freeze(Time.zone.local(2020, 5, 1, 5)) do # 2020-04-30 20:00 UTC
+            department = Department.find(department_id)
+
+            correct_inside_a(department)
+
+            expect([department.valid_from, department.name]).to eq [Date.new(2020, 5, 1), "B"]
+          end
+        end
+
         it "takes the last version on the day the timeline ends, while UTC is still on the day before" do
           department = Timecop.freeze(Time.zone.local(2020, 4, 30, 12)) {
             Department.create!(name: "A", valid_from: Date.new(2020, 1, 1), valid_to: Date.new(2020, 5, 1))
@@ -418,6 +446,65 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           expect([*span(employee), employee.name]).to eq [_2021_01_01, _2021_03_01, "A"]
         end
       end
+    end
+  end
+
+  # A datetime column declared without a precision, as schemas from before Rails 7 declared
+  # them, holds microseconds like datetime(6), but its type doesn't cut a time to them: the
+  # connection does, when it writes. The operations still take a time as the column stores it.
+  describe "a valid-time column without a declared precision" do
+    let(:_01_01) { "2020/01/01".in_time_zone }
+    let(:infinity) { ActiveRecord::Bitemporal::DEFAULT_VALID_TO }
+    # A time as Time.current can return it, and as the column stores it
+    let(:now) { "2020/03/01 09:30:00.123456789".in_time_zone }
+    let(:stored_now) { "2020/03/01 09:30:00.123456".in_time_zone }
+
+    # [Jan, now) A, [now, ∞) B: an upstream update! at now
+    let!(:employee) {
+      Timecop.freeze("2020/10/01") do
+        built = ActiveRecord::Bitemporal.valid_at(_01_01) { PrecisionlessEmployee.create!(name: "A") }
+        ActiveRecord::Bitemporal.valid_at(now) { built.update!(name: "B") }
+        PrecisionlessEmployee.find_at_time(_01_01, built.id)
+      end
+    }
+
+    # [valid_from, valid_to, name, row id] for every current-knowledge row, zero-length ones too
+    def rows(record)
+      record.class.ignore_valid_datetime
+        .where(bitemporal_id: record.bitemporal_id)
+        .where(transaction_to: tt_infinity)
+        .order(:valid_from, :valid_to)
+        .pluck(:valid_from, :valid_to, :name, :id)
+    end
+
+    it "has a type that keeps the fraction of a microsecond" do
+      expect(PrecisionlessEmployee.type_for_attribute(:valid_from).precision).to be_nil
+      expect(PrecisionlessEmployee.type_for_attribute(:valid_from).cast(now)).to eq now
+      expect(rows(employee).last.first).to eq stored_now
+    end
+
+    it "lets correct start at a boundary an upstream update! left at the same time" do
+      a = rows(employee).first
+
+      Timecop.freeze("2020/10/06") { employee.correct(valid_from: now, name: "X") }
+
+      expect(rows(employee)).to match [a, [stored_now, infinity, "X", Integer]]
+    end
+
+    it "lets terminate end there" do
+      a = rows(employee).first
+
+      Timecop.freeze("2020/10/06") { employee.terminate(termination_time: now) }
+
+      expect(rows(employee)).to match [a]
+    end
+
+    it "lets shift_genesis start there" do
+      b = rows(employee).last
+
+      Timecop.freeze("2020/10/06") { employee.shift_genesis(new_valid_from: now) }
+
+      expect(rows(employee)).to match [b]
     end
   end
 

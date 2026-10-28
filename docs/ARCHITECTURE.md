@@ -9,12 +9,13 @@ This document covers the internal architecture and implementation details of the
 3. [Update Mechanism](#update-mechanism)
 4. [Correction Mechanism](#correction-mechanism)
 5. [Termination Mechanism](#termination-mechanism)
-6. [Self After an Operation](#self-after-an-operation)
-7. [Uniqueness Validation](#uniqueness-validation)
-8. [ID Swapping Mechanism](#id-swapping-mechanism)
-9. [Query Scoping](#query-scoping)
-10. [Performance Considerations](#performance-considerations)
-11. [Limitations](#limitations)
+6. [Time Arguments](#time-arguments)
+7. [Self After an Operation](#self-after-an-operation)
+8. [Uniqueness Validation](#uniqueness-validation)
+9. [ID Swapping Mechanism](#id-swapping-mechanism)
+10. [Query Scoping](#query-scoping)
+11. [Performance Considerations](#performance-considerations)
+12. [Limitations](#limitations)
 
 ---
 
@@ -361,6 +362,19 @@ State after cancel:
                      Jan           Mar            May            ∞
   (Full pre-termination timeline restored)
 ```
+
+---
+
+## Time Arguments
+
+`correct`, `shift_genesis` and `terminate` take their times once, on entry, as the valid-time column stores them (`cast_valid_time`), so every guard, comparison and new row uses the value a stored boundary has:
+
+1. Read the value in `Time.zone`, as upstream's `valid_at` reads it: a String or Date as midnight there, a Time as the same instant there. `DEFAULT_VALID_TO` is kept as it is, as the attribute default stores it, since in a zone behind UTC its day there is the day before.
+2. Take it the way a write and a read do: through the column's type, the connection and the type again. A date column keeps the day; a datetime column keeps its declared precision, and at most microseconds when it declares none.
+
+Compared as given, such a time disagreed with the boundary it matched: a Date outside UTC is midnight in `Time.zone`, not the stored day, and `Time.current` can carry nanoseconds that a `datetime(6)` boundary written from it lost. Operations then cut zero-length rows, rewrote rows they left unchanged, or raised at the timeline's end. A `correct` span that is empty once cast (both ends on the same day of a date column) raises `ArgumentError`, as any empty span does.
+
+Transaction times need no cast: an operation writes its one `Time.current` to every row it closes or inserts, and never compares it with a stored one.
 
 ---
 

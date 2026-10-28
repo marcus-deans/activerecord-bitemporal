@@ -2080,4 +2080,215 @@ RSpec.describe "Cascade Correction (#correct method)" do
       end
     end
   end
+
+  # ==========================================================================
+  # Test Category 15: Times the valid-time column stores differently
+  # ==========================================================================
+  #
+  # A date column stores a day, and datetime(6) a time to the microsecond. correct takes
+  # valid_from and valid_to as the column stores them, the way upstream's valid_at reads
+  # a time, so it compares them with the stored boundaries it would write.
+  describe "times the valid-time column stores differently" do
+    let(:corrected_at) { "2020/10/06".in_time_zone }
+
+    # [valid_from, valid_to, name, row id] for every current-knowledge row, zero-length ones too
+    def rows(record)
+      record.class.ignore_valid_datetime
+        .where(bitemporal_id: record.bitemporal_id)
+        .where(transaction_to: tt_infinity)
+        .order(:valid_from, :valid_to)
+        .pluck(:valid_from, :valid_to, :name, :id)
+    end
+
+    def correct_at(time, record, **args)
+      Timecop.freeze(time) { record.correct(**args) }
+    end
+
+    shared_context "a department over days" do
+      let(:_01_01) { Date.new(2020, 1, 1) }
+      let(:_02_01) { Date.new(2020, 2, 1) }
+      let(:_03_01) { Date.new(2020, 3, 1) }
+      let(:_06_01) { Date.new(2020, 6, 1) }
+      let(:infinity) { Date.new(9999, 12, 31) }
+
+      # [Jan, Mar) A, [Mar, valid_to) B
+      def build_department(valid_to: nil)
+        Timecop.freeze("2020/10/01") do
+          department = Department.create!(name: "A", valid_from: _01_01, valid_to: valid_to || infinity)
+          ActiveRecord::Bitemporal.valid_at(_03_01) { department.update!(name: "B") }
+          Department.find_at_time(_01_01, department.id)
+        end
+      end
+    end
+
+    %w[Tokyo America/New_York].each do |zone|
+      context "with a date column in #{zone}" do
+        include_context "a department over days"
+        around { |example| Time.use_zone(zone, &example) }
+
+        it "corrects from the timeline's first day" do
+          department = build_department
+          b = rows(department).last
+
+          correct_at(corrected_at, department, valid_from: _01_01, valid_to: _02_01, name: "X")
+
+          expect(rows(department)).to match [
+            [_01_01, _02_01, "X", Integer],
+            [_02_01, _03_01, "A", Integer],
+            b,
+          ]
+        end
+
+        it "corrects from a segment boundary without zero-length rows" do
+          department = build_department
+          a = rows(department).first
+
+          correct_at(corrected_at, department, valid_from: _03_01, name: "X")
+
+          expect(rows(department)).to match [a, [_03_01, infinity, "X", Integer]]
+        end
+
+        it "corrects up to a segment boundary and leaves the next segment's row alone" do
+          department = build_department
+          b = rows(department).last
+
+          correct_at(corrected_at, department, valid_from: _02_01, valid_to: _03_01, name: "X")
+
+          expect(rows(department)).to match [
+            [_01_01, _02_01, "A", Integer],
+            [_02_01, _03_01, "X", Integer],
+            b,
+          ]
+        end
+
+        it "accepts a span ending at the timeline's end" do
+          department = build_department(valid_to: _06_01)
+
+          correct_at(corrected_at, department, valid_from: _02_01, valid_to: _06_01, name: "X")
+
+          expect(rows(department)).to match [
+            [_01_01, _02_01, "A", Integer],
+            [_02_01, _06_01, "X", Integer],
+          ]
+        end
+
+        # DEFAULT_VALID_TO is midnight UTC, the day before in a zone behind UTC
+        it "takes DEFAULT_VALID_TO as the timeline's end" do
+          department = build_department
+
+          correct_at(corrected_at, department, valid_from: _02_01, valid_to: ActiveRecord::Bitemporal::DEFAULT_VALID_TO, name: "X")
+
+          expect(rows(department)).to match [
+            [_01_01, _02_01, "A", Integer],
+            [_02_01, infinity, "X", Integer],
+          ]
+        end
+      end
+    end
+
+    context "with a time of day for a date column" do
+      include_context "a department over days"
+
+      it "takes the day of valid_from" do
+        department = build_department
+        a = rows(department).first
+
+        correct_at(corrected_at, department, valid_from: "2020/03/01 12:00".in_time_zone, name: "X")
+
+        expect(rows(department)).to match [a, [_03_01, infinity, "X", Integer]]
+      end
+
+      it "takes the day of valid_to" do
+        department = build_department
+        b = rows(department).last
+
+        correct_at(corrected_at, department, valid_from: "2020/02/01 12:00".in_time_zone, valid_to: "2020/03/01 12:00".in_time_zone, name: "X")
+
+        expect(rows(department)).to match [
+          [_01_01, _02_01, "A", Integer],
+          [_02_01, _03_01, "X", Integer],
+          b,
+        ]
+      end
+
+      it "raises ArgumentError and writes nothing when both fall on the same day" do
+        department = build_department
+        before_correction = rows(department)
+
+        expect {
+          correct_at(corrected_at, department, valid_from: "2020/02/01 09:00".in_time_zone, valid_to: "2020/02/01 18:00".in_time_zone, name: "X")
+        }.to raise_error(ArgumentError, /must be greater than/)
+        expect(rows(department)).to eq before_correction
+      end
+    end
+
+    context "with a String or Date for a datetime column outside UTC" do
+      around { |example| Time.use_zone("Tokyo", &example) }
+
+      # [Jan, Mar) A, [Mar, ∞) B, Mar being midnight in Tokyo as upstream's valid_at reads it
+      let!(:employee) {
+        Timecop.freeze("2020/10/01") do
+          built = ActiveRecord::Bitemporal.valid_at("2020/01/01") { Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at("2020/03/01") { built.update!(name: "B") }
+          Employee.find_at_time(_01_01, built.id)
+        end
+      }
+
+      ["2020/03/01", Date.new(2020, 3, 1)].each do |valid_from|
+        it "reads #{valid_from.inspect} in Time.zone, as upstream's valid_at does" do
+          a = rows(employee).first
+
+          correct_at(corrected_at, employee, valid_from: valid_from, name: "X")
+
+          expect(rows(employee)).to match [a, [_03_01, infinity, "X", Integer]]
+        end
+      end
+    end
+
+    context "with a fraction of a microsecond for a datetime(6) column" do
+      # A time as Time.current can return it, and as the column stores it
+      let(:now) { "2020/03/01 09:30:00.123456789".in_time_zone }
+      let(:stored_now) { "2020/03/01 09:30:00.123456".in_time_zone }
+
+      # [Jan, now) A, [now, ∞) B: an upstream update! at now
+      let!(:employee) {
+        Timecop.freeze("2020/10/01") do
+          built = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(now) { built.update!(name: "B") }
+          Employee.find_at_time(_01_01, built.id)
+        end
+      }
+
+      it "corrects from a boundary an upstream update! left at the same time" do
+        a = rows(employee).first
+
+        correct_at(corrected_at, employee, valid_from: now, name: "X")
+
+        expect(rows(employee)).to match [a, [stored_now, infinity, "X", Integer]]
+      end
+
+      it "corrects up to that boundary and leaves the next segment's row alone" do
+        b = rows(employee).last
+
+        correct_at(corrected_at, employee, valid_from: _02_01, valid_to: now, name: "X")
+
+        expect(rows(employee)).to match [
+          [_01_01, _02_01, "A", Integer],
+          [_02_01, stored_now, "X", Integer],
+          b,
+        ]
+      end
+
+      it "accepts a span ending at the timeline's end" do
+        ended = Timecop.freeze("2020/10/01") { Employee.create!(name: "A", valid_from: _01_01, valid_to: now) }
+
+        correct_at(corrected_at, ended, valid_from: _02_01, valid_to: now, name: "X")
+
+        expect(rows(ended)).to match [
+          [_01_01, _02_01, "A", Integer],
+          [_02_01, stored_now, "X", Integer],
+        ]
+      end
+    end
+  end
 end
