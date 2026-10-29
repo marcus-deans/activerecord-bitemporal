@@ -398,6 +398,11 @@ module ActiveRecord
           # Insert new records
           new_records.each do |record|
             record.save_without_bitemporal_callbacks!(validate: false)
+            # save! raises when a callback throws :abort, but the transaction block Rails opens
+            # inside it joins the enclosing one and swallows an ActiveRecord::Rollback raised
+            # before the insert: it returns nil without inserting, and the rows closed above
+            # would stay closed
+            raise ActiveRecord::RecordNotSaved.new("Failed to save the record", record) unless record.persisted?
           end
 
           # Validate the new timeline (post-hoc)

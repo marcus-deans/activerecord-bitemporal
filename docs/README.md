@@ -447,6 +447,7 @@ The commit callbacks run once because upstream's `after_create` sets each insert
 - On an inserted row, `saved_change_to_<attribute>?` is true for every column that holds a value, not only for the attributes the operation changed, because the row is a fresh copy. A `correct` of `name` reports `salary` as changed too.
 - A call that writes nothing (it changes nothing, and finds no seam or zero-length row to fix) runs no callback, `after_commit` included.
 - An operation that only closes rows, such as a `terminate` at a segment's end or a `shift_genesis` forward to a segment's start, saves no row, so it runs no callback either, `after_commit` included.
+- A callback that aborts a row's save aborts the whole operation: it raises and writes nothing. `throw :abort`, or an `ActiveRecord::Rollback` raised before the row is inserted, raises `ActiveRecord::RecordNotSaved`; any other exception is raised as it is. An `ActiveRecord::Rollback` raised after the insert, in `after_create` or `after_save`, doesn't abort the save: Rails swallows it and keeps the row, so the operation goes on.
 
 ### Times You Pass
 

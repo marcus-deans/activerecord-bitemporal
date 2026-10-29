@@ -444,6 +444,7 @@ Every timeline operation (`correct`, `shift_genesis`, `terminate`, `reopen` and 
    - A row the result keeps stays.
    - A new piece with the range and business attributes of a current row is dropped, and that row stays, so an unchanged version isn't recorded again. A cancel keeps the rows of the segments the operation it undoes didn't change.
    - Every other row is closed and every other piece inserted, closing first. Rows are closed with `update_columns` and inserted with `save_without_bitemporal_callbacks!(validate: false)`: see [Validations and Callbacks During an Operation](./README.md#validations-and-callbacks-during-an-operation) for what runs.
+   - A piece left unsaved raises `RecordNotSaved`, which rolls back everything the operation wrote, the rows it closed included. `save!` raises that itself when a callback throws `:abort`, but returns `nil` when a callback raises `ActiveRecord::Rollback` before the insert: the transaction block Rails opens inside `save!` joins the enclosing one and swallows it, rolling nothing back.
 5. Nothing to close or insert: return `true` without validating or reloading `self`.
 
 So a call that changes nothing writes nothing, and a call on a timeline with a seam or a zero-length row merges or closes it, even when it otherwise changes nothing. The cancels' history walks also leave zero-length rows out of each snapshot, and skip a snapshot of nothing else: there's no timeline in it to restore.
