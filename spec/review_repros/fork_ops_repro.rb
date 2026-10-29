@@ -13,6 +13,9 @@ require 'spec_helper'
 # - F8, op times compared unlike the column stores them, e.g. a Date column outside UTC
 #   (the ops cast them on entry; "times the valid-time column stores differently" in
 #   cascade_correction_spec.rb, terminate_spec.rb and shift_genesis_spec.rb)
+# - cancel_shift_genesis after two shifts, whose second cancel brought back the shift the first
+#   undid (a cancel after two shifts now refuses; shift_genesis_spec.rb, "the timeline it
+#   restores")
 RSpec.describe "Fork review repros" do
   let(:jan) { "2020/01/01".in_time_zone }
   let(:feb) { "2020/02/01".in_time_zone }
@@ -49,23 +52,11 @@ RSpec.describe "Fork review repros" do
     end
   end
 
-  describe "cancel_shift_genesis after two shifts" do
+  describe "cancel_shift_genesis after an upstream update! before the genesis" do
     before do
       Timecop.freeze("2020/10/01") do
         ActiveRecord::Bitemporal.valid_at(jan) { @e = Employee.create!(name: "A") }
       end
-    end
-
-    it "second cancel re-applies the shift it just cancelled instead of reaching the original genesis" do
-      e = Employee.find(@e.id)
-      Timecop.freeze("2020/10/02") { e.shift_genesis(new_valid_from: mar) }
-      Timecop.freeze("2020/10/03") { e.shift_genesis(new_valid_from: may) }
-      Timecop.freeze("2020/10/04") { e.cancel_shift_genesis }
-      g1 = timeline(Employee, e.id).first.first
-      Timecop.freeze("2020/10/05") { e.cancel_shift_genesis }
-      g2 = timeline(Employee, e.id).first.first
-      puts "\n[cancel x2] after 1st cancel genesis=#{g1.to_date}, after 2nd cancel genesis=#{g2.to_date}, shifted_genesis?=#{e.shifted_genesis?}"
-      expect(g2).to eq(jan)
     end
 
     it "shifted_genesis? is true after a plain upstream update before genesis; cancel_shift_genesis reverts that update" do

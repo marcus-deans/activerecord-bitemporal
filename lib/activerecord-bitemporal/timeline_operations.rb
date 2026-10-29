@@ -297,7 +297,8 @@ module ActiveRecord
       end
 
       # Serializes writes to this entity's timeline until the surrounding transaction ends.
-      # PostgreSQL only.
+      # PostgreSQL only. An operation that raises rolls back to its own savepoint, which
+      # releases the locks taken here; those the transaction took earlier stay held.
       #
       # 1. A transaction-scoped advisory lock with this key:
       #      pg_advisory_xact_lock(hashtext(<table_name>), hashtext(<bitemporal_id as text>))

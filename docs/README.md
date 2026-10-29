@@ -353,13 +353,13 @@ employee.correct(valid_from: jan_1, salary: 55_000)
 The `correct` method validates inputs and raises errors for invalid operations:
 
 ```ruby
-# valid_from must be within the timeline
+# valid_from must fall in a segment of the timeline (not before it, after its end or in a gap)
 employee.correct(valid_from: Date.new(1900, 1, 1), name: "X")
-# => ArgumentError: valid_from must be within the record's valid period
+# => ActiveRecord::RecordNotFound: Couldn't find Employee with 'bitemporal_id'=1 at 1900-01-01 00:00:00 UTC
 
 # valid_to must be after valid_from
 employee.correct(valid_from: mar_1, valid_to: jan_1, name: "X")
-# => ArgumentError: valid_to must be after valid_from
+# => ArgumentError: valid_to (2024-01-01 00:00:00 UTC) must be greater than valid_from (2024-03-01 00:00:00 UTC)
 ```
 
 ### Transaction Safety
@@ -616,6 +616,21 @@ employee.shifted_genesis?
 ```
 
 This queries the full transaction history to find the original genesis — it's always accurate regardless of how many shifts have occurred.
+
+An upstream `update!` at a valid time before the genesis inserts a row there, so it moves the genesis too, and `shifted_genesis?` is true. It closes no row, though, so `cancel_shift_genesis` finds no timeline to go back to and raises `PreShiftGenesisStateNotFoundError`. Move the genesis back with `shift_genesis` instead:
+
+```ruby
+employee.valid_at(dec_1) { |e| e.update!(name: "X") }  # before the January 1 genesis
+employee.shifted_genesis?
+# => true
+
+employee.cancel_shift_genesis
+# => ActiveRecord::Bitemporal::PreShiftGenesisStateNotFoundError
+
+employee.shift_genesis(new_valid_from: jan_1)
+employee.shifted_genesis?
+# => false
+```
 
 ---
 
@@ -883,6 +898,8 @@ Employee.find_at_time(may_1, employee.id)
 
 `correct`, `shift_genesis`, `terminate`, `reopen`, `cancel_shift_genesis` and `cancel_termination` lock the entity's timeline before they read it, and hold the locks until the surrounding transaction ends. They need PostgreSQL: the locks use its advisory lock functions.
 
+An operation that raises inside that transaction rolls back to its own savepoint, which releases the locks it took. Locks taken earlier in the transaction, by you or by an operation that succeeded, stay held. To keep the entity locked across an error you rescue, take the advisory lock yourself first (see [Holding the Lock Yourself](#holding-the-lock-yourself)).
+
 Each operation takes, in this order:
 
 1. **An advisory lock on the entity**, with this key:
@@ -934,6 +951,10 @@ employee.terminate(termination_time: jun_1)
 ```
 
 The call succeeds once this host's clock has passed that row's time. Clock skew between hosts is otherwise out of scope, as it is for upstream's writes.
+
+### Frozen Clocks
+
+A clock frozen in tests (`freeze_time`, `Timecop.freeze`) gives every write the same transaction time. A row recorded and closed at one instant was never current knowledge, so writes made at one frozen instant leave a cancel nothing to restore: create a record and then terminate it under one `freeze_time`, and `cancel_termination` raises `ActiveRecord::Bitemporal::PreTerminationStateNotFoundError`. The same goes for a `shift_genesis` and `cancel_shift_genesis`, which raises `PreShiftGenesisStateNotFoundError`. Advance the clock between writes. Travelling it back to before a current row was recorded makes the next operation raise `TransactionTimeSkewError`, as on a host whose clock runs behind.
 
 ---
 
