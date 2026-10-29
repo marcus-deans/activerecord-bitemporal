@@ -270,7 +270,7 @@ When correcting with only some attributes, each corrected piece keeps the non-co
 
 ### Overview
 
-The `#terminate` method sets a finite end date on an entity's valid-time timeline. Unlike `destroy` (which closes `transaction_to` to say "we no longer know about this"), `terminate` modifies `valid_to` to say "this entity stopped being valid at this date." The `#cancel_termination` method fully reverses a termination by recovering the pre-termination state from transaction history.
+The `#terminate` method sets a finite end date on an entity's valid-time timeline. Unlike `destroy` (which closes `transaction_to` to say "we no longer know about this"), `terminate` modifies `valid_to` to say "this entity stopped being valid at this date." The `#cancel_termination` method reverses a termination by recovering the pre-termination state from transaction history, and refuses when anything was recorded for the entity after the termination.
 
 Both methods are whole-timeline operations — they fetch all current-knowledge segments for the entity and operate on them atomically, similar to `_correct_record` and `_shift_genesis_record`.
 
@@ -310,15 +310,23 @@ Both methods are whole-timeline operations — they fetch all current-knowledge 
    a. Collect all distinct transaction_to values as change points
    b. Walk backward through change points
    c. At each point, query the timeline that was current just before that change
-   d. Return the first timeline where the last segment's valid_to = ∞
-7. CLOSE all current segments (set transaction_to = now)
-8. RECREATE pre-termination segments as new records (dup + save)
+   d. Return the first timeline where the last segment's valid_to = ∞, with its
+      change point (when the termination took effect)
+   e. Raise PreTerminationStateNotFoundError if none has one
+7. GUARD: Raise RecordedSinceTerminationError if any row of the entity, whatever
+   its valid time, was inserted (transaction_from) or closed (transaction_to) after
+   that change point. The termination's own rows, coalescing's included, carry the
+   change point itself, so the bounds are strict.
+8. CLOSE all current segments (set transaction_to = now)
+9. RECREATE pre-termination segments as new records (dup + save)
    - Clear deleted_at to prevent transaction_to corruption during save
-9. COALESCE adjacent identical segments
-10. VALIDATE no overlapping valid times
-11. RELOAD self (see Self After an Operation)
-12. COMMIT TRANSACTION
+10. COALESCE adjacent identical segments
+11. VALIDATE no overlapping valid times
+12. RELOAD self (see Self After an Operation)
+13. COMMIT TRANSACTION
 ```
+
+`cancel_shift_genesis` follows the same steps, walking back to the first timeline whose genesis differs from the current one, and raises `RecordedSinceGenesisShiftError` in step 7. Both refusals happen before any write, so the transaction writes nothing and `self` is not reloaded. Each subclasses its cancel's not-found error, so a `rescue` of that error catches it.
 
 ### Key Implementation Detail: `deleted_at` Corruption
 
@@ -364,6 +372,16 @@ State after cancel:
                      |--------------|--------------|----------->
                      Jan           Mar            May            ∞
   (Full pre-termination timeline restored)
+```
+
+Restoring that timeline replaces the current one, so it would discard anything recorded after the termination. The cancel refuses instead:
+
+```
+t1: terminate(termination_time: Feb)    rows inserted/closed at t1
+t2: correct(valid_from: Jan, ...)       rows inserted/closed at t2 > t1
+
+cancel_termination → pre-termination timeline found at change point t1
+                   → rows written at t2 > t1 → RecordedSinceTerminationError
 ```
 
 ---

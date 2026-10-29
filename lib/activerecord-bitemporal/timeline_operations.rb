@@ -89,15 +89,19 @@ module ActiveRecord
       # through transaction history. Recovers ALL segments that were removed
       # during termination.
       #
-      # IMPORTANT: This is a full undo — it restores the state from BEFORE the
-      # termination, not just the current state with valid_to extended. Any
-      # operations performed after termination (corrections, etc.) are lost.
+      # IMPORTANT: This is an undo — it restores the timeline as it stood just
+      # before the termination, not the current timeline with valid_to extended.
+      # If anything was recorded for the entity after the termination (a correct,
+      # an update!, a re-terminate, ...), it refuses instead of discarding that:
+      # it raises RecordedSinceTerminationError and writes nothing.
       #
       # No-op if entity is not currently terminated.
       #
       # @raise [ActiveRecord::RecordNotFound] if no current-knowledge records exist
       # @raise [ActiveRecord::Bitemporal::PreTerminationStateNotFoundError] if
       #   transaction history cannot determine the pre-termination state
+      # @raise [ActiveRecord::Bitemporal::RecordedSinceTerminationError] if changes were
+      #   recorded after the termination (a PreTerminationStateNotFoundError)
       # @return [Boolean] true if successful
       def cancel_termination
         _cancel_termination_record
@@ -121,15 +125,19 @@ module ActiveRecord
       # Restores the complete pre-shift timeline by searching backward through
       # transaction history. Recovers ALL segments removed during a forward shift.
       #
-      # IMPORTANT: This is a full undo — it restores the state from BEFORE the
-      # most recent genesis change. Any operations performed after the shift
-      # (corrections, updates, etc.) are lost.
+      # IMPORTANT: This is an undo — it restores the timeline as it stood just
+      # before the most recent genesis change. If anything was recorded for the
+      # entity after that change (a correct, an update!, a terminate, ...), it
+      # refuses instead of discarding that: it raises RecordedSinceGenesisShiftError
+      # and writes nothing.
       #
       # No-op if the genesis has never been shifted (matches original creation).
       #
       # @raise [ActiveRecord::RecordNotFound] if no current-knowledge records exist
       # @raise [ActiveRecord::Bitemporal::PreShiftGenesisStateNotFoundError] if
       #   transaction history cannot determine the pre-shift state
+      # @raise [ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError] if changes were
+      #   recorded after the genesis change (a PreShiftGenesisStateNotFoundError)
       # @return [Boolean] true if successful
       def cancel_shift_genesis
         _cancel_shift_genesis_record
@@ -572,14 +580,21 @@ module ActiveRecord
           return true if segments.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
 
           # 4. Find pre-termination state via transaction history
-          pre_termination_state = find_pre_termination_state
+          pre_termination_state, terminated_at = find_pre_termination_state
           if pre_termination_state.nil?
             raise PreTerminationStateNotFoundError,
               "Cannot determine pre-termination state for #{self.class} " \
               "with bitemporal_id=#{bitemporal_id}"
           end
 
-          # 5. Close ALL current segments; recreate pre-termination segments with new transaction_from.
+          # 5. Guard: restoring that state would discard anything recorded after the termination
+          if recorded_since?(terminated_at)
+            raise RecordedSinceTerminationError,
+              "Changes were recorded for #{self.class} with bitemporal_id=#{bitemporal_id} " \
+              "after its termination; cancelling it would discard them"
+          end
+
+          # 6. Close ALL current segments; recreate pre-termination segments with new transaction_from.
           #    Must clear deleted_at because historical records have it set (by timeline_close or
           #    upstream's update_transaction_to), and bitemporal_assign_initialize_value would use it
           #    to overwrite transaction_to during save.
@@ -623,6 +638,8 @@ module ActiveRecord
         [records_to_close, new_records]
       end
 
+      # The most recent snapshot with an infinite end, and the change point it ended at:
+      # [segments, change_point], or nil when no snapshot has one.
       def find_pre_termination_state
         change_points = self.class
           .where(bitemporal_id: bitemporal_id)
@@ -647,10 +664,30 @@ module ActiveRecord
             }
 
           next if state.empty?
-          return state if state.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+          return [state, cp] if state.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
         end
 
         nil
+      end
+
+      # Whether anything was recorded for this entity after change_point, the moment the
+      # operation a cancel undoes took effect: a row inserted after it, or a row closed after
+      # it (some writes only close rows, such as a terminate at a segment boundary). Rows that
+      # operation wrote, coalescing included, carry change_point itself, so the bounds are
+      # strict. Any row of the family counts, whatever its valid time.
+      def recorded_since?(change_point)
+        transaction_from = self.class.arel_table[:transaction_from]
+        transaction_to = self.class.arel_table[:transaction_to]
+        self.class
+          .where(bitemporal_id: bitemporal_id)
+          .ignore_valid_datetime
+          .within_deleted
+          .where(
+            transaction_from.gt(change_point).or(
+              transaction_to.gt(change_point).and(transaction_to.not_eq(ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO))
+            )
+          )
+          .exists?
       end
 
       # Cancel Shift Genesis: Main implementation
@@ -658,7 +695,8 @@ module ActiveRecord
       # Algorithm mirrors _cancel_termination_record (perform_timeline_operation does
       # the lock, close, insert, coalesce, validate and reloading self):
       # 1. Fetch segments → 2. Guard existence → 3. No-op if genesis matches original →
-      # 4. Find pre-shift state → 5. Close current, recreate pre-shift
+      # 4. Find pre-shift state → 5. Refuse if anything was recorded since →
+      # 6. Close current, recreate pre-shift
       def _cancel_shift_genesis_record
         perform_timeline_operation do |current_time|
           # 1. Fetch all current-knowledge segments
@@ -679,14 +717,21 @@ module ActiveRecord
           return true if current_genesis == original_genesis
 
           # 4. Find pre-shift state via transaction history
-          pre_shift_state = find_pre_shift_genesis_state(current_genesis)
+          pre_shift_state, shifted_at = find_pre_shift_genesis_state(current_genesis)
           if pre_shift_state.nil?
             raise PreShiftGenesisStateNotFoundError,
               "Cannot determine pre-shift genesis state for #{self.class} " \
               "with bitemporal_id=#{bitemporal_id}"
           end
 
-          # 5. Close ALL current segments; recreate pre-shift segments with new transaction_from.
+          # 5. Guard: restoring that state would discard anything recorded after the shift
+          if recorded_since?(shifted_at)
+            raise RecordedSinceGenesisShiftError,
+              "Changes were recorded for #{self.class} with bitemporal_id=#{bitemporal_id} " \
+              "after its genesis shift; cancelling it would discard them"
+          end
+
+          # 6. Close ALL current segments; recreate pre-shift segments with new transaction_from.
           #    Must clear deleted_at because historical records have it set (by timeline_close or
           #    upstream's update_transaction_to), and bitemporal_assign_initialize_value would use it
           #    to overwrite transaction_to during save.
@@ -746,8 +791,9 @@ module ActiveRecord
       #   └─────────────────────────────────────────────────────┘
       #
       # @param current_genesis [Time] the current first segment's valid_from
-      # @return [Array<ActiveRecord::Base>, nil] the pre-shift segment records,
-      #   or nil if no prior state with a different genesis can be found
+      # @return [Array(Array<ActiveRecord::Base>, Time), nil] the pre-shift segment records
+      #   and the change point they ended at (t2 above), or nil if no prior state with a
+      #   different genesis can be found
       def find_pre_shift_genesis_state(current_genesis)
         change_points = self.class
           .where(bitemporal_id: bitemporal_id)
@@ -772,7 +818,7 @@ module ActiveRecord
             }
 
           next if state.empty?
-          return state if state.first[valid_from_key] != current_genesis
+          return [state, cp] if state.first[valid_from_key] != current_genesis
         end
 
         nil

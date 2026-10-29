@@ -14,6 +14,12 @@ module ActiveRecord
     class PreTerminationStateNotFoundError < BitemporalError; end
 
     class PreShiftGenesisStateNotFoundError < BitemporalError; end
+
+    # A cancel refuses when changes were recorded after the operation it undoes. These
+    # subclass the not-found errors, so a rescue of those catches the refusal too.
+    class RecordedSinceTerminationError < PreTerminationStateNotFoundError; end
+
+    class RecordedSinceGenesisShiftError < PreShiftGenesisStateNotFoundError; end
   end
 end
 
