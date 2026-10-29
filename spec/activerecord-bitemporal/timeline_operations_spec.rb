@@ -492,6 +492,742 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
     end
   end
 
+  # Every operation leaves the current timeline with no seam (two adjacent segments with
+  # equal business attributes, as an upstream update! that sets the next segment's values
+  # leaves) and no zero-length row (as an upstream destroy at a segment's exact start leaves),
+  # however it found it. Rows whose range and values don't change keep their rows, and a call
+  # that changes nothing writes nothing.
+  describe "a timeline with a seam or a zero-length row" do
+    let(:_01_01) { "2020/01/01".in_time_zone }
+    let(:_02_01) { "2020/02/01".in_time_zone }
+    let(:_03_01) { "2020/03/01".in_time_zone }
+    let(:_04_01) { "2020/04/01".in_time_zone }
+    let(:_05_01) { "2020/05/01".in_time_zone }
+    let(:_07_01) { "2020/07/01".in_time_zone }
+    let(:_08_01) { "2020/08/01".in_time_zone }
+    let(:infinity) { ActiveRecord::Bitemporal::DEFAULT_VALID_TO }
+    let(:operated_at) { "2020/10/05".in_time_zone }
+
+    let(:employee) { Employee.find_at_time(_02_01, employee_id) }
+
+    # The current rows before the operation (after any setup it builds on)
+    let!(:rows_before) { rows(employee) }
+
+    #   A |Feb, Mar)  B |Mar, Jul)  C |Jul, ∞)   recorded on 2020-10-01
+    def create_employee
+      Timecop.freeze("2020/10/01") {
+        id = ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.create!(name: "A", emp_code: "E1") }.id
+        ActiveRecord::Bitemporal.valid_at(_03_01) { Employee.find(id).update!(name: "B") }
+        ActiveRecord::Bitemporal.valid_at(_07_01) { Employee.find(id).update!(name: "C") }
+        id
+      }
+    end
+
+    # A current row Q |at, at), recorded on 2020-10-02
+    def insert_zero_length_row(employee_id, at)
+      Timecop.freeze("2020/10/02") {
+        Employee.unscoped.insert_all!([{
+          bitemporal_id: employee_id, name: "Q", emp_code: "E1", valid_from: at, valid_to: at,
+          transaction_from: Time.current, transaction_to: tt_infinity, created_at: Time.current, updated_at: Time.current,
+        }])
+      }
+    end
+
+    # The id of the current row over [from, to) before the operation
+    def row_id(from, to)
+      rows_before.find { |row_from, row_to, *| row_from == from && row_to == to }.last
+    end
+
+    def an_inserted_row
+      satisfy("be the id of a row the operation inserted") { |id| rows_before.none? { |*, row_id| row_id == id } }
+    end
+
+    def history
+      all_rows(Employee, employee_id).order(:id).pluck(*Employee.column_names)
+    end
+
+    shared_context "a normalized timeline" do
+      let!(:employee_id) { create_employee }
+    end
+
+    # An upstream update! that sets the values the next segment already has leaves a seam:
+    #   A |Feb, Mar)  B |Mar, May)  B |May, Jul)  C |Jul, ∞)
+    shared_context "a seam" do
+      let!(:employee_id) {
+        id = Timecop.freeze("2020/10/01") {
+          employee = ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.create!(name: "A", emp_code: "E1") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { Employee.find(employee.id).update!(name: "B") }
+          ActiveRecord::Bitemporal.valid_at(_07_01) { Employee.find(employee.id).update!(name: "C") }
+          employee.id
+        }
+        Timecop.freeze("2020/10/02") {
+          ActiveRecord::Bitemporal.valid_at(_03_01) { Employee.find(id).update!(name: "B") }
+        }
+        id
+      }
+    end
+
+    # A current row of zero length, as an upstream destroy at a segment's exact start leaves:
+    #   A |Feb, Mar)  B |Mar, Jul)  Q |Jul, Jul)  C |Jul, ∞)
+    shared_context "a zero-length row" do
+      let!(:employee_id) { create_employee.tap { |id| insert_zero_length_row(id, _07_01) } }
+      let(:zero_length_closed_at) { operated_at }
+    end
+
+    shared_examples "writing no row it closes again" do
+      it "writes no row it closes again" do
+        subject
+
+        expect(all_rows(Employee, employee_id).where(transaction_from: operated_at, transaction_to: operated_at)).to be_empty
+      end
+    end
+
+    shared_examples "closing the zero-length row" do
+      it "closes the zero-length row and writes none" do
+        subject
+
+        expect(all_rows(Employee, employee_id).where("valid_from = valid_to").pluck(:name, :transaction_to)).to eq [
+          ["Q", zero_length_closed_at],
+        ]
+      end
+    end
+
+    shared_examples "a call that changes nothing" do
+      it "writes nothing and leaves self alone, unsaved changes included" do
+        employee.emp_code = "PENDING"
+        history_before = history
+        attributes = employee.attributes
+        swapped_id = employee.swapped_id
+
+        expect(subject).to be true
+        expect(history).to eq history_before
+        expect(employee.attributes).to eq attributes
+        expect(employee.swapped_id).to eq swapped_id
+        expect(employee.changes).to eq("emp_code" => ["E1", "PENDING"])
+      end
+    end
+
+    describe "#correct" do
+      subject(:correct) { Timecop.freeze(operated_at) { employee.correct(**correction) } }
+
+      let(:correction) { { valid_from: _02_01, valid_to: _03_01, name: "X" } }
+
+      context "with a seam" do
+        include_context "a seam"
+
+        it "merges it while correcting another part of the timeline" do
+          correct
+
+          expect(rows(employee)).to match [
+            [_02_01, _03_01, "X", an_inserted_row],
+            [_03_01, _07_01, "B", an_inserted_row],
+            [_07_01, infinity, "C", row_id(_07_01, infinity)],
+          ]
+        end
+
+        it_behaves_like "writing no row it closes again"
+
+        context "when the correction changes nothing" do
+          let(:correction) { { valid_from: _02_01, name: "A" } }
+
+          it "merges it" do
+            expect(correct).to be true
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", an_inserted_row],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "writing no row it closes again"
+        end
+      end
+
+      context "with a zero-length row" do
+        include_context "a zero-length row"
+
+        it "corrects the timeline and keeps the rows it doesn't change" do
+          correct
+
+          expect(rows(employee)).to match [
+            [_02_01, _03_01, "X", an_inserted_row],
+            [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+            [_07_01, infinity, "C", row_id(_07_01, infinity)],
+          ]
+        end
+
+        it_behaves_like "closing the zero-length row"
+        it_behaves_like "writing no row it closes again"
+
+        # A patch of the zero-length row would be a zero-length piece
+        context "when the correction spans it" do
+          let(:correction) { { valid_from: _05_01, valid_to: _08_01, emp_code: "E2" } }
+
+          it "patches the segments on either side" do
+            correct
+
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _05_01, "B", an_inserted_row],
+              [_05_01, _07_01, "B", an_inserted_row],
+              [_07_01, _08_01, "C", an_inserted_row],
+              [_08_01, infinity, "C", an_inserted_row],
+            ]
+            expect(all_rows(Employee, employee_id).where(transaction_to: tt_infinity).order(:valid_from).pluck(:emp_code)).to eq %w[
+              E1 E1 E2 E2 E1
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+        end
+
+        context "when the correction changes nothing" do
+          let(:correction) { { valid_from: _02_01, name: "A" } }
+
+          it "keeps every other row" do
+            expect(correct).to be true
+            expect(rows(employee)).to eq [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+        end
+      end
+
+      context "with neither" do
+        include_context "a normalized timeline"
+
+        context "when the correction changes nothing" do
+          let(:correction) { { valid_from: _02_01, name: "A" } }
+
+          it_behaves_like "a call that changes nothing"
+        end
+      end
+    end
+
+    describe "#terminate" do
+      subject(:terminate) { Timecop.freeze(operated_at) { employee.terminate(termination_time: termination_time) } }
+
+      let(:termination_time) { _08_01 }
+
+      context "with a seam" do
+        include_context "a seam"
+
+        it "merges it while ending the timeline" do
+          terminate
+
+          expect(rows(employee)).to match [
+            [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+            [_03_01, _07_01, "B", an_inserted_row],
+            [_07_01, _08_01, "C", an_inserted_row],
+          ]
+        end
+
+        it_behaves_like "writing no row it closes again"
+
+        context "when it terminates at the current end" do
+          let(:termination_time) { infinity }
+
+          it "merges it" do
+            expect(terminate).to be true
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", an_inserted_row],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "writing no row it closes again"
+        end
+      end
+
+      context "with a zero-length row" do
+        include_context "a zero-length row"
+
+        it "ends the timeline and keeps the rows it doesn't change" do
+          terminate
+
+          expect(rows(employee)).to match [
+            [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+            [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+            [_07_01, _08_01, "C", an_inserted_row],
+          ]
+        end
+
+        it_behaves_like "closing the zero-length row"
+        it_behaves_like "writing no row it closes again"
+
+        context "when it terminates at the current end" do
+          let(:termination_time) { infinity }
+
+          it "keeps every other row" do
+            expect(terminate).to be true
+            expect(rows(employee)).to eq [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+        end
+      end
+
+      context "with neither" do
+        include_context "a normalized timeline"
+
+        context "when it terminates at the current end" do
+          let(:termination_time) { infinity }
+
+          it_behaves_like "a call that changes nothing"
+        end
+      end
+    end
+
+    describe "#shift_genesis" do
+      subject(:shift_genesis) { Timecop.freeze(operated_at) { employee.shift_genesis(new_valid_from: new_valid_from) } }
+
+      context "with a seam" do
+        include_context "a seam"
+
+        context "when it shifts backward" do
+          let(:new_valid_from) { _01_01 }
+
+          it "merges it while extending the first segment" do
+            shift_genesis
+
+            expect(rows(employee)).to match [
+              [_01_01, _03_01, "A", an_inserted_row],
+              [_03_01, _07_01, "B", an_inserted_row],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "writing no row it closes again"
+        end
+
+        context "when it shifts forward into it" do
+          let(:new_valid_from) { _04_01 }
+
+          it "merges the trimmed segment with the one after it" do
+            shift_genesis
+
+            expect(rows(employee)).to match [
+              [_04_01, _07_01, "B", an_inserted_row],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "writing no row it closes again"
+        end
+
+        context "when it shifts to the current genesis" do
+          let(:new_valid_from) { _02_01 }
+
+          it "merges it" do
+            expect(shift_genesis).to be true
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", an_inserted_row],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "writing no row it closes again"
+        end
+      end
+
+      context "with a zero-length row" do
+        include_context "a zero-length row"
+
+        context "when it shifts backward" do
+          let(:new_valid_from) { _01_01 }
+
+          it "extends the first segment and keeps the rows it doesn't change" do
+            shift_genesis
+
+            expect(rows(employee)).to match [
+              [_01_01, _03_01, "A", an_inserted_row],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+          it_behaves_like "writing no row it closes again"
+        end
+
+        context "when it shifts forward" do
+          let(:new_valid_from) { _04_01 }
+
+          it "trims the timeline and keeps the rows it doesn't change" do
+            shift_genesis
+
+            expect(rows(employee)).to match [
+              [_04_01, _07_01, "B", an_inserted_row],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+          it_behaves_like "writing no row it closes again"
+        end
+
+        context "when it shifts to the current genesis" do
+          let(:new_valid_from) { _02_01 }
+
+          it "keeps every other row" do
+            expect(shift_genesis).to be true
+            expect(rows(employee)).to eq [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+        end
+
+        #   Q |Feb, Feb)  A |Feb, Mar)  B |Mar, Jul)  C |Jul, ∞)
+        context "when it sits at the genesis" do
+          let!(:employee_id) { create_employee.tap { |id| insert_zero_length_row(id, _02_01) } }
+          let(:new_valid_from) { _01_01 }
+
+          it "extends the first segment that holds a time" do
+            shift_genesis
+
+            expect(rows(employee)).to match [
+              [_01_01, _03_01, "A", an_inserted_row],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+        end
+      end
+
+      context "with neither" do
+        include_context "a normalized timeline"
+
+        context "when it shifts to the current genesis" do
+          let(:new_valid_from) { _02_01 }
+
+          it_behaves_like "a call that changes nothing"
+        end
+      end
+    end
+
+    describe "#cancel_termination" do
+      subject(:cancel_termination) { Timecop.freeze(operated_at) { employee.cancel_termination } }
+
+      # Self, terminated at Aug on 2020-10-03
+      shared_context "terminated" do
+        let(:employee) { super().tap { |e| Timecop.freeze("2020/10/03") { e.terminate(termination_time: _08_01) } } }
+      end
+
+      context "with a seam" do
+        include_context "a seam"
+
+        context "when the termination merged it" do
+          include_context "terminated"
+
+          it "restores the timeline with it merged, keeping the merged row" do
+            cancel_termination
+
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", an_inserted_row],
+            ]
+          end
+
+          it_behaves_like "writing no row it closes again"
+        end
+
+        context "when it isn't terminated" do
+          it "merges it" do
+            expect(cancel_termination).to be true
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", an_inserted_row],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "writing no row it closes again"
+        end
+      end
+
+      context "with a zero-length row" do
+        include_context "a zero-length row"
+
+        context "when the termination closed it" do
+          include_context "terminated"
+          let(:zero_length_closed_at) { "2020/10/03".in_time_zone }
+
+          it "restores the timeline without it, keeping the rows it doesn't change" do
+            cancel_termination
+
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", an_inserted_row],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+          it_behaves_like "writing no row it closes again"
+        end
+
+        context "when it isn't terminated" do
+          it "keeps every other row" do
+            expect(cancel_termination).to be true
+            expect(rows(employee)).to eq [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+        end
+      end
+
+      context "with neither" do
+        include_context "a normalized timeline"
+
+        context "when it's terminated" do
+          include_context "terminated"
+
+          it "rewrites only the segment the termination cut" do
+            cancel_termination
+
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", an_inserted_row],
+            ]
+            expect(all_rows(Employee, employee_id).where(transaction_to: operated_at).pluck(:valid_from, :valid_to, :name)).to eq [
+              [_07_01, _08_01, "C"],
+            ]
+            expect(all_rows(Employee, employee_id).where(transaction_from: operated_at).pluck(:valid_from, :valid_to, :name)).to eq [
+              [_07_01, infinity, "C"],
+            ]
+          end
+        end
+
+        context "when it isn't terminated" do
+          it_behaves_like "a call that changes nothing"
+        end
+      end
+    end
+
+    describe "#cancel_shift_genesis" do
+      subject(:cancel_shift_genesis) { Timecop.freeze(operated_at) { employee.cancel_shift_genesis } }
+
+      # Self, its genesis shifted to shifted_to on 2020-10-03
+      shared_context "shifted" do
+        let(:employee) { super().tap { |e| Timecop.freeze("2020/10/03") { e.shift_genesis(new_valid_from: shifted_to) } } }
+      end
+
+      context "with a seam" do
+        include_context "a seam"
+
+        context "when the shift merged it" do
+          include_context "shifted"
+          let(:shifted_to) { _04_01 }
+
+          it "restores the timeline with it merged" do
+            cancel_shift_genesis
+
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", an_inserted_row],
+              [_03_01, _07_01, "B", an_inserted_row],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "writing no row it closes again"
+        end
+
+        context "when its genesis was never shifted" do
+          it "merges it" do
+            expect(cancel_shift_genesis).to be true
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", an_inserted_row],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "writing no row it closes again"
+        end
+      end
+
+      context "with a zero-length row" do
+        include_context "a zero-length row"
+
+        context "when the shift closed it" do
+          include_context "shifted"
+          let(:shifted_to) { _04_01 }
+          let(:zero_length_closed_at) { "2020/10/03".in_time_zone }
+
+          it "restores the timeline without it, keeping the rows it doesn't change" do
+            cancel_shift_genesis
+
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", an_inserted_row],
+              [_03_01, _07_01, "B", an_inserted_row],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+          it_behaves_like "writing no row it closes again"
+        end
+
+        context "when its genesis was never shifted" do
+          it "keeps every other row" do
+            expect(cancel_shift_genesis).to be true
+            expect(rows(employee)).to eq [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+        end
+      end
+
+      context "with neither" do
+        include_context "a normalized timeline"
+
+        context "when its genesis was shifted" do
+          include_context "shifted"
+          let(:shifted_to) { _01_01 }
+
+          it "rewrites only the segment the shift extended" do
+            cancel_shift_genesis
+
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", an_inserted_row],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+            expect(all_rows(Employee, employee_id).where(transaction_to: operated_at).pluck(:valid_from, :valid_to, :name)).to eq [
+              [_01_01, _03_01, "A"],
+            ]
+            expect(all_rows(Employee, employee_id).where(transaction_from: operated_at).pluck(:valid_from, :valid_to, :name)).to eq [
+              [_02_01, _03_01, "A"],
+            ]
+          end
+        end
+
+        context "when its genesis was never shifted" do
+          it_behaves_like "a call that changes nothing"
+        end
+      end
+
+      # A genesis shift recorded over a timeline of zero-length rows alone, as an operation could
+      # record one before every operation closed such rows. It can't be built through them now:
+      #   2020-10-01  A |May, ∞)
+      #   2020-10-02  A |May, May)   an upstream destroy at the genesis
+      #   2020-10-03  A |Jan, May)   the genesis shifted to Jan
+      # The snapshot the shift ended holds no time, so there's no timeline in it to restore.
+      # The one before it ended with the destroy, and the shift was recorded after that.
+      context "when the shift was recorded over zero-length rows alone" do
+        let!(:employee_id) {
+          id = Timecop.freeze("2020/10/01") {
+            ActiveRecord::Bitemporal.valid_at(_05_01) { Employee.create!(name: "A", emp_code: "E1") }.id
+          }
+          Timecop.freeze("2020/10/02") { ActiveRecord::Bitemporal.valid_at(_05_01) { Employee.find(id).destroy } }
+          Timecop.freeze("2020/10/03") {
+            Employee.unscoped.where(bitemporal_id: id, transaction_to: tt_infinity)
+              .update_all(transaction_to: Time.current, deleted_at: Time.current)
+            Employee.unscoped.insert_all!([{
+              bitemporal_id: id, name: "A", emp_code: "E1", valid_from: _01_01, valid_to: _05_01,
+              transaction_from: Time.current, transaction_to: tt_infinity, created_at: Time.current, updated_at: Time.current,
+            }])
+          }
+          id
+        }
+
+        it "refuses and writes nothing" do
+          history_before = history
+
+          expect { cancel_shift_genesis }.to raise_error(ActiveRecord::Bitemporal::PreShiftGenesisStateNotFoundError)
+          expect(history).to eq history_before
+        end
+      end
+    end
+
+    # The predicates read the timeline the operations act on, so they look past zero-length rows too
+    describe "#shifted_genesis?" do
+      context "with a zero-length row before the genesis" do
+        #   Q |Jan, Jan)  A |Feb, Mar)  B |Mar, Jul)  C |Jul, ∞)
+        let!(:employee_id) { create_employee.tap { |id| insert_zero_length_row(id, _01_01) } }
+
+        it "reads the genesis from the first segment that holds a time" do
+          expect(employee.shifted_genesis?).to be false
+        end
+      end
+
+      # An upstream destroy at the genesis leaves A |Feb, Feb) in front of B
+      context "with a zero-length row at the original genesis" do
+        #   A |Feb, Feb)  B |Mar, Jul)  C |Jul, ∞)
+        let!(:employee_id) {
+          create_employee.tap { |id|
+            Timecop.freeze("2020/10/02") { ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.find(id).destroy } }
+          }
+        }
+        let(:employee) { Employee.find_at_time(_03_01, employee_id) }
+
+        it "reads the genesis from the first segment that holds a time" do
+          expect(employee.shifted_genesis?).to be true
+        end
+      end
+    end
+
+    # An upstream destroy at the genesis leaves only A |Feb, Feb): no segment holds a time
+    context "when every current row is zero-length" do
+      # Self, loaded before the destroy
+      let!(:employee) {
+        id = Timecop.freeze("2020/10/01") {
+          ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.create!(name: "A", emp_code: "E1") }.id
+        }
+        Employee.find_at_time(_02_01, id).tap {
+          Timecop.freeze("2020/10/02") { ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.find(id).destroy } }
+        }
+      }
+      let(:employee_id) { employee.id }
+
+      {
+        "correct" => ->(e) { e.correct(valid_from: "2020/02/01".in_time_zone, name: "X") },
+        "shift_genesis" => ->(e) { e.shift_genesis(new_valid_from: "2020/01/01".in_time_zone) },
+        "cancel_shift_genesis" => :cancel_shift_genesis.to_proc,
+        "terminate" => ->(e) { e.terminate(termination_time: "2020/03/01".in_time_zone) },
+        "cancel_termination" => :cancel_termination.to_proc,
+      }.each do |name, operation|
+        it "#{name} finds no version and writes nothing" do
+          history_before = history
+
+          expect { Timecop.freeze(operated_at) { operation.call(employee) } }.to raise_error(ActiveRecord::RecordNotFound)
+          expect(history).to eq history_before
+        end
+      end
+
+      it "reads as neither terminated nor shifted" do
+        expect(employee.terminated?).to be false
+        expect(employee.shifted_genesis?).to be false
+      end
+    end
+  end
+
   # A date column stores a day, and datetime(6) a time to the microsecond. Each operation takes
   # its times as the column stores them, the way upstream's valid_at reads a time, so it
   # compares them with the stored boundaries it would write.

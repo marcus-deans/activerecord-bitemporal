@@ -747,9 +747,9 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
 
       # An upstream update! that sets the values the next segment already has leaves a seam:
       #   A |Jan, Mar)  B |Mar, May)  B |May, ∞)
-      # Terminating at Jul cuts B |May, ∞) to B |May, Jul), and coalescing merges that with
-      # B |Mar, May), so the termination writes more rows at its own transaction time.
-      context "when the termination's coalescing wrote rows" do
+      # Terminating at Jul cuts B |May, ∞) to B |May, Jul) and merges that with B |Mar, May),
+      # so the termination closes both B rows and inserts B |Mar, Jul) at its own transaction time.
+      context "when the termination merged a seam" do
         let!(:employee_id) {
           id = Timecop.freeze("2020/10/01") {
             employee = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
@@ -763,15 +763,17 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           id
         }
 
-        it "doesn't count them as recorded after it" do
-          # The cut row, closed again by coalescing, and the merged row
-          expect(all_records(employee).where(transaction_from: terminated_at).pluck(:valid_from, :valid_to, :transaction_to)).to contain_exactly(
-            [_05_01, _07_01, terminated_at],
-            [_03_01, _07_01, tt_infinity],
+        it "doesn't count the rows it wrote as recorded after it" do
+          expect(all_records(employee).where(transaction_to: terminated_at).pluck(:valid_from, :valid_to)).to contain_exactly(
+            [_03_01, _05_01],
+            [_05_01, infinity],
           )
+          expect(all_records(employee).where(transaction_from: terminated_at).pluck(:valid_from, :valid_to, :transaction_to)).to eq [
+            [_03_01, _07_01, tt_infinity],
+          ]
 
           expect(cancel).to be true
-          # The restored seam is merged again by the cancel's own coalescing (under review)
+          # The cancel restores the seam merged, as every operation leaves a timeline
           expect(current_timeline(employee)).to eq [
             [_01_01, _03_01, "A"],
             [_03_01, infinity, "B"],
@@ -1173,13 +1175,17 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
   end
 
   # ==========================================================================
-  # Category 10: Coalescing
+  # Category 10: Equal Segments
   # ==========================================================================
+  #
+  # A termination never leaves two adjacent equal segments (a seam) or a zero-length
+  # row, nor does the cancel that restores the timeline: see "a timeline with a seam
+  # or a zero-length row" in timeline_operations_spec.rb.
 
-  describe "coalescing" do
+  describe "equal segments" do
 
     # Test 10.1: Termination at boundary removes differentiating segment
-    context "termination causes adjacent identical segments to merge" do
+    context "termination removes the segment between two equal ones" do
       before do
         Timecop.freeze("2020/10/01") do
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
@@ -1206,8 +1212,8 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
       end
     end
 
-    # Test 10.2: Cancel termination triggers coalesce
-    context "cancel termination restores and coalesces" do
+    # Test 10.2: Cancel termination restores the single segment
+    context "cancel termination of a single segment" do
       before do
         Timecop.freeze("2020/10/01") do
           ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
@@ -1217,7 +1223,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
         end
       end
 
-      it "restored timeline is valid after cancel" do
+      it "restores the one segment to infinity" do
         employee = find_ignoring_valid_time(@employee)
 
         Timecop.freeze("2020/10/06") do
@@ -1225,8 +1231,10 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
         end
 
         timeline = current_timeline(employee)
+        expect(timeline).to eq([
+          [_01_01, infinity, "A"]
+        ])
         expect(valid_timeline?(timeline)).to be true
-        expect(timeline.last[1]).to eq(infinity)
       end
     end
   end

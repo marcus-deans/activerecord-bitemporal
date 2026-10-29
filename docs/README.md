@@ -292,7 +292,7 @@ employee.correct(valid_from: feb_1, valid_to: apr_1, name: "X")
 3. Record B is trimmed to start at Apr 1 (was Mar, now Apr)
 4. Record C is **preserved unchanged** (CASCADE)
 
-Only the attributes you pass change. Each segment in the span keeps its own values for the rest, so a change of another attribute inside the span stays where it was (a patch, like SQL:2011's `UPDATE ... FOR PORTION OF`). A gap inside the span stays a gap. A segment that already has the given values isn't rewritten. Adjacent segments with equal values are merged anywhere in the timeline, so a correction that changes nothing writes only to merge such a seam (an upstream `update!` can leave one). Passing a bitemporal column (`bitemporal_id`, `transaction_from`, ...), or an alias of one, raises `ArgumentError`.
+Only the attributes you pass change. Each segment in the span keeps its own values for the rest, so a change of another attribute inside the span stays where it was (a patch, like SQL:2011's `UPDATE ... FOR PORTION OF`). A gap inside the span stays a gap. A segment that already has the given values isn't rewritten. Like every operation, a correction merges adjacent segments with equal values and closes zero-length rows anywhere in the timeline (see [The Timeline After an Operation](#the-timeline-after-an-operation)), so one that changes nothing writes only to do that. Passing a bitemporal column (`bitemporal_id`, `transaction_from`, ...), or an alias of one, raises `ArgumentError`.
 
 ### Unbounded Correction (without `valid_to`)
 
@@ -372,6 +372,12 @@ rescue ActiveRecord::RecordInvalid
   # Database is unchanged - no partial corrections
 end
 ```
+
+### The Timeline After an Operation
+
+`correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` each leave the entity's current timeline with no seam (two adjacent segments with the same values) and no zero-length row (`valid_from` equal to `valid_to`), whatever they found there. An `update!` that sets the values the next segment already has leaves a seam, and a `destroy` at a segment's exact start leaves a zero-length row. The operation merges or closes them anywhere in the timeline, so on such a timeline it writes to do that even when it otherwise changes nothing: shifting to the current genesis, terminating at the current end, or a cancel with nothing to cancel.
+
+Segments whose range and values don't change keep their rows, so a cancel rewrites only the segments the operation it undoes changed. A zero-length row holds no version, so the operations look past it, and so do `terminated?` and `shifted_genesis?`: an entity whose only current rows are zero-length raises `ActiveRecord::RecordNotFound`, and reads as neither terminated nor shifted.
 
 ### The Record After an Operation
 
@@ -469,7 +475,8 @@ employee.correct(valid_from: jan_1, valid_to: feb_1, role: "Intern")
 ### Error Handling
 
 ```ruby
-# Shifting to the same date is a no-op (returns true, no DB changes)
+# Shifting to the same date is a no-op (returns true, writing only to merge seams
+# or close zero-length rows left in the timeline)
 employee.shift_genesis(new_valid_from: current_genesis_date)
 
 # Cannot erase the entire timeline
@@ -523,7 +530,7 @@ employee.cancel_shift_genesis
 #    (the correction would be discarded; nothing is written)
 ```
 
-Cancel is a no-op if the entity's genesis has never been shifted (returns `true`, no DB changes).
+Cancel is a no-op if the entity's genesis has never been shifted (returns `true`, writing only to merge seams or close zero-length rows left in the timeline, see [The Timeline After an Operation](#the-timeline-after-an-operation)).
 
 ### Checking Genesis Shift Status
 
@@ -630,7 +637,7 @@ employee.cancel_termination
 #    (the correction would be discarded; nothing is written)
 ```
 
-Cancel is a no-op if the entity is not currently terminated (returns `true`, no DB changes).
+Cancel is a no-op if the entity is not currently terminated (returns `true`, writing only to merge seams or close zero-length rows left in the timeline, see [The Timeline After an Operation](#the-timeline-after-an-operation)).
 
 ### Checking Termination Status
 

@@ -10,12 +10,13 @@ This document covers the internal architecture and implementation details of the
 4. [Correction Mechanism](#correction-mechanism)
 5. [Termination Mechanism](#termination-mechanism)
 6. [Time Arguments](#time-arguments)
-7. [Self After an Operation](#self-after-an-operation)
-8. [Uniqueness Validation](#uniqueness-validation)
-9. [ID Swapping Mechanism](#id-swapping-mechanism)
-10. [Query Scoping](#query-scoping)
-11. [Performance Considerations](#performance-considerations)
-12. [Limitations](#limitations)
+7. [Timeline After an Operation](#timeline-after-an-operation)
+8. [Self After an Operation](#self-after-an-operation)
+9. [Uniqueness Validation](#uniqueness-validation)
+10. [ID Swapping Mechanism](#id-swapping-mechanism)
+11. [Query Scoping](#query-scoping)
+12. [Performance Considerations](#performance-considerations)
+13. [Limitations](#limitations)
 
 ---
 
@@ -41,6 +42,7 @@ ActiveRecord::Bitemporal
 | `_update_row` | Line 349 | Regular update persistence |
 | `bitemporal_build_update_records` | Line 641 | Builds before/after for updates |
 | `build_correction_records` | `timeline_operations.rb` | Builds the patched timeline for corrections |
+| `perform_timeline_operation` | `timeline_operations.rb` | Shared skeleton of the timeline operations: lock, fetch, normalize, write the difference, reload self |
 | `scope_relation` | Line 724 | Uniqueness validation scoping |
 | `terminate` | Line ~332 | Public API for timeline termination |
 | `_terminate_record` | Line ~777 | Main termination implementation |
@@ -176,23 +178,24 @@ The `#correct` method implements cascade correction - fixing historical data whi
 1. BEGIN TRANSACTION
 2. LOCK the timeline: advisory lock, then the row valid now, then every
    current-knowledge row (see Locking Strategy)
-3. FIND containing record at valid_from (none, e.g. inside a gap: RecordNotFound)
-4. END the span at valid_to, or at the containing record's end when unbounded
+3. FETCH all current-knowledge segments, setting zero-length rows aside
+4. FIND containing record at valid_from (none, e.g. inside a gap: RecordNotFound)
+5. END the span at valid_to, or at the containing record's end when unbounded
    (past the timeline's end: ValidDatetimeRangeError)
-5. BUILD new timeline (a patch):
+6. BUILD the patch:
    a. Split every segment overlapping the span at the span's edges
    b. Assign the corrected attributes to each piece inside the span; each keeps its
       own values for the attributes not given
    c. Keep the rows of segments the patch wouldn't change
-   d. Merge adjacent pieces with equal attributes anywhere in the timeline, including
-      seams an upstream update! left (only stored columns count, not virtual attributes)
-   e. Records outside the span are preserved (CASCADE), and gaps stay gaps
-   f. Nothing changed and nothing to merge: write nothing
-6. CLOSE replaced records (set transaction_to = now)
-7. INSERT new timeline records
-8. VALIDATE no overlapping valid times
-9. RELOAD self (see Self After an Operation)
-10. COMMIT TRANSACTION
+   d. Records outside the span are preserved (CASCADE), and gaps stay gaps
+7. NORMALIZE the new timeline and diff it against the current rows (see Timeline
+   After an Operation): equal neighbours are merged anywhere in the timeline,
+   seams an upstream update! left included. Nothing to write: return true
+8. CLOSE the rows the diff drops (set transaction_to = now)
+9. INSERT the pieces it adds
+10. VALIDATE no overlapping valid times
+11. RELOAD self (see Self After an Operation)
+12. COMMIT TRANSACTION
 ```
 
 ### Critical Ordering
@@ -203,7 +206,7 @@ The key insight is that validation must happen AFTER closing old records:
 # CORRECT ORDER:
 1. Lock the timeline (advisory lock, row valid now, every current-knowledge row)
 2. Find affected records
-3. Build new timeline
+3. Build and normalize the new timeline
 4. CLOSE old records FIRST (set transaction_to)
 5. INSERT new records
 6. Validate post-hoc
@@ -280,18 +283,20 @@ Both methods are whole-timeline operations — they fetch all current-knowledge 
 1. BEGIN TRANSACTION
 2. LOCK the timeline: advisory lock, then SELECT ... FOR UPDATE on the row valid now,
    then on every current-knowledge row (see Locking Strategy)
-3. FETCH all current-knowledge segments (transaction_to = ∞), ordered by valid_from
+3. FETCH all current-knowledge segments (transaction_to = ∞), ordered by valid time,
+   setting zero-length rows aside
 4. GUARD: Raise RecordNotFound if no segments exist
 5. GUARD: Raise ArgumentError if termination_time <= first segment's valid_from
 6. GUARD: Raise ArgumentError if termination_time > last segment's valid_to
-7. NO-OP: Return true if last segment's valid_to already equals termination_time
+7. NO-OP: Replace nothing if last segment's valid_to already equals termination_time
 8. BUILD new timeline:
    a. Segments entirely before termination_time → keep unchanged
    b. Segment spanning termination_time → truncate (set valid_to = termination_time)
    c. Segments entirely at/after termination_time → remove
-9. CLOSE affected old segments (set transaction_to = now)
-10. INSERT new truncated segment (if a segment was split)
-11. COALESCE adjacent identical segments
+9. NORMALIZE the new timeline and diff it against the current rows (see Timeline
+   After an Operation). Nothing to write: return true
+10. CLOSE the rows the diff drops (set transaction_to = now)
+11. INSERT the pieces it adds
 12. VALIDATE no overlapping valid times
 13. RELOAD self (see Self After an Operation)
 14. COMMIT TRANSACTION
@@ -303,27 +308,31 @@ Both methods are whole-timeline operations — they fetch all current-knowledge 
 1. BEGIN TRANSACTION
 2. LOCK the timeline: advisory lock, then the row valid now, then every
    current-knowledge row (see Locking Strategy)
-3. FETCH all current-knowledge segments
+3. FETCH all current-knowledge segments, setting zero-length rows aside
 4. GUARD: Raise RecordNotFound if no segments exist
-5. NO-OP: Return true if last segment's valid_to = ∞ (not terminated)
+5. NO-OP: Replace nothing if last segment's valid_to = ∞ (not terminated)
 6. FIND pre-termination state:
    a. Collect all distinct transaction_to values as change points
    b. Walk backward through change points
-   c. At each point, query the timeline that was current just before that change
+   c. At each point, query the timeline that was current just before that change,
+      leaving out its zero-length rows (a timeline of nothing else is skipped)
    d. Return the first timeline where the last segment's valid_to = ∞, with its
       change point (when the termination took effect)
    e. Raise PreTerminationStateNotFoundError if none has one
 7. GUARD: Raise RecordedSinceTerminationError if any row of the entity, whatever
    its valid time, was inserted (transaction_from) or closed (transaction_to) after
-   that change point. The termination's own rows, coalescing's included, carry the
-   change point itself, so the bounds are strict.
-8. CLOSE all current segments (set transaction_to = now)
-9. RECREATE pre-termination segments as new records (dup + save)
+   that change point. The termination's own rows carry the change point itself,
+   so the bounds are strict.
+8. REPLACE all current segments with copies of the pre-termination ones (dup)
    - Clear deleted_at to prevent transaction_to corruption during save
-10. COALESCE adjacent identical segments
-11. VALIDATE no overlapping valid times
-12. RELOAD self (see Self After an Operation)
-13. COMMIT TRANSACTION
+9. NORMALIZE the restored timeline and diff it against the current rows (see
+   Timeline After an Operation): a restored segment with a current row's range and
+   values keeps that row. Nothing to write: return true
+10. CLOSE the rows the diff drops (set transaction_to = now)
+11. INSERT the pieces it adds
+12. VALIDATE no overlapping valid times
+13. RELOAD self (see Self After an Operation)
+14. COMMIT TRANSACTION
 ```
 
 `cancel_shift_genesis` follows the same steps, walking back to the first timeline whose genesis differs from the current one, and raises `RecordedSinceGenesisShiftError` in step 7. Both refusals happen before any write, so the transaction writes nothing and `self` is not reloaded. Each subclasses its cancel's not-found error, so a `rescue` of that error catches it.
@@ -399,6 +408,40 @@ Transaction times need no cast: an operation writes its one `Time.current` to ev
 
 ---
 
+## Timeline After an Operation
+
+Every timeline operation (`correct`, `shift_genesis`, `terminate` and the two cancels) leaves the entity's current timeline with no seam (two adjacent segments with equal business attributes, as an upstream `update!` that sets the values the next segment already has leaves) and no zero-length row (`valid_from = valid_to`, as an upstream `destroy` at a segment's exact start leaves), whatever it found there. The shared skeleton, `perform_timeline_operation`, does this for all five:
+
+1. FETCH every current-knowledge row once the locks are held, and set the zero-length rows aside. The operation's guards and builders see only segments that hold a time: a zero-length row is never the genesis, the last segment or part of a patch, and an entity whose only current rows are zero-length raises `RecordNotFound`.
+2. BUILD (op-specific): the segments the operation replaces, and the pieces it adds. A no-op exit replaces nothing.
+3. NORMALIZE the result (segments - replaced + pieces): drop zero-length pieces, order by valid time, and merge equal neighbours (only stored columns count, not virtual attributes). A stored segment is never extended in place: it's closed and replaced by the merged piece.
+4. DIFF it against every current row, zero-length rows included:
+   - A row the result keeps stays.
+   - A new piece with the range and business attributes of a current row is dropped, and that row stays, so an unchanged version isn't recorded again. A cancel keeps the rows of the segments the operation it undoes didn't change.
+   - Every other row is closed and every other piece inserted, closing first.
+5. Nothing to close or insert: return `true` without validating or reloading `self`.
+
+So a call that changes nothing writes nothing, and a call on a timeline with a seam or a zero-length row merges or closes it, even when it otherwise changes nothing. The cancels' history walks also leave zero-length rows out of each snapshot, and skip a snapshot of nothing else: there's no timeline in it to restore.
+
+```
+Before (an upstream update! at Mar set B, the next segment's values):
+  A         B         B         C
+  |---------|---------|---------|----------->
+  Feb      Mar       May       Jul
+
+terminate(termination_time: Aug)
+
+After:
+  A         B                   C
+  |---------|-------------------|---------|
+  Feb      Mar                 Jul       Aug
+
+  A keeps its row. Both B rows and C are closed, and B [Mar, Jul) and
+  C [Jul, Aug) inserted.
+```
+
+---
+
 ## Self After an Operation
 
 Every timeline operation (`correct`, `shift_genesis`, `terminate` and the two cancels) ends inside its transaction by reloading `self`, the way `update!` and `reload` treat the record's own valid time:
@@ -407,7 +450,7 @@ Every timeline operation (`correct`, `shift_genesis`, `terminate` and the two ca
 2. Call the real `reload(unscoped: true)` inside `valid_at!` and `transaction_at!(now)`, with the record's own `ignore_*` options off. The valid time is that same time when the version covers it, else the version's `valid_from`. Forcing both pins the lookup to that version whatever the record or the caller's scopes say. Pinning at the record's own time when possible means a strict-loading record's associations, which `reload` preloads under the pin, load at the time `reload` would load them at.
 3. Set `swapped_id_previously_was` to the row `self` pointed at before, as `update!` does.
 
-Going through `reload` means every reload hook runs: Rails' dirty tracking and autosave flags, and any `reload` override on the model (such as one resetting memoized values). Unsaved changes on `self` are discarded, as `reload` discards them. An operation's no-op exits return before any write and leave `self` alone. A frozen `self` raises `FrozenError` before anything is written, as `update!` does.
+Going through `reload` means every reload hook runs: Rails' dirty tracking and autosave flags, and any `reload` override on the model (such as one resetting memoized values). Unsaved changes on `self` are discarded, as `reload` discards them. A call with nothing to write (see Timeline After an Operation) writes nothing and leaves `self` alone. A frozen `self` raises `FrozenError` before anything is written, as `update!` does.
 
 ---
 
@@ -708,13 +751,14 @@ Transaction time records:
   Old (closed at correction time):
     Record 1: A, VT[Jan,Mar), TT[T1,T2]
     Record 2: B, VT[Mar,May), TT[T1,T2]
-    Record 3: C, VT[May,∞),   TT[T1,T2]
+
+  Kept (current, not rewritten):
+    Record 3: C, VT[May,∞),   TT[T1,∞)   ← PRESERVED (cascade)
 
   New (current):
     Record 4: A, VT[Jan,Feb), TT[T2,∞)   ← Trimmed
     Record 5: X, VT[Feb,Apr), TT[T2,∞)   ← CORRECTION
     Record 6: B, VT[Apr,May), TT[T2,∞)   ← Trimmed
-    Record 7: C, VT[May,∞),   TT[T2,∞)   ← PRESERVED (cascade)
 ```
 
 ---
