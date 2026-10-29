@@ -953,6 +953,59 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #reopen, 
       end
     end
 
+    # Moving an end later: a reopen, then a terminate at the new end, in one transaction. Only a
+    # real transaction rolls back on a raise, so these examples commit.
+    context "when the end is moved later, reopen and terminate in one transaction", use_truncation: true do
+      let(:new_end) { _06_01 }
+
+      subject(:move_end) {
+        Employee.transaction {
+          Timecop.freeze(reopened_at) { employee.reopen }
+          Timecop.freeze("2020/10/07") { employee.terminate(termination_time: new_end) }
+        }
+      }
+
+      before { terminate_on("2020/10/02", _04_01) }
+
+      it "ends the timeline at the new end" do
+        expect(move_end).to be true
+        expect(current_timeline(employee)).to eq [
+          [_01_01, _03_01, "A"],
+          [_03_01, _06_01, "B"],
+        ]
+      end
+
+      context "when the terminate raises" do
+        # Before the genesis
+        let(:new_end) { "2019/12/01".in_time_zone }
+
+        it "rolls the reopen back with it, leaving the old end" do
+          history_before = history(employee)
+
+          expect { move_end }.to raise_error(ArgumentError)
+          expect(history(employee)).to eq history_before
+          expect(current_timeline(employee)).to eq [
+            [_01_01, _03_01, "A"],
+            [_03_01, _04_01, "B"],
+          ]
+        end
+      end
+
+      # The cancel undoes the last terminate only: the old end stays lifted, and the segment
+      # the first termination removed stays removed
+      context "when the move's termination is canceled" do
+        it "restores the reopened timeline, open-ended" do
+          move_end
+          Timecop.freeze("2020/10/08") { employee.cancel_termination }
+
+          expect(current_timeline(employee)).to eq [
+            [_01_01, _03_01, "A"],
+            [_03_01, infinity, "B"],
+          ]
+        end
+      end
+    end
+
     context "when the timeline isn't terminated" do
       it "writes nothing" do
         history_before = history(employee)

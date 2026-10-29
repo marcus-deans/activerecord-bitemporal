@@ -837,6 +837,8 @@ end
 
 `reopen` continues the current last segment, so the segments the termination removed stay removed, and it works whatever was recorded since. To bring those segments back, undo the termination with `cancel_termination` before terminating at the new end instead. That cancel refuses once anything has been recorded for the entity after the termination, including a re-termination at an earlier point.
 
+After a move, `cancel_termination` undoes only the last `terminate`. It restores the reopened, open-ended timeline, not the earlier end, and not the segments the first termination removed.
+
 ### Error Handling
 
 ```ruby
