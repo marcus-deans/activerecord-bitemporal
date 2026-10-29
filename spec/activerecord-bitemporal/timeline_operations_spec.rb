@@ -1228,6 +1228,297 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
     end
   end
 
+  # An operation inserts every row with save_without_bitemporal_callbacks!(validate: false) and
+  # closes every row with update_columns. So the model's validations never run on its rows: the
+  # only check is that the current rows don't overlap, and validating new values is the caller's
+  # job. Each inserted row runs the model's save and create callbacks, a closed row runs none,
+  # and upstream's bitemporal_* callbacks never run. Upstream's after_create gives every inserted
+  # row the entity's id, so Rails runs the commit callbacks on one of them: once for the
+  # operation, however many rows it inserts.
+  describe "validations and callbacks during an operation" do
+    let(:_01_01) { "2020/01/01".in_time_zone }
+    let(:_02_01) { "2020/02/01".in_time_zone }
+    let(:_03_01) { "2020/03/01".in_time_zone }
+    let(:_04_01) { "2020/04/01".in_time_zone }
+    let(:_05_01) { "2020/05/01".in_time_zone }
+    let(:_07_01) { "2020/07/01".in_time_zone }
+    let(:_08_01) { "2020/08/01".in_time_zone }
+    let(:infinity) { ActiveRecord::Bitemporal::DEFAULT_VALID_TO }
+    let(:operated_at) { "2020/10/05".in_time_zone }
+
+    # The callbacks the model ran, in order, and the columns each row it saved reported as changed
+    let(:callbacks) { [] }
+    let(:saved_columns) { [] }
+
+    # The operations run through this model on the employees table. Its validation rejects a blank
+    # name, and it logs every validation, save, create, update, destroy, bitemporal_* and commit
+    # callback it runs.
+    let(:model) {
+      log = callbacks
+      columns = saved_columns
+      Class.new(ActiveRecord::Base) {
+        def self.name; "CallbackLoggingEmployee"; end
+        self.table_name = "employees"
+        include ActiveRecord::Bitemporal
+
+        validates :name, presence: true
+
+        %i[
+          before_validation after_validation
+          before_save after_save before_create after_create before_update after_update before_destroy after_destroy
+          before_bitemporal_create after_bitemporal_create before_bitemporal_update after_bitemporal_update
+          before_bitemporal_destroy after_bitemporal_destroy
+          after_commit after_create_commit after_update_commit after_save_commit after_destroy_commit
+        ].each { |callback| public_send(callback) { log << callback } }
+        around_save { |_, save| log << :around_save; save.call }
+        around_create { |_, create| log << :around_create; create.call }
+        after_save { columns << saved_changes.keys.sort }
+      }
+    }
+
+    # The callbacks one inserted row runs, and those that run on commit (Rails runs commit
+    # callbacks last defined first)
+    let(:insert_callbacks) { %i[before_save around_save before_create around_create after_create after_save] }
+    let(:commit_callbacks) { %i[after_save_commit after_create_commit after_commit] }
+
+    #   A |Feb, Mar)  B |Mar, Jul)  C |Jul, ∞)   recorded on 2020-10-01 through Employee, which has
+    #   neither the model's validation nor its callbacks
+    let(:b_name) { "B" }
+    let!(:employee_id) {
+      Timecop.freeze("2020/10/01") {
+        id = ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.create!(name: "A", emp_code: "E1") }.id
+        ActiveRecord::Bitemporal.valid_at(_03_01) { Employee.find(id).update!(name: b_name) }
+        ActiveRecord::Bitemporal.valid_at(_07_01) { Employee.find(id).update!(name: "C") }
+        id
+      }
+    }
+
+    let(:employee) { model.find_at_time(_02_01, employee_id) }
+
+    # [valid_from, valid_to, name, emp_code] of every current row
+    def timeline
+      all_rows(Employee, employee_id).where(transaction_to: tt_infinity).order(:valid_from)
+        .pluck(:valid_from, :valid_to, :name, :emp_code)
+    end
+
+    # [valid_from, valid_to, name] of the rows the operation inserted, and of those it closed
+    def inserted
+      all_rows(Employee, employee_id).where(transaction_from: operated_at).order(:valid_from)
+        .pluck(:valid_from, :valid_to, :name)
+    end
+
+    def closed
+      all_rows(Employee, employee_id).where(transaction_to: operated_at).order(:valid_from)
+        .pluck(:valid_from, :valid_to, :name)
+    end
+
+    def history
+      all_rows(Employee, employee_id).order(:id).pluck(*Employee.column_names)
+    end
+
+    describe "validations" do
+      subject(:correct) { Timecop.freeze(operated_at) { employee.correct(**correction) } }
+
+      context "when the correction sets a value the model's validation rejects" do
+        let(:correction) { { valid_from: _04_01, name: "" } }
+
+        it "writes it without running the validation" do
+          expect(correct).to be true
+          expect(timeline).to eq [
+            [_02_01, _03_01, "A", "E1"],
+            [_03_01, _04_01, "B", "E1"],
+            [_04_01, _07_01, "", "E1"],
+            [_07_01, infinity, "C", "E1"],
+          ]
+          expect(callbacks).not_to include(:before_validation, :after_validation)
+        end
+      end
+
+      # B has no name, as a row stored before the validation was added can
+      context "when a segment the correction patches holds a value the validation rejects" do
+        let(:b_name) { nil }
+        let(:correction) { { valid_from: _04_01, valid_to: _08_01, emp_code: "E2" } }
+
+        it "keeps that value in the pieces it writes" do
+          expect(correct).to be true
+          expect(timeline).to eq [
+            [_02_01, _03_01, "A", "E1"],
+            [_03_01, _04_01, nil, "E1"],
+            [_04_01, _07_01, nil, "E2"],
+            [_07_01, _08_01, "C", "E2"],
+            [_08_01, infinity, "C", "E1"],
+          ]
+        end
+      end
+
+      # Only rows written around the gem overlap, here Q |May, Aug) over B and C
+      context "when the current rows overlap" do
+        let(:correction) { { valid_from: _02_01, valid_to: _03_01, name: "X" } }
+
+        before {
+          Timecop.freeze("2020/10/02") {
+            Employee.unscoped.insert_all!([{
+              bitemporal_id: employee_id, name: "Q", emp_code: "E1", valid_from: _05_01, valid_to: _08_01,
+              transaction_from: Time.current, transaction_to: tt_infinity, created_at: Time.current, updated_at: Time.current,
+            }])
+          }
+        }
+
+        it "still raises RecordInvalid and writes nothing" do
+          history_before = history
+
+          expect { correct }.to raise_error(ActiveRecord::RecordInvalid, /Overlapping valid periods/)
+          expect(history).to eq history_before
+        end
+      end
+    end
+
+    # after_commit runs only when the transaction commits, so these examples commit each operation
+    describe "callbacks", use_truncation: true do
+      describe "#correct" do
+        subject(:correct) { Timecop.freeze(operated_at) { employee.correct(**correction) } }
+
+        #   A |Feb, Mar)  B |Mar, Apr)  X |Apr, Aug)  C |Aug, ∞)
+        let(:correction) { { valid_from: _04_01, valid_to: _08_01, name: "X" } }
+
+        # The whole log, so no validation, update, destroy or bitemporal_* callback ran either
+        it "runs the save and create callbacks once for each row it inserts, none for a row it closes, and the commit callbacks once" do
+          correct
+
+          expect(inserted).to eq [[_03_01, _04_01, "B"], [_04_01, _08_01, "X"], [_08_01, infinity, "C"]]
+          expect(closed).to eq [[_03_01, _07_01, "B"], [_07_01, infinity, "C"]]
+          expect(callbacks).to eq [*insert_callbacks * 3, *commit_callbacks]
+        end
+
+        # Each row is a new copy of a version, so every column holding a value counts as changed
+        it "reports every column holding a value as changed on each row it inserts" do
+          correct
+
+          expect(saved_columns).to eq [
+            %w[bitemporal_id created_at emp_code id name transaction_from transaction_to updated_at valid_from valid_to],
+          ] * 3
+        end
+
+        #   A |Feb, Mar)  B |Mar, May)  B |May, Jul)  C |Jul, ∞)
+        context "when it merges a seam" do
+          let!(:employee_id) {
+            id = Timecop.freeze("2020/10/01") {
+              employee = ActiveRecord::Bitemporal.valid_at(_02_01) { Employee.create!(name: "A", emp_code: "E1") }
+              ActiveRecord::Bitemporal.valid_at(_05_01) { Employee.find(employee.id).update!(name: "B") }
+              ActiveRecord::Bitemporal.valid_at(_07_01) { Employee.find(employee.id).update!(name: "C") }
+              employee.id
+            }
+            Timecop.freeze("2020/10/02") {
+              ActiveRecord::Bitemporal.valid_at(_03_01) { Employee.find(id).update!(name: "B") }
+            }
+            id
+          }
+          let(:correction) { { valid_from: _02_01, valid_to: _03_01, name: "X" } }
+
+          it "runs the commit callbacks once for the merged row and the correction" do
+            correct
+
+            expect(inserted).to eq [[_02_01, _03_01, "X"], [_03_01, _07_01, "B"]]
+            expect(callbacks).to eq [*insert_callbacks * 2, *commit_callbacks]
+          end
+        end
+
+        context "when the correction changes nothing" do
+          let(:correction) { { valid_from: _02_01, name: "A" } }
+
+          it "runs no callback, commit callbacks included" do
+            expect(correct).to be true
+            expect(callbacks).to be_empty
+          end
+        end
+      end
+
+      describe "#terminate" do
+        subject(:terminate) { Timecop.freeze(operated_at) { employee.terminate(termination_time: termination_time) } }
+
+        let(:termination_time) { _05_01 }
+
+        it "runs the save and create callbacks for the row it inserts, and the commit callbacks once" do
+          terminate
+
+          expect(inserted).to eq [[_03_01, _05_01, "B"]]
+          expect(closed).to eq [[_03_01, _07_01, "B"], [_07_01, infinity, "C"]]
+          expect(callbacks).to eq [*insert_callbacks, *commit_callbacks]
+        end
+
+        # Nothing is saved, so no record is left for the commit callbacks to run on
+        context "when it ends the timeline at a segment's end" do
+          let(:termination_time) { _07_01 }
+
+          it "only closes rows, running no callback, commit callbacks included" do
+            terminate
+
+            expect(inserted).to be_empty
+            expect(closed).to eq [[_07_01, infinity, "C"]]
+            expect(callbacks).to be_empty
+          end
+        end
+      end
+
+      describe "#shift_genesis" do
+        subject(:shift_genesis) { Timecop.freeze(operated_at) { employee.shift_genesis(new_valid_from: new_valid_from) } }
+
+        let(:new_valid_from) { _01_01 }
+
+        it "runs the save and create callbacks for the row it inserts, and the commit callbacks once" do
+          shift_genesis
+
+          expect(inserted).to eq [[_01_01, _03_01, "A"]]
+          expect(closed).to eq [[_02_01, _03_01, "A"]]
+          expect(callbacks).to eq [*insert_callbacks, *commit_callbacks]
+        end
+
+        # Nothing is saved, so no record is left for the commit callbacks to run on
+        context "when it moves the genesis forward to a segment's start" do
+          let(:new_valid_from) { _03_01 }
+
+          it "only closes rows, running no callback, commit callbacks included" do
+            shift_genesis
+
+            expect(inserted).to be_empty
+            expect(closed).to eq [[_02_01, _03_01, "A"]]
+            expect(callbacks).to be_empty
+          end
+        end
+      end
+
+      describe "#cancel_termination" do
+        subject(:cancel_termination) { Timecop.freeze(operated_at) { employee.cancel_termination } }
+
+        # Terminated at May on 2020-10-03, through Employee
+        before { Timecop.freeze("2020/10/03") { Employee.find_at_time(_02_01, employee_id).terminate(termination_time: _05_01) } }
+
+        it "runs the save and create callbacks once for each row it restores, and the commit callbacks once" do
+          cancel_termination
+
+          expect(inserted).to eq [[_03_01, _07_01, "B"], [_07_01, infinity, "C"]]
+          expect(closed).to eq [[_03_01, _05_01, "B"]]
+          expect(callbacks).to eq [*insert_callbacks * 2, *commit_callbacks]
+        end
+      end
+
+      describe "#cancel_shift_genesis" do
+        subject(:cancel_shift_genesis) { Timecop.freeze(operated_at) { employee.cancel_shift_genesis } }
+
+        # Shifted back to Jan on 2020-10-03, through Employee
+        before { Timecop.freeze("2020/10/03") { Employee.find_at_time(_02_01, employee_id).shift_genesis(new_valid_from: _01_01) } }
+
+        it "runs the save and create callbacks for the row it restores, and the commit callbacks once" do
+          cancel_shift_genesis
+
+          expect(inserted).to eq [[_02_01, _03_01, "A"]]
+          expect(closed).to eq [[_01_01, _03_01, "A"]]
+          expect(callbacks).to eq [*insert_callbacks, *commit_callbacks]
+        end
+      end
+    end
+  end
+
   # A date column stores a day, and datetime(6) a time to the microsecond. Each operation takes
   # its times as the column stores them, the way upstream's valid_at reads a time, so it
   # compares them with the stored boundaries it would write.
