@@ -48,6 +48,8 @@ ActiveRecord::Bitemporal
 | `_terminate_record` | Line ~777 | Main termination implementation |
 | `cancel_termination` | Line ~340 | Public API for termination reversal |
 | `_cancel_termination_record` | Line ~852 | Main cancel implementation |
+| `reopen` | `timeline_operations.rb` | Public API for lifting a terminated timeline's end |
+| `_reopen_record` | `timeline_operations.rb` | Main reopen implementation |
 | `build_termination_records` | Line ~922 | Builds truncated timeline for termination |
 | `find_pre_termination_state` | Line ~952 | Searches transaction history for pre-termination state |
 
@@ -273,9 +275,9 @@ When correcting with only some attributes, each corrected piece keeps the non-co
 
 ### Overview
 
-The `#terminate` method sets a finite end date on an entity's valid-time timeline. Unlike `destroy` (which closes `transaction_to` to say "we no longer know about this"), `terminate` modifies `valid_to` to say "this entity stopped being valid at this date." The `#cancel_termination` method reverses a termination by recovering the pre-termination state from transaction history, and refuses when anything was recorded for the entity after the termination.
+The `#terminate` method sets a finite end date on an entity's valid-time timeline. Unlike `destroy` (which closes `transaction_to` to say "we no longer know about this"), `terminate` modifies `valid_to` to say "this entity stopped being valid at this date." The `#cancel_termination` method reverses a termination by recovering the pre-termination state from transaction history, and refuses when anything was recorded for the entity after the termination. The `#reopen` method lifts the end instead: it continues the current last segment to infinity, never reads transaction history, and works whatever was recorded after the termination.
 
-Both methods are whole-timeline operations — they fetch all current-knowledge segments for the entity and operate on them atomically, similar to `_correct_record` and `_shift_genesis_record`.
+All three methods are whole-timeline operations — they fetch all current-knowledge segments for the entity and operate on them atomically, similar to `_correct_record` and `_shift_genesis_record`.
 
 ### Terminate Algorithm
 
@@ -336,6 +338,29 @@ Both methods are whole-timeline operations — they fetch all current-knowledge 
 ```
 
 `cancel_shift_genesis` follows the same steps. Its no-op in step 5 is a genesis equal to the original one, the `valid_from` of the entity's first recorded row. Step 6 walks back to the most recent timeline that starts at that original genesis, passing over any timeline an earlier shift left at another genesis, and step 7 raises `RecordedSinceGenesisShiftError`. So it undoes one shift: after two shifts it refuses, since the second was recorded after the first moved the genesis off the original. Both refusals happen before any write, so the transaction writes nothing and `self` is not reloaded. Each subclasses its cancel's not-found error, so a `rescue` of that error catches it.
+
+### Reopen Algorithm
+
+```
+1. BEGIN TRANSACTION
+2. LOCK the timeline: advisory lock, then the row valid now, then every
+   current-knowledge row (see Locking Strategy)
+3. FETCH all current-knowledge segments, setting zero-length rows aside
+4. GUARD: Raise RecordNotFound if no segments exist
+5. NO-OP: Replace nothing if last segment's valid_to = ∞ (not terminated)
+6. REPLACE the last segment with a copy of it whose valid_to = ∞. No history is
+   read, so nothing recorded since the termination can be in the way, and the
+   segments the termination removed stay removed
+7. NORMALIZE the new timeline and diff it against the current rows (see Timeline
+   After an Operation). Nothing to write: return true
+8. CLOSE the rows the diff drops (set transaction_to = now)
+9. INSERT the pieces it adds
+10. VALIDATE no overlapping valid times
+11. RELOAD self (see Self After an Operation)
+12. COMMIT TRANSACTION
+```
+
+The last segment is the last one that holds a time. A finite end left by an upstream `destroy` of the last segment is lifted like a termination's. A `destroy` at the last segment's exact start leaves a zero-length row there, so the segment before it is the one that continues, and the diff closes that row.
 
 ### Key Implementation Detail: `deleted_at` Corruption
 
@@ -410,7 +435,7 @@ Transaction times need no cast: an operation writes its one `Time.current` to ev
 
 ## Timeline After an Operation
 
-Every timeline operation (`correct`, `shift_genesis`, `terminate` and the two cancels) leaves the entity's current timeline with no seam (two adjacent segments with equal business attributes, as an upstream `update!` that sets the values the next segment already has leaves) and no zero-length row (`valid_from = valid_to`, as an upstream `destroy` at a segment's exact start leaves), whatever it found there. The shared skeleton, `perform_timeline_operation`, does this for all five:
+Every timeline operation (`correct`, `shift_genesis`, `terminate`, `reopen` and the two cancels) leaves the entity's current timeline with no seam (two adjacent segments with equal business attributes, as an upstream `update!` that sets the values the next segment already has leaves) and no zero-length row (`valid_from = valid_to`, as an upstream `destroy` at a segment's exact start leaves), whatever it found there. The shared skeleton, `perform_timeline_operation`, does this for all six:
 
 1. FETCH every current-knowledge row once the locks are held, and set the zero-length rows aside. The operation's guards and builders see only segments that hold a time: a zero-length row is never the genesis, the last segment or part of a patch, and an entity whose only current rows are zero-length raises `RecordNotFound`. Every read of the entity's rows, this one, the cancels' history walks, `terminated?` and `shifted_genesis?` included, starts from `unscoped`, so neither a caller's `transaction_at`, `valid_at` or `bitemporal_at` block, a `scoping` block nor the model's own `default_scope` hides a row: the operation works on the timeline as it is now, as upstream's writes record at now. An STI subclass still reads only its own type. A current row whose `transaction_from` is after the operation's time, as a host whose clock runs ahead records one, raises `TransactionTimeSkewError` before anything else: closing it would set its `transaction_to` before its `transaction_from`.
 2. BUILD (op-specific): the segments the operation replaces, and the pieces it adds. A no-op exit replaces nothing.
@@ -444,7 +469,7 @@ After:
 
 ## Self After an Operation
 
-Every timeline operation (`correct`, `shift_genesis`, `terminate` and the two cancels) ends inside its transaction by reloading `self`, the way `update!` and `reload` treat the record's own valid time:
+Every timeline operation (`correct`, `shift_genesis`, `terminate`, `reopen` and the two cancels) ends inside its transaction by reloading `self`, the way `update!` and `reload` treat the record's own valid time:
 
 1. Pick the version: the current-knowledge segment valid at `self.valid_datetime` (the time it was loaded at with `valid_at`/`find_at_time`), or at now when it has none. That time is first cast to the valid-time column's type, so a date column compares days the way the database does. When none is valid then (a timeline ended before it, a gap, or a timeline starting after it), take the latest segment starting before that time, else the first segment. Zero-length rows are never picked. The segments are read unscoped, so neither the model's default scope nor a caller's `scoping` or `transaction_at` can hide one.
 2. Call the real `reload(unscoped: true)` inside `valid_at!` and `transaction_at!(now)`, with the record's own `ignore_*` options off. The valid time is that same time when the version covers it, else the version's `valid_from`. Forcing both pins the lookup to that version whatever the record or the caller's scopes say. Pinning at the record's own time when possible means a strict-loading record's associations, which `reload` preloads under the pin, load at the time `reload` would load them at.

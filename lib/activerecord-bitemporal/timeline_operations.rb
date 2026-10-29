@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# Fork-added timeline operations: correct, shift_genesis, terminate and their cancels.
+# Fork-added timeline operations: correct, shift_genesis, terminate, their cancels and reopen.
 #
 # After any of them the entity's current timeline has no seams (adjacent segments with equal
 # business attributes) and no zero-length rows, whatever upstream writes left there. Rows
@@ -84,7 +84,7 @@ module ActiveRecord
       #
       # Raises ActiveRecord::RecordNotFound if no current-knowledge records exist.
       # Raises ArgumentError if termination_time <= first valid_from or > last valid_to.
-      # Re-terminating earlier works; re-terminating later requires cancel_termination first.
+      # Re-terminating earlier works; re-terminating later is reopen, then terminate.
       # Terminating at the current end is a no-op, writing only to merge seams or close
       # zero-length rows left in the timeline.
       # termination_time is taken as the valid-time column stores it (see cast_valid_time).
@@ -106,7 +106,8 @@ module ActiveRecord
       # before the termination, not the current timeline with valid_to extended.
       # If anything was recorded for the entity after the termination (a correct,
       # an update!, a re-terminate, ...), it refuses instead of discarding that:
-      # it raises RecordedSinceTerminationError and writes nothing.
+      # it raises RecordedSinceTerminationError and writes nothing. reopen lifts the
+      # end and keeps them.
       #
       # Segments it restores unchanged keep their current rows. No-op if entity is not
       # currently terminated, writing only to merge seams or close zero-length rows left in
@@ -120,6 +121,33 @@ module ActiveRecord
       # @return [Boolean] true if successful
       def cancel_termination
         _cancel_termination_record
+      end
+
+      # Reopen: Lift the end of a terminated timeline (right edge)
+      #
+      # The last segment continues, with the values it already has, to DEFAULT_VALID_TO.
+      # The end-side mirror of a backward shift_genesis, which extends the first segment's
+      # values earlier.
+      #
+      # IMPORTANT: This is an edit, not an undo — like terminate and correct, it changes the
+      # current timeline in valid time and never reads transaction history. Segments a
+      # termination removed stay removed (cancel_termination brings them back). It works
+      # whatever was recorded after the termination (a correct, an update!, a re-terminate,
+      # ...), so it's the recourse when cancel_termination raises
+      # RecordedSinceTerminationError.
+      #
+      # An end in the past is lifted as one in the future, and so is the end an upstream
+      # destroy of the last segment leaves. Moving an end later is reopen, then terminate;
+      # wrap both in a transaction to make the move atomic.
+      #
+      # The other segments keep their rows. No-op if the timeline isn't terminated (last
+      # segment extends to infinity), writing only to merge seams or close zero-length rows
+      # left in the timeline.
+      #
+      # @raise [ActiveRecord::RecordNotFound] if no current-knowledge records exist
+      # @return [Boolean] true if successful
+      def reopen
+        _reopen_record
       end
 
       # Predicate: Is this entity's timeline terminated (finite end)?
@@ -144,8 +172,9 @@ module ActiveRecord
       # cancel_termination restores the most recent unterminated one. If anything was
       # recorded for the entity after that move (a correct, an update!, a terminate,
       # another shift_genesis, ...), it refuses instead of discarding that: it raises
-      # RecordedSinceGenesisShiftError and writes nothing. So after two shifts it
-      # refuses, and a second cancel finds nothing to cancel.
+      # RecordedSinceGenesisShiftError and writes nothing; a shift_genesis to the
+      # original genesis moves it back and keeps them. So after two shifts it refuses,
+      # and a second cancel finds nothing to cancel.
       #
       # Segments it restores unchanged keep their current rows. No-op if the genesis is the
       # original one (never shifted, shifted back, or already canceled), writing only to merge
@@ -309,7 +338,7 @@ module ActiveRecord
         current_knowledge_rows.lock!.pluck(:id)
       end
 
-      # Shared skeleton of the five timeline operations.
+      # Shared skeleton of the six timeline operations.
       #
       # Owns the steps every operation repeats: transaction, lock, timestamp, fetch,
       # normalize, close, insert, validate and reloading self. The block does the
@@ -502,7 +531,7 @@ module ActiveRecord
           # A terminated (or shift-genesis-truncated) entity has a finite valid_to on
           # its last segment. Allowing a bounded correction to specify a valid_to
           # beyond that point would silently "un-terminate" the entity — extending
-          # its lifetime without going through cancel_termination.
+          # its lifetime without going through reopen or cancel_termination.
           #
           #   Timeline:  |---A---|---B---|  (terminated at T)
           #   Correction:        |---X-------->|  ← valid_to past T — REJECTED
@@ -516,7 +545,7 @@ module ActiveRecord
           if effective_valid_to > timeline_end
             raise ActiveRecord::Bitemporal::ValidDatetimeRangeError,
               "correction valid_to (#{effective_valid_to}) exceeds timeline end " \
-              "(#{timeline_end}). Cancel termination first to extend the timeline."
+              "(#{timeline_end}). Reopen the timeline or cancel its termination first to extend it."
           end
 
           # 3. Patch the span
@@ -671,7 +700,8 @@ module ActiveRecord
           if recorded_since?(terminated_at)
             raise RecordedSinceTerminationError,
               "Changes were recorded for #{self.class} with bitemporal_id=#{bitemporal_id} " \
-              "after its termination; cancelling it would discard them"
+              "after its termination; cancelling it would discard them. To lift the end and " \
+              "keep them, call reopen"
           end
 
           # 5. Replace ALL current segments with the pre-termination ones, as new records with
@@ -689,6 +719,31 @@ module ActiveRecord
           end
 
           [segments, new_records]
+        end
+      end
+
+      # Reopen: Main implementation
+      def _reopen_record
+        perform_timeline_operation do |segments, current_time|
+          # 1. Guard: entity must exist
+          if segments.empty?
+            raise ActiveRecord::RecordNotFound.new(
+              "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
+              "(no current-knowledge records)",
+              self.class, "bitemporal_id", bitemporal_id
+            )
+          end
+
+          last_segment = segments.last
+
+          # 2. No-op: not terminated (last segment extends to infinity), nothing to replace
+          next [[], []] if last_segment[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+
+          # 3. Continue the last segment to infinity, as it is: no history is read
+          [
+            [last_segment],
+            [timeline_piece(last_segment, last_segment[valid_from_key], ActiveRecord::Bitemporal::DEFAULT_VALID_TO, current_time)],
+          ]
         end
       end
 
@@ -800,7 +855,8 @@ module ActiveRecord
           if recorded_since?(shifted_at)
             raise RecordedSinceGenesisShiftError,
               "Changes were recorded for #{self.class} with bitemporal_id=#{bitemporal_id} " \
-              "after its genesis shift; cancelling it would discard them"
+              "after its genesis shift; cancelling it would discard them. To move the genesis " \
+              "back to #{original_genesis} and keep them, call shift_genesis with that time"
           end
 
           # 5. Replace ALL current segments with the pre-shift ones, as new records with this

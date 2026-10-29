@@ -1346,6 +1346,13 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
           )
         end
 
+        it "points at a shift back to the original genesis, which keeps them" do
+          expect { cancel }.to raise_error(
+            ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError,
+            /To move the genesis back to #{Regexp.escape(_01_01.to_s)} and keep them, call shift_genesis with that time\z/
+          )
+        end
+
         it "is caught by a rescue of PreShiftGenesisStateNotFoundError" do
           rescued = begin
             cancel

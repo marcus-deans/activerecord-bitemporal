@@ -442,6 +442,48 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
       end
     end
 
+    describe "#reopen" do
+      subject(:reopen) { Timecop.freeze("2020/10/05") { employee.reopen } }
+
+      # Terminated at Jun on 2020-10-03, so self is loaded at May, a time a version covers
+      before { Timecop.freeze("2020/10/03") { Employee.find(employee_id).terminate(termination_time: _06_01) } }
+
+      let(:employee) { version_at(_05_01) }
+
+      it "lands on the reopened version and leaves nothing to save" do
+        reopen
+
+        expect([*span(employee), employee.name]).to eq [_05_01, ActiveRecord::Bitemporal::DEFAULT_VALID_TO, "B"]
+        expect(employee.swapped_id).to eq version_at(_06_01).swapped_id
+        expect(employee.changed?).to be false
+      end
+
+      it "discards unsaved changes, as reload does" do
+        employee.emp_code = "PENDING"
+
+        reopen
+
+        expect(employee.emp_code).to eq "C1"
+        expect(employee.changed?).to be false
+      end
+
+      it "keeps the row self pointed at before as swapped_id_previously_was" do
+        before = employee.swapped_id
+
+        reopen
+
+        expect(employee.swapped_id).not_to eq before
+        expect(employee.swapped_id_previously_was).to eq before
+      end
+
+      it "refuses a frozen receiver before writing" do
+        employee.freeze
+
+        expect { reopen }.to raise_error(FrozenError)
+        expect(version_at(_05_01).valid_to).to eq _06_01
+      end
+    end
+
     it "refuses a frozen receiver before writing, as update! does" do
       employee = Employee.find(employee_id).freeze
 
@@ -1173,6 +1215,118 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
       end
     end
 
+    describe "#reopen" do
+      subject(:reopen) { Timecop.freeze(operated_at) { employee.reopen } }
+
+      # Self, terminated at Aug on 2020-10-03
+      shared_context "terminated" do
+        let(:employee) { super().tap { |e| Timecop.freeze("2020/10/03") { e.terminate(termination_time: _08_01) } } }
+      end
+
+      context "with a seam" do
+        include_context "a seam"
+
+        context "when the termination merged it" do
+          include_context "terminated"
+
+          it "lifts the end, keeping the merged row" do
+            reopen
+
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", an_inserted_row],
+            ]
+          end
+
+          it_behaves_like "writing no row it closes again"
+        end
+
+        context "when it isn't terminated" do
+          it "merges it" do
+            expect(reopen).to be true
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", an_inserted_row],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "writing no row it closes again"
+        end
+      end
+
+      context "with a zero-length row" do
+        # Recorded after the termination, at the end of the timeline:
+        #   A |Feb, Mar)  B |Mar, Jul)  C |Jul, Aug)  Q |Aug, Aug)
+        context "when it ends a terminated timeline" do
+          let!(:employee_id) {
+            create_employee.tap { |id|
+              Timecop.freeze("2020/10/01 12:00") { Employee.find_at_time(_02_01, id).terminate(termination_time: _08_01) }
+              insert_zero_length_row(id, _08_01)
+            }
+          }
+          let(:zero_length_closed_at) { operated_at }
+
+          it "continues the last segment that holds a time, keeping the rows it doesn't change" do
+            reopen
+
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", an_inserted_row],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+          it_behaves_like "writing no row it closes again"
+        end
+
+        context "when it isn't terminated" do
+          include_context "a zero-length row"
+
+          it "keeps every other row" do
+            expect(reopen).to be true
+            expect(rows(employee)).to eq [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", row_id(_07_01, infinity)],
+            ]
+          end
+
+          it_behaves_like "closing the zero-length row"
+        end
+      end
+
+      context "with neither" do
+        include_context "a normalized timeline"
+
+        context "when it's terminated" do
+          include_context "terminated"
+
+          it "rewrites only the last segment" do
+            reopen
+
+            expect(rows(employee)).to match [
+              [_02_01, _03_01, "A", row_id(_02_01, _03_01)],
+              [_03_01, _07_01, "B", row_id(_03_01, _07_01)],
+              [_07_01, infinity, "C", an_inserted_row],
+            ]
+            expect(all_rows(Employee, employee_id).where(transaction_to: operated_at).pluck(:valid_from, :valid_to, :name)).to eq [
+              [_07_01, _08_01, "C"],
+            ]
+            expect(all_rows(Employee, employee_id).where(transaction_from: operated_at).pluck(:valid_from, :valid_to, :name)).to eq [
+              [_07_01, infinity, "C"],
+            ]
+          end
+        end
+
+        context "when it isn't terminated" do
+          it_behaves_like "a call that changes nothing"
+        end
+      end
+    end
+
     # The predicates read the timeline the operations act on, so they look past zero-length rows too
     describe "#shifted_genesis?" do
       context "with a zero-length row before the genesis" do
@@ -1219,6 +1373,7 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
         "cancel_shift_genesis" => :cancel_shift_genesis.to_proc,
         "terminate" => ->(e) { e.terminate(termination_time: "2020/03/01".in_time_zone) },
         "cancel_termination" => :cancel_termination.to_proc,
+        "reopen" => :reopen.to_proc,
       }.each do |name, operation|
         it "#{name} finds no version and writes nothing" do
           history_before = history
@@ -1520,6 +1675,21 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
 
           expect(inserted).to eq [[_02_01, _03_01, "A"]]
           expect(closed).to eq [[_01_01, _03_01, "A"]]
+          expect(callbacks).to eq [*insert_callbacks, *commit_callbacks]
+        end
+      end
+
+      describe "#reopen" do
+        subject(:reopen) { Timecop.freeze(operated_at) { employee.reopen } }
+
+        # Terminated at May on 2020-10-03, through Employee
+        before { Timecop.freeze("2020/10/03") { Employee.find_at_time(_02_01, employee_id).terminate(termination_time: _05_01) } }
+
+        it "runs the save and create callbacks for the row it inserts, and the commit callbacks once" do
+          reopen
+
+          expect(inserted).to eq [[_03_01, infinity, "B"]]
+          expect(closed).to eq [[_03_01, _05_01, "B"]]
           expect(callbacks).to eq [*insert_callbacks, *commit_callbacks]
         end
       end
@@ -2183,6 +2353,22 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
         it_behaves_like "in or out of the caller's blocks", "restoring the current timeline"
       end
 
+      describe "#reopen" do
+        subject(:reopen) { Timecop.freeze("2020/10/05") { in_callers_block { employee.reopen } } }
+
+        before { Timecop.freeze("2020/10/04") { employee.terminate(termination_time: _04_01) } }
+
+        shared_examples "continuing the current timeline" do
+          it "continues the current timeline's last segment" do
+            reopen
+
+            expect(timeline(employee_id)).to eq [[_02_01, _03_01, "A"], [_03_01, infinity, "B2"]]
+          end
+        end
+
+        it_behaves_like "in or out of the caller's blocks", "continuing the current timeline"
+      end
+
       describe "#terminated?" do
         subject(:terminated) { in_callers_block { employee.terminated? } }
 
@@ -2464,6 +2650,49 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
         it_behaves_like "with a default scope or in a scoping block", "restoring the hidden genesis"
       end
 
+      describe "#reopen" do
+        subject(:reopen) { Timecop.freeze("2020/10/06") { in_callers_block { employee.reopen } } }
+
+        # Ends the timeline in the hidden row C
+        context "after a termination" do
+          before { Timecop.freeze("2020/10/04") { Employee.find_at_time(_03_01, employee_id).terminate(termination_time: _06_01) } }
+
+          shared_examples "continuing the hidden row" do
+            it "continues the whole timeline's last segment" do
+              reopen
+
+              expect(timeline(employee_id, :archived_at)).to eq recorded_timeline
+            end
+          end
+
+          it_behaves_like "with a default scope or in a scoping block", "continuing the hidden row"
+        end
+
+        context "when a hidden row was re-recorded since the termination" do
+          before do
+            Timecop.freeze("2020/10/04") { Employee.find_at_time(_03_01, employee_id).terminate(termination_time: _06_01) }
+            Timecop.freeze("2020/10/05") do
+              c = Employee.find_at_time(_05_01, employee_id)
+              c.force_update { c.update!(name: "C2") }
+            end
+          end
+
+          shared_examples "continuing the re-recorded row" do
+            it "continues the re-recorded row" do
+              reopen
+
+              expect(timeline(employee_id, :archived_at)).to eq [
+                [_02_01, _03_01, "A", archived_at],
+                [_03_01, _05_01, "B", nil],
+                [_05_01, infinity, "C2", archived_at],
+              ]
+            end
+          end
+
+          it_behaves_like "with a default scope or in a scoping block", "continuing the re-recorded row"
+        end
+      end
+
       describe "#terminated?" do
         subject(:terminated) { in_callers_block { employee.terminated? } }
 
@@ -2564,18 +2793,19 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
       end
     end
 
-    context "when a host whose clock runs ahead recorded the operation a cancel undoes" do
+    context "when a host whose clock runs ahead recorded the operation a cancel undoes or reopen lifts" do
       {
         "cancel_termination" => [->(e) { e.terminate(termination_time: "2020/06/01".in_time_zone) }, :cancel_termination.to_proc],
         "cancel_shift_genesis" => [->(e) { e.shift_genesis(new_valid_from: "2020/03/01".in_time_zone) }, :cancel_shift_genesis.to_proc],
-      }.each do |name, (undone, cancel)|
+        "reopen" => [->(e) { e.terminate(termination_time: "2020/06/01".in_time_zone) }, :reopen.to_proc],
+      }.each do |name, (undone, operation)|
         it "#{name} raises before it writes" do
           Timecop.freeze(ahead) { undone.call(Employee.find_at_time(_05_01, employee_id)) }
           recorded = history
           before_operation = employee.attributes
 
           expect {
-            Timecop.freeze(now) { cancel.call(employee) }
+            Timecop.freeze(now) { operation.call(employee) }
           }.to raise_error(ActiveRecord::Bitemporal::TransactionTimeSkewError, message)
           expect(history).to eq recorded
           expect(employee.attributes).to eq before_operation
@@ -2653,6 +2883,7 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
         "cancel_shift_genesis" => [->(e) { e.shift_genesis(new_valid_from: "2020/02/01".in_time_zone) }, :cancel_shift_genesis.to_proc],
         "terminate" => [nil, ->(e) { e.terminate(termination_time: "2020/03/01".in_time_zone) }],
         "cancel_termination" => [->(e) { e.terminate(termination_time: "2020/03/01".in_time_zone) }, :cancel_termination.to_proc],
+        "reopen" => [->(e) { e.terminate(termination_time: "2020/03/01".in_time_zone) }, :reopen.to_proc],
       }.each do |name, (setup, operation)|
         it "#{name} takes the advisory lock, then save!'s lock on the row valid now, then row-locks the timeline, before it writes" do
           Timecop.freeze("2020/10/02") { setup&.call(employee) }
