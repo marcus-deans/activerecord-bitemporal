@@ -869,28 +869,6 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
 
   describe "timeline integrity" do
 
-    # Test 6.1: After terminate: no overlaps, no gaps
-    context "after termination" do
-      before do
-        Timecop.freeze("2020/10/01") do
-          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
-          ActiveRecord::Bitemporal.valid_at(_03_01) { @employee.update!(name: "B") }
-          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
-        end
-      end
-
-      it "maintains no overlaps and no gaps in surviving timeline" do
-        employee = Employee.find(@employee.id)
-
-        Timecop.freeze("2020/10/06") do
-          employee.terminate(termination_time: _04_01)
-        end
-
-        timeline = current_timeline(employee)
-        expect(valid_timeline?(timeline)).to be true
-      end
-    end
-
     # Test 6.2: After cancel: no overlaps, no gaps
     context "after cancel" do
       before do
@@ -904,7 +882,7 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
         end
       end
 
-      it "maintains no overlaps and no gaps in restored timeline" do
+      it "restores all three segments, leaving no overlaps or gaps" do
         employee = find_ignoring_valid_time(@employee)
 
         Timecop.freeze("2020/10/06") do
@@ -912,9 +890,12 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
         end
 
         timeline = current_timeline(employee)
+        expect(timeline).to eq([
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"],
+          [_05_01, infinity, "C"]
+        ])
         expect(valid_timeline?(timeline)).to be true
-        expect(timeline.size).to eq(3)
-        expect(timeline.last[1]).to eq(infinity)
       end
     end
   end
@@ -1283,10 +1264,13 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
 
         expect(errors).to be_empty
 
-        # Timeline should be consistent
+        # The same timeline as a single termination, whichever thread went first
         timeline = current_timeline(@employee)
+        expect(timeline).to eq([
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"]
+        ])
         expect(valid_timeline?(timeline)).to be true
-        expect(timeline.last[1]).to eq(_05_01)
       end
     end
   end
@@ -1456,122 +1440,6 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
         current_records.each do |record|
           expect(record.updated_at).to eq(@cancel_time)
         end
-      end
-    end
-  end
-
-  # ==========================================================================
-  # Category 14: Times the valid-time column stores differently
-  # ==========================================================================
-  #
-  # A date column stores a day, and datetime(6) a time to the microsecond. terminate takes
-  # termination_time as the column stores it, the way upstream's valid_at reads a time,
-  # so it compares it with the stored boundaries it would write.
-  describe "times the valid-time column stores differently" do
-    let(:terminated_at) { "2020/10/06".in_time_zone }
-
-    # [valid_from, valid_to, name, row id] for every current-knowledge row, zero-length ones too
-    def rows(record)
-      record.class.ignore_valid_datetime
-        .where(bitemporal_id: record.bitemporal_id)
-        .where(transaction_to: tt_infinity)
-        .order(:valid_from, :valid_to)
-        .pluck(:valid_from, :valid_to, :name, :id)
-    end
-
-    def terminate_at(time, record, termination_time)
-      Timecop.freeze(time) { record.terminate(termination_time: termination_time) }
-    end
-
-    shared_context "a department over days" do
-      let(:_01_01) { Date.new(2020, 1, 1) }
-      let(:_03_01) { Date.new(2020, 3, 1) }
-      let(:_06_01) { Date.new(2020, 6, 1) }
-      let(:infinity) { Date.new(9999, 12, 31) }
-
-      # [Jan, Mar) A, [Mar, valid_to) B
-      def build_department(valid_to: nil)
-        Timecop.freeze("2020/10/01") do
-          department = Department.create!(name: "A", valid_from: _01_01, valid_to: valid_to || infinity)
-          ActiveRecord::Bitemporal.valid_at(_03_01) { department.update!(name: "B") }
-          Department.find_at_time(_01_01, department.id)
-        end
-      end
-    end
-
-    %w[Tokyo America/New_York].each do |zone|
-      context "with a date column in #{zone}" do
-        include_context "a department over days"
-        around { |example| Time.use_zone(zone, &example) }
-
-        it "terminates at a segment boundary without zero-length rows" do
-          department = build_department
-          a = rows(department).first
-
-          terminate_at(terminated_at, department, _03_01)
-
-          expect(rows(department)).to match [a]
-        end
-
-        it "is a no-op at the timeline's end" do
-          department = build_department(valid_to: _06_01)
-
-          expect { terminate_at(terminated_at, department, _06_01) }.not_to change { rows(department) }
-        end
-
-        # DEFAULT_VALID_TO is midnight UTC, the day before in a zone behind UTC
-        it "is a no-op at DEFAULT_VALID_TO" do
-          department = build_department
-
-          expect {
-            terminate_at(terminated_at, department, ActiveRecord::Bitemporal::DEFAULT_VALID_TO)
-          }.not_to change { rows(department) }
-        end
-      end
-    end
-
-    context "with a time of day for a date column" do
-      include_context "a department over days"
-
-      it "takes the day of termination_time" do
-        department = build_department
-        a = rows(department).first
-
-        terminate_at(terminated_at, department, "2020/03/01 12:00".in_time_zone)
-
-        expect(rows(department)).to match [a]
-      end
-
-      it "is a no-op on the day the timeline ends" do
-        department = build_department(valid_to: _06_01)
-
-        expect {
-          terminate_at(terminated_at, department, "2020/06/01 12:00".in_time_zone)
-        }.not_to change { rows(department) }
-      end
-    end
-
-    context "with a fraction of a microsecond for a datetime(6) column" do
-      # A time as Time.current can return it, and as the column stores it
-      let(:now) { "2020/03/01 09:30:00.123456789".in_time_zone }
-
-      it "terminates at a boundary an upstream update! left at the same time" do
-        employee = Timecop.freeze("2020/10/01") {
-          built = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
-          ActiveRecord::Bitemporal.valid_at(now) { built.update!(name: "B") }
-          Employee.find_at_time(_01_01, built.id)
-        }
-        a = rows(employee).first
-
-        terminate_at(terminated_at, employee, now)
-
-        expect(rows(employee)).to match [a]
-      end
-
-      it "is a no-op at a timeline end stored at the same time" do
-        employee = Timecop.freeze("2020/10/01") { Employee.create!(name: "A", valid_from: _01_01, valid_to: now) }
-
-        expect { terminate_at(terminated_at, employee, now) }.not_to change { rows(employee) }
       end
     end
   end

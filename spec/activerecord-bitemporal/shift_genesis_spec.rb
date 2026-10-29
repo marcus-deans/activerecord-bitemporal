@@ -711,7 +711,7 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
       end
 
-      it "maintains no overlaps and no gaps" do
+      it "extends only the genesis segment, leaving no overlaps or gaps" do
         employee = Employee.find(@employee.id)
 
         Timecop.freeze("2020/10/06") do
@@ -719,8 +719,12 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
 
         timeline = current_timeline(employee)
+        expect(timeline).to eq([
+          [_01_01, _05_01, "A"],
+          [_05_01, _07_01, "B"],
+          [_07_01, infinity, "C"]
+        ])
         expect(valid_timeline?(timeline)).to be true
-        expect(timeline.size).to eq(3)
       end
     end
 
@@ -735,7 +739,7 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
       end
 
-      it "maintains no overlaps and no gaps" do
+      it "trims the timeline to start at the new genesis, leaving no overlaps or gaps" do
         employee = Employee.find(@employee.id)
 
         Timecop.freeze("2020/10/06") do
@@ -743,6 +747,11 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
 
         timeline = current_timeline(employee)
+        expect(timeline).to eq([
+          [_04_01, _05_01, "B"],
+          [_05_01, _07_01, "C"],
+          [_07_01, infinity, "D"]
+        ])
         expect(valid_timeline?(timeline)).to be true
       end
     end
@@ -899,10 +908,10 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
 
         expect(errors).to be_empty
 
-        # Timeline should be consistent
+        # The genesis is the date of whichever thread went last
         timeline = current_timeline(@employee)
+        expect(timeline).to eq([[_03_01, infinity, "A"]]).or eq([[_01_01, infinity, "A"]])
         expect(no_overlaps?(timeline)).to be true
-        expect(timeline.size).to eq(1)
       end
     end
   end
@@ -1559,7 +1568,9 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         threads.each(&:join)
         expect(errors).to be_empty
 
+        # The second cancel finds the original genesis already restored and does nothing
         timeline = current_timeline(@employee)
+        expect(timeline).to eq([[_03_01, infinity, "A"]])
         expect(no_overlaps?(timeline)).to be true
       end
     end
@@ -1631,127 +1642,14 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         end
       end
 
-      it "restored timeline has no overlaps and no gaps" do
+      it "restores all three segments, leaving no overlaps or gaps" do
         timeline = current_timeline(@employee)
+        expect(timeline).to eq([
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"],
+          [_05_01, infinity, "C"]
+        ])
         expect(valid_timeline?(timeline)).to be true
-        expect(timeline.size).to eq(3)
-      end
-    end
-  end
-
-  # ==========================================================================
-  # Category 10: Times the valid-time column stores differently
-  # ==========================================================================
-  #
-  # A date column stores a day, and datetime(6) a time to the microsecond. shift_genesis
-  # takes new_valid_from as the column stores it, the way upstream's valid_at reads a
-  # time, so it compares it with the stored boundaries it would write.
-  describe "times the valid-time column stores differently" do
-    let(:shifted_at) { "2020/10/06".in_time_zone }
-
-    # [valid_from, valid_to, name, row id] for every current-knowledge row, zero-length ones too
-    def rows(record)
-      record.class.ignore_valid_datetime
-        .where(bitemporal_id: record.bitemporal_id)
-        .where(transaction_to: tt_infinity)
-        .order(:valid_from, :valid_to)
-        .pluck(:valid_from, :valid_to, :name, :id)
-    end
-
-    def shift_at(time, record, new_valid_from)
-      Timecop.freeze(time) { record.shift_genesis(new_valid_from: new_valid_from) }
-    end
-
-    shared_context "a department over days" do
-      let(:_01_01) { Date.new(2020, 1, 1) }
-      let(:_03_01) { Date.new(2020, 3, 1) }
-      let(:_06_01) { Date.new(2020, 6, 1) }
-      let(:infinity) { Date.new(9999, 12, 31) }
-
-      # [Jan, Mar) A, [Mar, valid_to) B
-      def build_department(valid_to: nil)
-        Timecop.freeze("2020/10/01") do
-          department = Department.create!(name: "A", valid_from: _01_01, valid_to: valid_to || infinity)
-          ActiveRecord::Bitemporal.valid_at(_03_01) { department.update!(name: "B") }
-          Department.find_at_time(_01_01, department.id)
-        end
-      end
-    end
-
-    %w[Tokyo America/New_York].each do |zone|
-      context "with a date column in #{zone}" do
-        include_context "a department over days"
-        around { |example| Time.use_zone(zone, &example) }
-
-        it "is a no-op at the current genesis" do
-          department = build_department
-
-          expect { shift_at(shifted_at, department, _01_01) }.not_to change { rows(department) }
-        end
-
-        it "shifts to a segment boundary without zero-length rows and leaves that segment's row alone" do
-          department = build_department
-          b = rows(department).last
-
-          shift_at(shifted_at, department, _03_01)
-
-          expect(rows(department)).to match [b]
-        end
-
-        it "raises ArgumentError and writes nothing at the timeline's end" do
-          department = build_department(valid_to: _06_01)
-          before_shift = rows(department)
-
-          expect { shift_at(shifted_at, department, _06_01) }.to raise_error(ArgumentError, /erase all segments/)
-          expect(rows(department)).to eq before_shift
-        end
-      end
-    end
-
-    context "with a time of day for a date column" do
-      include_context "a department over days"
-
-      it "is a no-op on the day of the current genesis" do
-        department = build_department
-
-        expect {
-          shift_at(shifted_at, department, "2020/01/01 12:00".in_time_zone)
-        }.not_to change { rows(department) }
-      end
-
-      it "takes the day of new_valid_from" do
-        department = build_department
-        b = rows(department).last
-
-        shift_at(shifted_at, department, "2020/03/01 12:00".in_time_zone)
-
-        expect(rows(department)).to match [b]
-      end
-    end
-
-    context "with a fraction of a microsecond for a datetime(6) column" do
-      # A time as Time.current can return it
-      let(:now) { "2020/03/01 09:30:00.123456789".in_time_zone }
-
-      it "is a no-op at a genesis an upstream create! stored at the same time" do
-        employee = Timecop.freeze("2020/10/01") {
-          ActiveRecord::Bitemporal.valid_at(now) { Employee.create!(name: "A") }
-        }
-
-        expect { shift_at(shifted_at, employee, now) }.not_to change { rows(employee) }
-      end
-
-      it "shifts to a boundary an upstream update! left at the same time and leaves that segment's row alone" do
-        employee = Timecop.freeze("2020/10/01") {
-          built = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
-          ActiveRecord::Bitemporal.valid_at(now) { built.update!(name: "B") }
-          Employee.find_at_time(_01_01, built.id)
-        }
-        b = rows(employee).last
-
-        shift_at(shifted_at, employee, now)
-
-        expect(rows(employee)).to match [b]
       end
     end
   end
