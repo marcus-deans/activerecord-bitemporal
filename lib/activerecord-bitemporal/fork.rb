@@ -20,6 +20,11 @@ module ActiveRecord
     class RecordedSinceTerminationError < PreTerminationStateNotFoundError; end
 
     class RecordedSinceGenesisShiftError < PreShiftGenesisStateNotFoundError; end
+
+    # A timeline operation refuses when a current row was recorded after its own current
+    # time, as a host whose clock runs ahead records one: closing that row would set its
+    # transaction_to before its transaction_from.
+    class TransactionTimeSkewError < BitemporalError; end
   end
 end
 

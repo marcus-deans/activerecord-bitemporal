@@ -404,7 +404,7 @@ cancel_termination → pre-termination timeline found at change point t1
 
 Compared as given, such a time disagreed with the boundary it matched: a Date outside UTC is midnight in `Time.zone`, not the stored day, and `Time.current` can carry nanoseconds that a `datetime(6)` boundary written from it lost. Operations then cut zero-length rows, rewrote rows they left unchanged, or raised at the timeline's end. A `correct` span that is empty once cast (both ends on the same day of a date column) raises `ArgumentError`, as any empty span does.
 
-Transaction times need no cast: an operation writes its one `Time.current` to every row it closes or inserts, and never compares it with a stored one.
+Transaction times need no cast: an operation writes its one `Time.current` to every row it closes or inserts, and compares it with a stored one only to refuse a current row recorded after it (see Timeline After an Operation). A stored time is cut to the column's precision, never rounded up, so a row recorded at or before that time never reads as later than it, and a row that does would end before it starts once closed.
 
 ---
 
@@ -412,7 +412,7 @@ Transaction times need no cast: an operation writes its one `Time.current` to ev
 
 Every timeline operation (`correct`, `shift_genesis`, `terminate` and the two cancels) leaves the entity's current timeline with no seam (two adjacent segments with equal business attributes, as an upstream `update!` that sets the values the next segment already has leaves) and no zero-length row (`valid_from = valid_to`, as an upstream `destroy` at a segment's exact start leaves), whatever it found there. The shared skeleton, `perform_timeline_operation`, does this for all five:
 
-1. FETCH every current-knowledge row once the locks are held, and set the zero-length rows aside. The operation's guards and builders see only segments that hold a time: a zero-length row is never the genesis, the last segment or part of a patch, and an entity whose only current rows are zero-length raises `RecordNotFound`.
+1. FETCH every current-knowledge row once the locks are held, and set the zero-length rows aside. The operation's guards and builders see only segments that hold a time: a zero-length row is never the genesis, the last segment or part of a patch, and an entity whose only current rows are zero-length raises `RecordNotFound`. Every read of the entity's rows, this one, the cancels' history walks, `terminated?` and `shifted_genesis?` included, starts from `unscoped`, so neither a caller's `transaction_at`, `valid_at` or `bitemporal_at` block, a `scoping` block nor the model's own `default_scope` hides a row: the operation works on the timeline as it is now, as upstream's writes record at now. An STI subclass still reads only its own type. A current row whose `transaction_from` is after the operation's time, as a host whose clock runs ahead records one, raises `TransactionTimeSkewError` before anything else: closing it would set its `transaction_to` before its `transaction_from`.
 2. BUILD (op-specific): the segments the operation replaces, and the pieces it adds. A no-op exit replaces nothing.
 3. NORMALIZE the result (segments - replaced + pieces): drop zero-length pieces, order by valid time, and merge equal neighbours (only stored columns count, not virtual attributes). A stored segment is never extended in place: it's closed and replaced by the merged piece.
 4. DIFF it against every current row, zero-length rows included:
@@ -555,7 +555,7 @@ Position.where(bitemporal_id: x)     # Works ✓
 
 ### Default Scope Implementation
 
-The gem does NOT use Rails' `default_scope`. Instead, it hooks into query building:
+The time filters are a Rails `default_scope` (`bitemporal_default_scope`, unless the model is bitemporalized with `enable_default_scope: false`), so `unscoped` drops them along with any other default scope. A relation builds its query under its own bitemporal options merged into the global ones (those a `valid_at` or `transaction_at` block sets):
 
 ```ruby
 def build_arel(*)
@@ -621,7 +621,7 @@ WHERE valid_from <= ? AND valid_to > ?
 
 ### Locking Strategy
 
-Upstream's `save` and `save!` lock the row valid now (through the default scope) before they write:
+Upstream's `save` and `save!` lock the row valid now (through the default scope; inside a `valid_at` or `transaction_at` block, the row that block's times select) before they write:
 
 ```ruby
 self.class.where(bitemporal_id: self.id).lock!.pluck(:id) if self.id
@@ -632,8 +632,8 @@ They then close the row valid at the record's own time, which for a future-dated
 The timeline operations (`lock_timeline!`, PostgreSQL only) take three locks, in this order, before they read the timeline:
 
 1. **Advisory lock**: `pg_advisory_xact_lock(hashtext(<table_name>), hashtext(<bitemporal_id as text>))`, held until the transaction ends. The key is a public contract: a caller holding it in the same transaction and the operations wait for each other, and an operation called while holding it re-enters it. Unlike a row lock, it holds even when the entity has no row valid now.
-2. **Row valid now**: upstream's statement above. Every upstream save locks that row before any other, so an operation holding it makes the save wait while holding nothing. Locking another row first could deadlock with a future-dated save that holds the row valid now and waits for that other row.
-3. **Every current-knowledge row**: `FOR UPDATE` with `ignore_valid_datetime` and `transaction_to = ∞`, so an upstream write already in flight on any of them commits before the operation reads the timeline.
+2. **Row valid now**: upstream's statement above, as it reads outside any block. The operation builds it from `unscoped` with the default scope's four time conditions at `Time.current`, so it's the same statement whatever block or scope the caller is in. Every upstream save outside a block locks that row before any other, so an operation holding it makes the save wait while holding nothing. Locking another row first could deadlock with a future-dated save that holds the row valid now and waits for that other row.
+3. **Every current-knowledge row**: `FOR UPDATE` on the `unscoped` rows with `transaction_to = ∞`, so an upstream write already in flight on any of them commits before the operation reads the timeline, whatever the caller's scopes hide.
 
 **Not covered**: a `save` on an entity with no row valid now locks no row first, and `destroy` reads before it locks. Either can read the timeline before an operation commits and write after it. Callers serialize such writes by holding the same advisory lock, taken before the transaction's first write to the entity.
 
@@ -687,7 +687,7 @@ Position.create(name: "Full-time", valid_from: 'Mar-1', valid_to: 'Dec-31')
 
 ### Rewriting Transaction History
 
-`transaction_at` sets the context for queries, not for writes. You cannot insert records with `transaction_from` in the past.
+`transaction_at` sets the context for queries, not for writes. You cannot insert records with `transaction_from` in the past. The timeline operations ignore it for their reads too: they read and rewrite the timeline as it is now.
 
 ### Bulk Historical Rewrites
 
