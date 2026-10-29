@@ -44,6 +44,13 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
       .order(:transaction_from, :valid_from)
   end
 
+  # Every row of the entity, each with its own key and every column
+  def history(record)
+    all_records(record)
+      .map { |row| row.attributes.merge("swapped_id" => row.swapped_id) }
+      .sort_by { |row| row["swapped_id"] }
+  end
+
   # Timeline invariant helpers
   def no_overlaps?(timeline)
     return true if timeline.size <= 1
@@ -1326,13 +1333,6 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
 
       subject(:cancel) { Timecop.freeze("2020/10/06") { employee.cancel_shift_genesis } }
 
-      # Every row of the entity, each with its own key and every column
-      def history(record)
-        all_records(record)
-          .map { |row| row.attributes.merge("swapped_id" => row.swapped_id) }
-          .sort_by { |row| row["swapped_id"] }
-      end
-
       # Each write below happens on 10/03, between the shift and the cancel
       def record_after_shift(&block)
         Timecop.freeze("2020/10/03") { block.call(Employee.find_at_time(_02_01, employee_id)) }
@@ -1472,6 +1472,108 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
             [_01_01, _03_01, "A"],
             [_03_01, infinity, "B"],
           ]
+        end
+      end
+    end
+
+    # A cancel restores the most recent timeline at the original genesis, as it stood just
+    # before the genesis moved off it, as cancel_termination restores the most recent
+    # unterminated one. A second shift is recorded after that, so the cancel refuses. Once the
+    # genesis is the original one again, there's nothing to cancel.
+    describe "the timeline it restores" do
+      let(:_2019_12_01) { "2019/12/01".in_time_zone }
+
+      #   A |Jan, Mar)  B |Mar, May)  C |May, ∞)   genesis Jan, recorded on 2020-10-01
+      let!(:employee_id) {
+        Timecop.freeze("2020/10/01") {
+          employee = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_03_01) { employee.update!(name: "B") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { employee.update!(name: "C") }
+          employee.id
+        }
+      }
+      let(:employee) { Employee.find_at_time(_05_01, employee_id) }
+      let(:original_timeline) { [[_01_01, _03_01, "A"], [_03_01, _05_01, "B"], [_05_01, infinity, "C"]] }
+
+      subject(:cancel) { Timecop.freeze("2020/10/06") { employee.cancel_shift_genesis } }
+
+      def shift_genesis_on(day, new_valid_from)
+        Timecop.freeze(day) { Employee.find_at_time(_05_01, employee_id).shift_genesis(new_valid_from: new_valid_from) }
+      end
+
+      context "after one shift" do
+        before { shift_genesis_on("2020/10/02", _04_01) }
+
+        it "restores the original timeline" do
+          expect(cancel).to be true
+          expect(current_timeline(employee)).to eq original_timeline
+        end
+
+        it "leaves nothing for a second cancel to write" do
+          cancel
+          history_before = history(employee)
+
+          expect(Timecop.freeze("2020/10/07") { employee.cancel_shift_genesis }).to be true
+          expect(history(employee)).to eq history_before
+          expect(current_timeline(employee)).to eq original_timeline
+        end
+      end
+
+      context "after a backward shift" do
+        before { shift_genesis_on("2020/10/02", _2019_12_01) }
+
+        it "restores the original timeline, without the extension" do
+          expect(current_timeline(employee).first).to eq [_2019_12_01, _03_01, "A"]
+
+          expect(cancel).to be true
+          expect(current_timeline(employee)).to eq original_timeline
+        end
+      end
+
+      context "after two shifts" do
+        before {
+          shift_genesis_on("2020/10/02", _02_01)
+          shift_genesis_on("2020/10/03", _04_01)
+        }
+
+        # The timeline at the original genesis ended with the first shift, and the second was
+        # recorded after it
+        it "refuses and writes nothing" do
+          history_before = history(employee)
+
+          expect { cancel }.to raise_error(ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError)
+          expect(history(employee)).to eq history_before
+          expect(current_timeline(employee)).to eq [[_04_01, _05_01, "B"], [_05_01, infinity, "C"]]
+        end
+      end
+
+      context "after a shift, its cancel and a second shift" do
+        before {
+          shift_genesis_on("2020/10/02", _02_01)
+          Timecop.freeze("2020/10/03") { Employee.find_at_time(_05_01, employee_id).cancel_shift_genesis }
+          shift_genesis_on("2020/10/04", _04_01)
+        }
+
+        it "restores the original timeline" do
+          expect(cancel).to be true
+          expect(current_timeline(employee)).to eq original_timeline
+        end
+      end
+
+      # The backward shift extends B, the first segment left, back to Jan: A doesn't come back
+      context "after a forward shift and a backward shift to the original genesis" do
+        before {
+          shift_genesis_on("2020/10/02", _04_01)
+          shift_genesis_on("2020/10/03", _01_01)
+        }
+
+        it "finds the genesis not shifted and writes nothing" do
+          history_before = history(employee)
+
+          expect(employee.shifted_genesis?).to be false
+          expect(cancel).to be true
+          expect(history(employee)).to eq history_before
+          expect(current_timeline(employee)).to eq [[_01_01, _05_01, "B"], [_05_01, infinity, "C"]]
         end
       end
     end

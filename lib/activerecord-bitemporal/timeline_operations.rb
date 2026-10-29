@@ -136,24 +136,26 @@ module ActiveRecord
 
       # Cancel Shift Genesis: Full reversal via transaction history
       #
-      # Restores the complete pre-shift timeline by searching backward through
-      # transaction history. Recovers ALL segments removed during a forward shift.
+      # Restores the complete timeline at the original genesis by searching backward
+      # through transaction history. Recovers ALL segments removed during a forward shift.
       #
-      # IMPORTANT: This is an undo — it restores the timeline as it stood just
-      # before the most recent genesis change. If anything was recorded for the
-      # entity after that change (a correct, an update!, a terminate, ...), it
-      # refuses instead of discarding that: it raises RecordedSinceGenesisShiftError
-      # and writes nothing.
+      # IMPORTANT: This is an undo — it restores the most recent timeline that started
+      # at the original genesis, as it stood just before the genesis moved off it, as
+      # cancel_termination restores the most recent unterminated one. If anything was
+      # recorded for the entity after that move (a correct, an update!, a terminate,
+      # another shift_genesis, ...), it refuses instead of discarding that: it raises
+      # RecordedSinceGenesisShiftError and writes nothing. So after two shifts it
+      # refuses, and a second cancel finds nothing to cancel.
       #
-      # Segments it restores unchanged keep their current rows. No-op if the genesis has never
-      # been shifted (matches original creation), writing only to merge seams or close
-      # zero-length rows left in the timeline.
+      # Segments it restores unchanged keep their current rows. No-op if the genesis is the
+      # original one (never shifted, shifted back, or already canceled), writing only to merge
+      # seams or close zero-length rows left in the timeline.
       #
       # @raise [ActiveRecord::RecordNotFound] if no current-knowledge records exist
       # @raise [ActiveRecord::Bitemporal::PreShiftGenesisStateNotFoundError] if
-      #   transaction history cannot determine the pre-shift state
+      #   transaction history holds no timeline at the original genesis
       # @raise [ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError] if changes were
-      #   recorded after the genesis change (a PreShiftGenesisStateNotFoundError)
+      #   recorded after the genesis moved off the original (a PreShiftGenesisStateNotFoundError)
       # @return [Boolean] true if successful
       def cancel_shift_genesis
         _cancel_shift_genesis_record
@@ -767,8 +769,8 @@ module ActiveRecord
       # Algorithm mirrors _cancel_termination_record (perform_timeline_operation does
       # the lock, fetch, normalize, close, insert, validate and reloading self):
       # 1. Guard existence → 2. No-op if genesis matches original →
-      # 3. Find pre-shift state → 4. Refuse if anything was recorded since →
-      # 5. Replace current with pre-shift
+      # 3. Find the most recent timeline at the original genesis → 4. Refuse if anything
+      # was recorded since → 5. Replace current with it
       def _cancel_shift_genesis_record
         perform_timeline_operation do |segments, current_time|
           # 1. Guard: entity must exist
@@ -785,15 +787,16 @@ module ActiveRecord
           original_genesis = find_original_genesis
           next [[], []] if current_genesis == original_genesis
 
-          # 3. Find pre-shift state via transaction history
-          pre_shift_state, shifted_at = find_pre_shift_genesis_state(current_genesis)
+          # 3. Find the timeline at the original genesis via transaction history
+          pre_shift_state, shifted_at = find_pre_shift_genesis_state(original_genesis)
           if pre_shift_state.nil?
             raise PreShiftGenesisStateNotFoundError,
               "Cannot determine pre-shift genesis state for #{self.class} " \
               "with bitemporal_id=#{bitemporal_id}"
           end
 
-          # 4. Guard: restoring that state would discard anything recorded after the shift
+          # 4. Guard: restoring that state would discard anything recorded after the genesis
+          #    moved off it, a later shift included
           if recorded_since?(shifted_at)
             raise RecordedSinceGenesisShiftError,
               "Changes were recorded for #{self.class} with bitemporal_id=#{bitemporal_id} " \
@@ -831,8 +834,9 @@ module ActiveRecord
           .pick(valid_from_key)
       end
 
-      # Find the pre-shift state: the most recent complete timeline snapshot where
-      # the genesis (first segment's valid_from) differs from current_genesis.
+      # Find the pre-shift state: the most recent complete timeline snapshot whose genesis
+      # (first segment's valid_from) is the original genesis, as find_pre_termination_state
+      # finds the most recent one with an infinite end.
       #
       # == How it works (transaction history search)
       #
@@ -841,30 +845,31 @@ module ActiveRecord
       # — transaction_to values where the timeline was rewritten.
       #
       # We walk backward through change points, reconstructing the timeline that
-      # was active just before each change, until we find one with a different
-      # genesis:
+      # was active just before each change, until we find one at the original
+      # genesis. A timeline an earlier shift left at another genesis is passed over:
       #
       #   Transaction time →
-      #   ┌─────────────────────────────────────────────────────┐
-      #   │ t1: CREATE    |---A---|---B---|---C--->∞             │ genesis = Jan 1
-      #   │               └──────────────────────┘              │
-      #   │ t2: SHIFT →   closed at t2                          │
-      #   │               |---B---|---C--->∞                    │ genesis = Mar 1
-      #   │               └──────────────┘                      │
-      #   │                                                     │
-      #   │ Walking backward from t2:                           │
-      #   │   change_point = t2 → reconstruct t1 state          │
-      #   │   t1 genesis = Jan 1 ≠ current (Mar 1) → FOUND! ✅  │
-      #   └─────────────────────────────────────────────────────┘
+      #   ┌───────────────────────────────────────────────────────────┐
+      #   │ t1: CREATE    |---A---|---B---|---C--->∞                  │ genesis = Jan (original)
+      #   │ t2: SHIFT →       |-A-|---B---|---C--->∞                  │ genesis = Feb
+      #   │ t3: SHIFT →           |---B---|---C--->∞                  │ genesis = Mar
+      #   │                                                           │
+      #   │ Walking backward from t3:                                 │
+      #   │   change_point = t3 → t2 state: genesis Feb, passed over  │
+      #   │   change_point = t2 → t1 state: genesis Jan → FOUND       │
+      #   └───────────────────────────────────────────────────────────┘
+      #
+      # Here the cancel then refuses, since the t3 shift was recorded after t2 (see
+      # recorded_since?). After the t2 shift alone, it would restore the t1 timeline.
       #
       # A snapshot's zero-length rows are no part of it, so a snapshot of nothing else is
       # skipped: there's no timeline in it to restore.
       #
-      # @param current_genesis [Time] the current first segment's valid_from
+      # @param original_genesis [Time] the entity's original genesis (see find_original_genesis)
       # @return [Array(Array<ActiveRecord::Base>, Time), nil] the pre-shift segment records
-      #   and the change point they ended at (t2 above), or nil if no prior state with a
-      #   different genesis can be found
-      def find_pre_shift_genesis_state(current_genesis)
+      #   and the change point they ended at (t2 above), or nil if no snapshot starts at the
+      #   original genesis
+      def find_pre_shift_genesis_state(original_genesis)
         change_points = timeline_rows
           .where.not(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
           .distinct.pluck(:transaction_to)
@@ -883,7 +888,7 @@ module ActiveRecord
             .reject { |r| zero_length?(r) }
 
           next if state.empty?
-          return [state, cp] if state.first[valid_from_key] != current_genesis
+          return [state, cp] if state.first[valid_from_key] == original_genesis
         end
 
         nil

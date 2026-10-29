@@ -562,7 +562,7 @@ Employee.find_at_time(feb_1, employee.id)
 
 ### Canceling a Genesis Shift
 
-The `cancel_shift_genesis` method reverses a genesis shift by restoring the complete pre-shift timeline from transaction history:
+The `cancel_shift_genesis` method reverses a genesis shift by restoring, from transaction history, the complete timeline the entity had at its original genesis:
 
 ```ruby
 # Original: Timeline starts in March
@@ -573,7 +573,7 @@ employee.shift_genesis(new_valid_from: jan_1)
 employee.cancel_shift_genesis
 ```
 
-**Important:** `cancel_shift_genesis` is an **undo** — it restores the timeline exactly as it stood just before the most recent genesis shift. It never discards anything: if anything was recorded for the entity after that shift (a `correct`, an upstream `update!`, a `terminate`, ...), it **refuses**. It raises `ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError`, writes nothing, and leaves the record as it was. That error is a subclass of `PreShiftGenesisStateNotFoundError`, so a `rescue` of that class catches it too:
+**Important:** `cancel_shift_genesis` is an **undo** — it restores the most recent timeline that started at the original genesis, exactly as it stood just before the genesis moved off it, as `cancel_termination` restores the most recent timeline that wasn't terminated. It never discards anything: if anything was recorded for the entity after that shift (a `correct`, an upstream `update!`, a `terminate`, another `shift_genesis`, ...), it **refuses**. It raises `ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError`, writes nothing, and leaves the record as it was. That error is a subclass of `PreShiftGenesisStateNotFoundError`, so a `rescue` of that class catches it too:
 
 ```ruby
 employee.shift_genesis(new_valid_from: jan_1)
@@ -584,7 +584,17 @@ employee.cancel_shift_genesis
 #    (the correction would be discarded; nothing is written)
 ```
 
-Cancel is a no-op if the entity's genesis has never been shifted (returns `true`, writing only to merge seams or close zero-length rows left in the timeline, see [The Timeline After an Operation](#the-timeline-after-an-operation)).
+So a cancel undoes one shift. After two shifts it refuses, since the second was recorded after the first moved the genesis off the original:
+
+```ruby
+employee.shift_genesis(new_valid_from: feb_1)  # original genesis: January
+employee.shift_genesis(new_valid_from: apr_1)
+
+employee.cancel_shift_genesis
+# => ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError
+```
+
+Cancel is a no-op if the entity's genesis is its original one: never shifted, shifted back to it, or already canceled (returns `true`, writing only to merge seams or close zero-length rows left in the timeline, see [The Timeline After an Operation](#the-timeline-after-an-operation)). A `shift_genesis` back to the original genesis is not an undo, though: segments a forward shift removed stay removed, and the first segment left is extended back instead.
 
 ### Checking Genesis Shift Status
 
@@ -1228,7 +1238,7 @@ position.valid_at(3.days.ago) { |p| p.update!(rate: 200) }  # Backdated change
 position.force_update { |p| p.update(rate: 200) }  # Correction (not temporal)
 position.correct(valid_from: feb_1, name: "X")    # Retroactive correction (preserves cascade)
 position.shift_genesis(new_valid_from: jan_1)      # Change when timeline begins
-position.cancel_shift_genesis                      # Undo the last genesis shift (refuses if anything was recorded since)
+position.cancel_shift_genesis                      # Undo to the original genesis (refuses if anything was recorded since)
 position.shifted_genesis?                          # Check if genesis differs from original
 position.terminate(termination_time: mar_1)        # End timeline at specific date
 position.cancel_termination                        # Undo termination (refuses if anything was recorded since)

@@ -335,7 +335,7 @@ Both methods are whole-timeline operations — they fetch all current-knowledge 
 14. COMMIT TRANSACTION
 ```
 
-`cancel_shift_genesis` follows the same steps, walking back to the first timeline whose genesis differs from the current one, and raises `RecordedSinceGenesisShiftError` in step 7. Both refusals happen before any write, so the transaction writes nothing and `self` is not reloaded. Each subclasses its cancel's not-found error, so a `rescue` of that error catches it.
+`cancel_shift_genesis` follows the same steps. Its no-op in step 5 is a genesis equal to the original one, the `valid_from` of the entity's first recorded row. Step 6 walks back to the most recent timeline that starts at that original genesis, passing over any timeline an earlier shift left at another genesis, and step 7 raises `RecordedSinceGenesisShiftError`. So it undoes one shift: after two shifts it refuses, since the second was recorded after the first moved the genesis off the original. Both refusals happen before any write, so the transaction writes nothing and `self` is not reloaded. Each subclasses its cancel's not-found error, so a `rescue` of that error catches it.
 
 ### Key Implementation Detail: `deleted_at` Corruption
 
