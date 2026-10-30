@@ -37,21 +37,21 @@ ActiveRecord::Bitemporal
 
 | Method | Location | Purpose |
 |--------|----------|---------|
-| `correct` | Line 261 | Public API for cascade corrections |
-| `_correct_record` | Line 456 | Main cascade correction implementation |
-| `_update_row` | Line 349 | Regular update persistence |
-| `bitemporal_build_update_records` | Line 641 | Builds before/after for updates |
+| `correct` | `timeline_operations.rb` | Public API for cascade corrections |
+| `_correct_record` | `timeline_operations.rb` | Main cascade correction implementation |
+| `_update_row` | `bitemporal.rb` | Regular update persistence |
+| `bitemporal_build_update_records` | `bitemporal.rb` | Builds before/after for updates |
 | `build_correction_records` | `timeline_operations.rb` | Builds the patched timeline for corrections |
 | `perform_timeline_operation` | `timeline_operations.rb` | Shared skeleton of the timeline operations: lock, fetch, normalize, write the difference, reload self |
-| `scope_relation` | Line 724 | Uniqueness validation scoping |
-| `terminate` | Line ~332 | Public API for timeline termination |
-| `_terminate_record` | Line ~777 | Main termination implementation |
-| `cancel_termination` | Line ~340 | Public API for termination reversal |
-| `_cancel_termination_record` | Line ~852 | Main cancel implementation |
+| `scope_relation` | `bitemporal.rb` | Uniqueness validation scoping |
+| `terminate` | `timeline_operations.rb` | Public API for timeline termination |
+| `_terminate_record` | `timeline_operations.rb` | Main termination implementation |
+| `cancel_termination` | `timeline_operations.rb` | Public API for termination reversal |
+| `_cancel_termination_record` | `timeline_operations.rb` | Main cancel implementation |
 | `reopen` | `timeline_operations.rb` | Public API for lifting a terminated timeline's end |
 | `_reopen_record` | `timeline_operations.rb` | Main reopen implementation |
-| `build_termination_records` | Line ~922 | Builds truncated timeline for termination |
-| `find_pre_termination_state` | Line ~952 | Searches transaction history for pre-termination state |
+| `build_termination_records` | `timeline_operations.rb` | Builds truncated timeline for termination |
+| `find_pre_termination_state` | `timeline_operations.rb` | Searches transaction history for pre-termination state |
 
 ### Bitemporal Invariant
 
@@ -444,6 +444,7 @@ Every timeline operation (`correct`, `shift_genesis`, `terminate`, `reopen` and 
    - A row the result keeps stays.
    - A new piece with the range and business attributes of a current row is dropped, and that row stays, so an unchanged version isn't recorded again. A cancel keeps the rows of the segments the operation it undoes didn't change.
    - Every other row is closed and every other piece inserted, closing first. Rows are closed with `update_columns` and inserted with `save_without_bitemporal_callbacks!(validate: false)`: see [Validations and Callbacks During an Operation](./README.md#validations-and-callbacks-during-an-operation) for what runs.
+   - A piece left unsaved raises `RecordNotSaved`, which rolls back everything the operation wrote, the rows it closed included. `save!` raises that itself when a callback throws `:abort`, but returns `nil` when a callback raises `ActiveRecord::Rollback` before the insert: the transaction block Rails opens inside `save!` joins the enclosing one and swallows it, rolling nothing back.
 5. Nothing to close or insert: return `true` without validating or reloading `self`.
 
 So a call that changes nothing writes nothing, and a call on a timeline with a seam or a zero-length row merges or closes it, even when it otherwise changes nothing. The cancels' history walks also leave zero-length rows out of each snapshot, and skip a snapshot of nothing else: there's no timeline in it to restore.
@@ -656,9 +657,11 @@ They then close the row valid at the record's own time, which for a future-dated
 
 The timeline operations (`lock_timeline!`, PostgreSQL only) take three locks, in this order, before they read the timeline:
 
-1. **Advisory lock**: `pg_advisory_xact_lock(hashtext(<table_name>), hashtext(<bitemporal_id as text>))`, held until the transaction ends. The key is a public contract: a caller holding it in the same transaction and the operations wait for each other, and an operation called while holding it re-enters it. Unlike a row lock, it holds even when the entity has no row valid now.
+1. **Advisory lock**: `pg_advisory_xact_lock(hashtext(<table_name>), hashtext(<bitemporal_id as text>))`, held until the transaction ends unless the operation raises (see below). The key is a public contract: a caller holding it in the same transaction and the operations wait for each other, and an operation called while holding it re-enters it. Unlike a row lock, it holds even when the entity has no row valid now.
 2. **Row valid now**: upstream's statement above, as it reads outside any block. The operation builds it from `unscoped` with the default scope's four time conditions at `Time.current`, so it's the same statement whatever block or scope the caller is in. Every upstream save outside a block locks that row before any other, so an operation holding it makes the save wait while holding nothing. Locking another row first could deadlock with a future-dated save that holds the row valid now and waits for that other row.
 3. **Every current-knowledge row**: `FOR UPDATE` on the `unscoped` rows with `transaction_to = ∞`, so an upstream write already in flight on any of them commits before the operation reads the timeline, whatever the caller's scopes hide.
+
+An operation that raises rolls back to its own savepoint (`requires_new: true`), and PostgreSQL releases the locks taken since then, all three of these included. Locks taken earlier in the transaction, by the caller or by an operation that succeeded, stay held. A caller that rescues the error and needs the entity to stay locked takes the advisory lock itself first.
 
 **Not covered**: a `save` on an entity with no row valid now locks no row first, and `destroy` reads before it locks. Either can read the timeline before an operation commits and write after it. Callers serialize such writes by holding the same advisory lock, taken before the transaction's first write to the entity.
 

@@ -1537,6 +1537,38 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
 
     # after_commit runs only when the transaction commits, so these examples commit each operation
     describe "callbacks", use_truncation: true do
+      # save! raises when a callback throws :abort, but returns nil without inserting when a
+      # callback raises ActiveRecord::Rollback before the insert: the transaction block Rails opens
+      # inside save! joins the enclosing one and swallows it. Either way the operation raises and
+      # writes nothing.
+      # A Rollback raised after the insert is swallowed the same way, and the row stays saved.
+      shared_examples "a row's save stopped by a callback" do
+        {
+          "raises ActiveRecord::Rollback" => -> { raise ActiveRecord::Rollback },
+          "throws :abort" => -> { throw :abort },
+        }.each do |stops, callback|
+          context "when a before_save callback #{stops}" do
+            let(:model) { super().tap { |klass| klass.before_save(&callback) } }
+
+            it "raises RecordNotSaved and writes nothing" do
+              history_before = history
+
+              expect { subject }.to raise_error(ActiveRecord::RecordNotSaved)
+              expect(history).to eq history_before
+            end
+          end
+        end
+
+        context "when an after_save callback raises ActiveRecord::Rollback" do
+          let(:model) { super().tap { |klass| klass.after_save { raise ActiveRecord::Rollback } } }
+
+          it "keeps every row it inserts" do
+            expect(subject).to be true
+            expect(inserted).to eq inserted_rows
+          end
+        end
+      end
+
       describe "#correct" do
         subject(:correct) { Timecop.freeze(operated_at) { employee.correct(**correction) } }
 
@@ -1559,6 +1591,10 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           expect(saved_columns).to eq [
             %w[bitemporal_id created_at emp_code id name transaction_from transaction_to updated_at valid_from valid_to],
           ] * 3
+        end
+
+        it_behaves_like "a row's save stopped by a callback" do
+          let(:inserted_rows) { [[_03_01, _04_01, "B"], [_04_01, _08_01, "X"], [_08_01, infinity, "C"]] }
         end
 
         #   A |Feb, Mar)  B |Mar, May)  B |May, Jul)  C |Jul, ∞)
@@ -1608,6 +1644,10 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           expect(callbacks).to eq [*insert_callbacks, *commit_callbacks]
         end
 
+        it_behaves_like "a row's save stopped by a callback" do
+          let(:inserted_rows) { [[_03_01, _05_01, "B"]] }
+        end
+
         # Nothing is saved, so no record is left for the commit callbacks to run on
         context "when it ends the timeline at a segment's end" do
           let(:termination_time) { _07_01 }
@@ -1633,6 +1673,10 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           expect(inserted).to eq [[_01_01, _03_01, "A"]]
           expect(closed).to eq [[_02_01, _03_01, "A"]]
           expect(callbacks).to eq [*insert_callbacks, *commit_callbacks]
+        end
+
+        it_behaves_like "a row's save stopped by a callback" do
+          let(:inserted_rows) { [[_01_01, _03_01, "A"]] }
         end
 
         # Nothing is saved, so no record is left for the commit callbacks to run on
@@ -1662,6 +1706,10 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           expect(closed).to eq [[_03_01, _05_01, "B"]]
           expect(callbacks).to eq [*insert_callbacks * 2, *commit_callbacks]
         end
+
+        it_behaves_like "a row's save stopped by a callback" do
+          let(:inserted_rows) { [[_03_01, _07_01, "B"], [_07_01, infinity, "C"]] }
+        end
       end
 
       describe "#cancel_shift_genesis" do
@@ -1677,6 +1725,10 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           expect(closed).to eq [[_01_01, _03_01, "A"]]
           expect(callbacks).to eq [*insert_callbacks, *commit_callbacks]
         end
+
+        it_behaves_like "a row's save stopped by a callback" do
+          let(:inserted_rows) { [[_02_01, _03_01, "A"]] }
+        end
       end
 
       describe "#reopen" do
@@ -1691,6 +1743,10 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           expect(inserted).to eq [[_03_01, infinity, "B"]]
           expect(closed).to eq [[_03_01, _05_01, "B"]]
           expect(callbacks).to eq [*insert_callbacks, *commit_callbacks]
+        end
+
+        it_behaves_like "a row's save stopped by a callback" do
+          let(:inserted_rows) { [[_03_01, infinity, "B"]] }
         end
       end
     end
