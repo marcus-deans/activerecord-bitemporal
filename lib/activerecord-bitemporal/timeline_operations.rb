@@ -503,7 +503,7 @@ module ActiveRecord
         # just wrote included
         versions = current_knowledge_rows
           .order(valid_from_key => :asc)
-          .reject { |r| r[valid_from_key] == r[valid_to_key] }
+          .reject { |r| zero_length?(r) }
         covering = versions.find { |r| r[valid_from_key] <= at && at < r[valid_to_key] }
         version = covering ||
           versions.reverse.find { |r| r[valid_from_key] <= at } ||

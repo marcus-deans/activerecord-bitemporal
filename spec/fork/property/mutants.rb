@@ -39,7 +39,8 @@ module ForkProperty
       end
     end
 
-    # Zero-length rows count as segments: the guards and builders see them, and they're kept
+    # Zero-length rows count as segments: the guards, the builders and self's reload see them,
+    # and they're kept
     module ZeroLengthAsSegment
       private
 
