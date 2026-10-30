@@ -548,7 +548,7 @@ RSpec.describe "Cascade Correction (#correct method)" do
     # -------------------------------------------------------------------------
     # When correcting with only some attributes, the non-corrected attributes
     # come from the segment being corrected, NOT from the current record. A span
-    # crossing a change point keeps it (patch semantics, see Category 14).
+    # crossing a change point keeps it (patch semantics, see Category 11).
     # -------------------------------------------------------------------------
     context "non-corrected attributes inherit from the segments they correct" do
       before do
@@ -1368,7 +1368,7 @@ RSpec.describe "Cascade Correction (#correct method)" do
     # Setup: A[Jan-Mar, "X"], B[Mar-∞, "Y"]
     # Action: correct(Feb, Mar, name: "X")
     # Splitting would give A'[Jan-Feb, "X"], X[Feb-Mar, "X"], B[Mar-∞, "Y"], to be
-    # merged again. A has "X" already, so nothing is written (see Category 14).
+    # merged again. A has "X" already, so nothing is written (see Category 11).
     # Result: A[Jan-Mar, "X"], B[Mar-∞, "Y"]
     # -------------------------------------------------------------------------
     context "left boundary no-op correction" do
@@ -1603,7 +1603,7 @@ RSpec.describe "Cascade Correction (#correct method)" do
   end
 
   # ==========================================================================
-  # Category 13: Correction Guard — Cannot Extend Past Timeline End
+  # Category 10: Correction Guard — Cannot Extend Past Timeline End
   # ==========================================================================
 
   # Helper to find a terminated employee (whose valid_to is in the past)
@@ -1617,7 +1617,7 @@ RSpec.describe "Cascade Correction (#correct method)" do
 
   describe "correction guard against extending past timeline end" do
 
-    # Test 13.1: Bounded correction past termination raises ValidDatetimeRangeError
+    # Test 10.1: Bounded correction past termination raises ValidDatetimeRangeError
     #
     #   Timeline:  |---A---|---B---|  (terminated at May)
     #   Correction:        |---X-------->|  ← valid_to past May — REJECTED
@@ -1661,7 +1661,7 @@ RSpec.describe "Cascade Correction (#correct method)" do
       end
     end
 
-    # Test 13.2: Unbounded correction on terminated entity stays within range
+    # Test 10.2: Unbounded correction on terminated entity stays within range
     #
     #   Timeline:  |---A---|---B---|  (terminated at May)
     #   Correction:   |---X---|         ← unbounded, inherits B's valid_to (May) — OK
@@ -1697,7 +1697,7 @@ RSpec.describe "Cascade Correction (#correct method)" do
       end
     end
 
-    # Test 13.3: Bounded correction exactly at timeline end (edge case — should pass)
+    # Test 10.3: Bounded correction exactly at timeline end (edge case — should pass)
     context "bounded correction with valid_to exactly at timeline end" do
       before do
         Timecop.freeze("2020/10/01") do
@@ -1721,7 +1721,7 @@ RSpec.describe "Cascade Correction (#correct method)" do
       end
     end
 
-    # Test 13.4: Correction on non-terminated entity (no guard triggered)
+    # Test 10.4: Correction on non-terminated entity (no guard triggered)
     context "bounded correction on non-terminated entity" do
       before do
         Timecop.freeze("2020/10/01") do
@@ -1748,7 +1748,7 @@ RSpec.describe "Cascade Correction (#correct method)" do
   end
 
   # ==========================================================================
-  # Test Category 14: Patch semantics
+  # Test Category 11: Patch semantics
   # ==========================================================================
   #
   # A bounded correction is a patch, like SQL:2011's UPDATE ... FOR PORTION OF: every
