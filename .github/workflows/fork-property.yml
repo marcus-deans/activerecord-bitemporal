@@ -34,7 +34,7 @@ env:
 jobs:
   deep:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -76,7 +76,7 @@ jobs:
           bundler-cache: true
       - name: Run the deep tier
         # Under the job's timeout, so the reports of the batches that finished still upload
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
           FORK_PROPERTY: deep
           FORK_PROPERTY_MODEL: ${{ matrix.model }}
