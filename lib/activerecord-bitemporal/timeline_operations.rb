@@ -76,9 +76,11 @@ module ActiveRecord
 
       # Terminate: Set a finite end date for the entity's timeline (right edge)
       #
-      # Unlike destroy (which operates on transaction time), this truncates the
-      # valid-time timeline. Segments beyond termination_time are removed; a
-      # segment spanning the boundary is truncated.
+      # Ends the timeline in valid time: a segment spanning termination_time is truncated
+      # there, and every segment starting at or after it is removed. Upstream's destroy works
+      # on valid time too, but on one version: it ends the version valid at the record's time
+      # (now, or the time the record was loaded at) there, and later versions stay current, so
+      # on a timeline with a change after that time it leaves a gap rather than an end.
       #
       # Raises ActiveRecord::RecordNotFound if no current-knowledge records exist.
       # Raises ArgumentError if termination_time <= first valid_from or > last valid_to.
@@ -216,8 +218,9 @@ module ActiveRecord
       # undefined. These helpers take the record as an argument because they're called
       # on records other than self.
       #
-      # Keep them in sync: on every upstream merge, diff upstream's refinements block in
-      # bitemporal.rb and mirror any change here (see timeline_operations_spec.rb).
+      # Keep them in sync: spec/fork/upstream_sentinel_spec.rb fails when a merge from upstream
+      # changes that refinements block. Mirror the change here and into the examples in
+      # spec/fork/timeline_operations_spec.rb.
 
       # Mirrors upstream's refined ActiveRecord::Base#dup: copy without the bitemporal
       # internal status.
