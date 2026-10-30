@@ -505,6 +505,43 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
         ])
       end
     end
+
+    # Test 2.8: Forward into a gap
+    #
+    # An upstream destroy at Mar ends only the segment valid at Mar, leaving a gap
+    # before C. No segment spans a new start inside the gap, so none is trimmed to it.
+    context "forward into a gap" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
+        end
+        Timecop.freeze("2020/10/02") do
+          Employee.find_at_time(_03_01, @employee.id).destroy
+        end
+      end
+
+      # before: A                       C
+      #         |-------------|  (gap)  |----------->
+      #         Jan          Mar       May
+      #
+      # shift_genesis(new_valid_from: Apr)
+      #                  ↓
+      # after:                          C
+      #                                 |----------->
+      #                                May
+      it "removes the segments before the gap, and the timeline starts at the segment after it" do
+        employee = Employee.find_at_time(_02_01, @employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.shift_genesis(new_valid_from: _04_01)
+        end
+
+        expect(current_timeline(employee)).to eq([
+          [_05_01, infinity, "C"]
+        ])
+      end
+    end
   end
 
   # ==========================================================================
@@ -1581,6 +1618,74 @@ RSpec.describe "Shift Genesis (#shift_genesis method)" do
           expect(cancel).to be true
           expect(history(employee)).to eq history_before
           expect(current_timeline(employee)).to eq [[_01_01, _05_01, "B"], [_05_01, infinity, "C"]]
+        end
+      end
+
+      # An upstream update! at a time before the genesis inserts a version there and closes no
+      # row, so it moves the genesis without ending a timeline at the original one
+      context "after an upstream update! before the genesis" do
+        before {
+          Timecop.freeze("2020/10/02") {
+            record = Employee.find_at_time(_01_01, employee_id)
+            record.valid_at(_2019_12_01) { record.update!(name: "Z") }
+          }
+        }
+
+        it "finds the genesis shifted" do
+          expect(current_timeline(employee)).to eq [[_2019_12_01, _01_01, "Z"], *original_timeline]
+          expect(employee.shifted_genesis?).to be true
+        end
+
+        it "finds no timeline to restore and writes nothing" do
+          history_before = history(employee)
+
+          expect { cancel }.to raise_error(
+            ActiveRecord::Bitemporal::PreShiftGenesisStateNotFoundError,
+            /\ACannot determine pre-shift genesis state/
+          )
+          expect(history(employee)).to eq history_before
+        end
+
+        it "lets a shift_genesis to the original genesis move it back" do
+          shift_genesis_on("2020/10/06", _01_01)
+
+          expect(employee.shifted_genesis?).to be false
+          expect(current_timeline(employee)).to eq original_timeline
+        end
+      end
+
+      # History then holds a timeline at the original genesis, from before that other write,
+      # and the update! was recorded after it
+      context "after an upstream update! before the genesis, recorded after another write" do
+        before {
+          Timecop.freeze("2020/10/02") {
+            record = Employee.find_at_time(_05_01, employee_id)
+            record.valid_at(_06_01) { record.update!(name: "D") }
+          }
+          Timecop.freeze("2020/10/03") {
+            record = Employee.find_at_time(_01_01, employee_id)
+            record.valid_at(_2019_12_01) { record.update!(name: "Z") }
+          }
+        }
+
+        it "refuses as recorded since, and writes nothing" do
+          history_before = history(employee)
+
+          expect { cancel }.to raise_error(ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError)
+          expect(history(employee)).to eq history_before
+        end
+      end
+
+      # An upstream destroy at the genesis leaves a zero-length row there, so the genesis moves
+      # to B's start. It closed A's row, so the timeline from before it is there to restore.
+      context "after an upstream destroy at the genesis" do
+        before { Timecop.freeze("2020/10/02") { Employee.find_at_time(_01_01, employee_id).destroy } }
+
+        it "finds the genesis shifted, and restores the timeline from before the destroy" do
+          expect(employee.shifted_genesis?).to be true
+
+          expect(cancel).to be true
+          expect(current_timeline(employee)).to eq original_timeline
         end
       end
     end

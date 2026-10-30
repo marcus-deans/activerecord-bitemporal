@@ -595,6 +595,28 @@ RSpec.describe "Cascade Correction (#correct method)" do
           [_03_01, _04_01, "E002"]
         ])
       end
+
+      it "inherits from the record at valid_from in an unbounded correction too" do
+        employee = Employee.find(@employee.id)  # Returns current (Bob, E002)
+
+        Timecop.freeze("2020/10/06") do
+          # Correct name from Feb to the end of the Jan-Mar record
+          employee.correct(valid_from: _02_01, name: "X")
+        end
+
+        timeline = Employee.ignore_valid_datetime
+          .where(bitemporal_id: employee.bitemporal_id)
+          .where(transaction_to: tt_infinity)
+          .order(:valid_from)
+          .pluck(:valid_from, :valid_to, :name, :emp_code)
+
+        expect(timeline).to eq([
+          [_01_01, _02_01, "Alice", "E001"],
+          [_02_01, _03_01, "X", "E001"],  # emp_code from the Jan-Mar record, NOT "E002" from current
+          [_03_01, _05_01, "Alice", "E002"],
+          [_05_01, infinity, "Bob", "E002"]
+        ])
+      end
     end
 
     # Test 3.4: Zero-width correction window
