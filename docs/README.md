@@ -1,5 +1,7 @@
 # ActiveRecord::Bitemporal - Usage Guide
 
+This fork of [kufu/activerecord-bitemporal](https://github.com/kufu/activerecord-bitemporal) adds operations that edit an entity's whole timeline: `correct`, `shift_genesis`, `terminate` and `reopen`, and the cancels `cancel_shift_genesis` and `cancel_termination`. This guide covers upstream's API and those additions. [CHANGELOG.md](./CHANGELOG.md) lists what the fork changed, and [ARCHITECTURE.md](./ARCHITECTURE.md) explains how the operations work.
+
 ## Overview
 
 `activerecord-bitemporal` is a Rails library that enables **Bitemporal Data Modeling** for ActiveRecord models. This allows you to track both:
@@ -1348,6 +1350,7 @@ end
 - [Official Repository](https://github.com/kufu/activerecord-bitemporal)
 - [ARCHITECTURE.md](./ARCHITECTURE.md) - Deep dive into internal mechanics
 - [BITEMPORAL_CONCEPTS.md](./BITEMPORAL_CONCEPTS.md) - Comprehensive bitemporal theory
+- [CHANGELOG.md](./CHANGELOG.md) - What the fork changed
 - [Bitemporal Data Theory](https://en.wikipedia.org/wiki/Bitemporal_Modeling)
 
 ---
