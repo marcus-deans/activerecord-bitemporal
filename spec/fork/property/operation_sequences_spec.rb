@@ -68,7 +68,7 @@ module ForkProperty
     ["CustomColumnRecord", 5_000, 5, 30, true, false],
   ].freeze
 
-  # Every model with zero-length rows and seams off and on: 3600 sequences, about 45 minutes
+  # Every model with zero-length rows and seams off and on: 3600 sequences, about 13 minutes
   DEEP = [
     ["Employee", 1_100_000, 300, 40, false, false],
     ["Employee", 1_200_000, 300, 40, false, true],

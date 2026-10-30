@@ -93,7 +93,7 @@ An upstream write's outcome is only compared with the model. A difference is an 
 | Tier | How | What | Time |
 | --- | --- | --- | --- |
 | smoke | the default; part of every `rspec` run | 4 batches, 22 sequences of up to 30 steps | about 10 seconds |
-| deep | `FORK_PROPERTY=deep` | 12 batches of 300 sequences of up to 40 steps: each model with zero-length rows and seams off and on | about 45 minutes in one process, 16 split by model across three |
+| deep | `FORK_PROPERTY=deep` | 12 batches of 300 sequences of up to 40 steps: each model with zero-length rows and seams off and on | about 13 minutes in one process, 5 split by model across three |
 
 The smoke tier prints nothing unless it fails, and stops at its first failure. The deep tier, and any run from a seed, runs every sequence, shrinks the first failure of each signature, writes a report per batch to `$TMPDIR/activerecord-bitemporal-fork-property/<model>-<first seed>.txt` and prints one line per batch.
 
