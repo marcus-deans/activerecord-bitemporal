@@ -58,4 +58,5 @@ What this fork of [kufu/activerecord-bitemporal](https://github.com/kufu/activer
 ## Specs and Docs
 
 - The fork's specs follow upstream's conventions ([#18](https://github.com/marcus-deans/activerecord-bitemporal/pull/18)).
-- Review repros were added ([#9](https://github.com/marcus-deans/activerecord-bitemporal/pull/9)), then moved into the operations' specs, with the concurrency gap the README describes kept as a pending example.
+- Review repros were added ([#9](https://github.com/marcus-deans/activerecord-bitemporal/pull/9)), then moved into the operations' specs, with the concurrency gap the README describes kept as a pending example ([#25](https://github.com/marcus-deans/activerecord-bitemporal/pull/25)).
+- The fork's specs live in `spec/fork/`, apart from upstream's, so either suite runs on its own. A property harness checks random sequences of operations and upstream writes against a reference model, a sentinel spec fails when upstream changes code the fork copies, and [TESTING.md](./TESTING.md) explains both ([#26](https://github.com/marcus-deans/activerecord-bitemporal/pull/26)).

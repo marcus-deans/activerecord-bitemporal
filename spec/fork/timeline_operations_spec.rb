@@ -25,9 +25,9 @@ end
 # Persistence. Refinements are active only inside that file, so the fork's timeline
 # operations carry their own copies.
 #
-# Keep them in sync: on every upstream merge, diff upstream's refinements block
-# (`using Module.new { refine Persistence do ... }`) and mirror any change into
-# lib/activerecord-bitemporal/timeline_operations.rb and these examples.
+# Keep them in sync: upstream_sentinel_spec.rb fails when a merge from upstream changes
+# that refinements block (`using Module.new { refine Persistence do ... }`). Mirror the
+# change into lib/activerecord-bitemporal/timeline_operations.rb and these examples.
 RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
   let(:tt_infinity) { ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO }
 

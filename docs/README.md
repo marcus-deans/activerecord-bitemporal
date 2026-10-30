@@ -1351,6 +1351,7 @@ end
 - [ARCHITECTURE.md](./ARCHITECTURE.md) - Deep dive into internal mechanics
 - [BITEMPORAL_CONCEPTS.md](./BITEMPORAL_CONCEPTS.md) - Comprehensive bitemporal theory
 - [CHANGELOG.md](./CHANGELOG.md) - What the fork changed
+- [TESTING.md](./TESTING.md) - How the fork is tested
 - [Bitemporal Data Theory](https://en.wikipedia.org/wiki/Bitemporal_Modeling)
 
 ---
