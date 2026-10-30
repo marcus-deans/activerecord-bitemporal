@@ -62,6 +62,7 @@ ActiveRecord::Bitemporal
 | `_cancel_shift_genesis_record` | `timeline_operations.rb` | Main cancel shift genesis implementation |
 | `find_original_genesis` | `timeline_operations.rb` | The `valid_from` of the entity's first recorded row |
 | `find_pre_shift_genesis_state` | `timeline_operations.rb` | Searches transaction history for the last timeline at the original genesis |
+| `find_latest_snapshot` | `timeline_operations.rb` | Walks transaction history back for both cancels: the latest snapshot that a given condition accepts |
 | `shifted_genesis?` | `timeline_operations.rb` | Whether the first segment that holds a time starts off the original genesis |
 | `recorded_since?` | `timeline_operations.rb` | Whether anything was recorded for the entity after a change point (the cancels' refusal) |
 

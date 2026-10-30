@@ -737,10 +737,22 @@ module ActiveRecord
         [records_to_close, new_records]
       end
 
-      # The most recent snapshot with an infinite end, and the change point it ended at:
-      # [segments, change_point], or nil when no snapshot has one. A snapshot's zero-length
-      # rows are no part of it.
-      def find_pre_termination_state
+      # The most recent snapshot the block accepts, and the change point it ended at:
+      # [segments, change_point], or nil when it accepts none. Each cancel finds the timeline
+      # it restores with it.
+      #
+      # == How it works (transaction history search)
+      #
+      # Every bitemporal mutation closes old records (transaction_to = now) and
+      # inserts new ones (transaction_from = now). This creates "change points"
+      # — transaction_to values where the timeline was rewritten.
+      #
+      # We walk backward through change points, reconstructing the timeline that
+      # was active just before each change, until the block accepts one.
+      #
+      # A snapshot's zero-length rows are no part of it, so a snapshot of nothing else is
+      # skipped: there's no timeline in it to restore.
+      def find_latest_snapshot
         change_points = timeline_rows
           .where.not(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
           .distinct.pluck(:transaction_to)
@@ -759,10 +771,16 @@ module ActiveRecord
             .reject { |r| zero_length?(r) }
 
           next if state.empty?
-          return [state, cp] if state.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
+          return [state, cp] if yield(state)
         end
 
         nil
+      end
+
+      # The most recent snapshot with an infinite end, and the change point it ended at:
+      # [segments, change_point], or nil when no snapshot has one (see find_latest_snapshot).
+      def find_pre_termination_state
+        find_latest_snapshot { |state| state.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO }
       end
 
       # Whether anything was recorded for this entity after change_point, the moment the
@@ -849,17 +867,10 @@ module ActiveRecord
 
       # Find the pre-shift state: the most recent complete timeline snapshot whose genesis
       # (first segment's valid_from) is the original genesis, as find_pre_termination_state
-      # finds the most recent one with an infinite end.
+      # finds the most recent one with an infinite end (see find_latest_snapshot).
       #
-      # == How it works (transaction history search)
-      #
-      # Every bitemporal mutation closes old records (transaction_to = now) and
-      # inserts new ones (transaction_from = now). This creates "change points"
-      # — transaction_to values where the timeline was rewritten.
-      #
-      # We walk backward through change points, reconstructing the timeline that
-      # was active just before each change, until we find one at the original
-      # genesis. A timeline an earlier shift left at another genesis is passed over:
+      # Walking backward through change points, a timeline an earlier shift left at another
+      # genesis is passed over:
       #
       #   Transaction time →
       #   ┌───────────────────────────────────────────────────────────┐
@@ -875,36 +886,12 @@ module ActiveRecord
       # Here the cancel then refuses, since the t3 shift was recorded after t2 (see
       # recorded_since?). After the t2 shift alone, it would restore the t1 timeline.
       #
-      # A snapshot's zero-length rows are no part of it, so a snapshot of nothing else is
-      # skipped: there's no timeline in it to restore.
-      #
       # @param original_genesis [Time] the entity's original genesis (see find_original_genesis)
       # @return [Array(Array<ActiveRecord::Base>, Time), nil] the pre-shift segment records
       #   and the change point they ended at (t2 above), or nil if no snapshot starts at the
       #   original genesis
       def find_pre_shift_genesis_state(original_genesis)
-        change_points = timeline_rows
-          .where.not(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
-          .distinct.pluck(:transaction_to)
-          .sort.reverse
-
-        change_points.each do |cp|
-          state = timeline_rows
-            .where(self.class.arel_table[:transaction_from].lt(cp))
-            .where(self.class.arel_table[:transaction_to].gteq(cp))
-            .order(valid_from_key => :asc)
-            .to_a
-            .each { |r|
-              r.id = r.swapped_id
-              r.clear_changes_information
-            }
-            .reject { |r| zero_length?(r) }
-
-          next if state.empty?
-          return [state, cp] if state.first[valid_from_key] == original_genesis
-        end
-
-        nil
+        find_latest_snapshot { |state| state.first[valid_from_key] == original_genesis }
       end
 
       def validate_cascade_correction_timeline!

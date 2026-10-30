@@ -53,20 +53,10 @@ module ForkProperty
     module CancelWalkOldestFirst
       private
 
-      def find_pre_termination_state
+      # find_latest_snapshot's walk, with the change points in ascending order
+      def find_latest_snapshot
         return super unless Mutants.enabled?
 
-        oldest_restorable_state { |state| state.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO }
-      end
-
-      def find_pre_shift_genesis_state(original_genesis)
-        return super unless Mutants.enabled?
-
-        oldest_restorable_state { |state| state.first[valid_from_key] == original_genesis }
-      end
-
-      # find_pre_termination_state's walk, with the change points in ascending order
-      def oldest_restorable_state
         table = self.class.arel_table
         change_points = timeline_rows
           .where.not(transaction_to: ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO)
