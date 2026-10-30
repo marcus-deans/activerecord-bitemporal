@@ -610,13 +610,7 @@ module ActiveRecord
       end
 
       def build_genesis_backward_shift(genesis, new_valid_from, current_time)
-        new_genesis = timeline_dup(genesis)
-        new_genesis.id = nil
-        new_genesis[valid_from_key] = new_valid_from
-        new_genesis.transaction_from = current_time
-        new_genesis.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
-
-        [[genesis], [new_genesis]]
+        [[genesis], [timeline_piece(genesis, new_valid_from, genesis[valid_to_key], current_time)]]
       end
 
       def build_genesis_forward_shift(segments, new_valid_from, current_time)
@@ -631,13 +625,7 @@ module ActiveRecord
           elsif segment[valid_from_key] < new_valid_from
             # Spans the boundary — close + trimmed replacement
             records_to_close << segment
-
-            trimmed = timeline_dup(segment)
-            trimmed.id = nil
-            trimmed[valid_from_key] = new_valid_from
-            trimmed.transaction_from = current_time
-            trimmed.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
-            new_records << trimmed
+            new_records << timeline_piece(segment, new_valid_from, segment[valid_to_key], current_time)
 
           else
             # valid_from >= new_valid_from — untouched, stop
@@ -752,13 +740,7 @@ module ActiveRecord
           elsif segment[valid_from_key] < termination_time
             # Spans boundary — CLOSE + truncated copy
             records_to_close << segment
-
-            truncated = timeline_dup(segment)
-            truncated.id = nil
-            truncated[valid_to_key] = termination_time
-            truncated.transaction_from = current_time
-            truncated.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
-            new_records << truncated
+            new_records << timeline_piece(segment, segment[valid_from_key], termination_time, current_time)
           else
             # segment.valid_from >= termination_time — entirely after — CLOSE, no replacement
             records_to_close << segment
