@@ -1619,7 +1619,7 @@ RSpec.describe "Cascade Correction (#correct method)" do
           end
         }.to raise_error(
           ActiveRecord::Bitemporal::ValidDatetimeRangeError,
-          /exceeds timeline end/
+          /exceeds timeline end .* Reopen the timeline or cancel its termination first to extend it\.\z/
         )
       end
 

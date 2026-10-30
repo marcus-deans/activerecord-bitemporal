@@ -319,7 +319,7 @@ employee.correct(valid_from: feb_1, name: "X")  # No valid_to!
 
 This is the safest option when you only need to correct a specific error without affecting the entire future timeline.
 
-### Comparison: `update` vs `force_update` vs `correct` vs `shift_genesis` vs `terminate`
+### Comparison: `update` vs `force_update` vs `correct` vs `shift_genesis` vs `terminate` vs `reopen`
 
 | Method | Purpose | Preserves Future Changes | Changes Attributes | Undo Method |
 |--------|---------|--------------------------|-------------------|-------------|
@@ -328,6 +328,7 @@ This is the safest option when you only need to correct a specific error without
 | `correct` | Fix historical error | ✅ Yes (CASCADE) | Yes | — |
 | `shift_genesis` | Change when entity's timeline begins | ✅ Yes (untouched) | No (purely temporal) | `cancel_shift_genesis` |
 | `terminate` | End entity's timeline at a specific date | ✅ Yes (before termination point) | No (purely temporal) | `cancel_termination` |
+| `reopen` | Lift a terminated timeline's end | ✅ Yes (only the last segment changes) | No (purely temporal) | `terminate` at the old end |
 
 ### Example: Correcting a Salary Error
 
@@ -375,13 +376,13 @@ end
 
 ### The Timeline After an Operation
 
-`correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` each leave the entity's current timeline with no seam (two adjacent segments with the same values) and no zero-length row (`valid_from` equal to `valid_to`), whatever they found there. An `update!` that sets the values the next segment already has leaves a seam, and a `destroy` at a segment's exact start leaves a zero-length row. The operation merges or closes them anywhere in the timeline, so on such a timeline it writes to do that even when it otherwise changes nothing: shifting to the current genesis, terminating at the current end, or a cancel with nothing to cancel.
+`correct`, `shift_genesis`, `terminate`, `reopen`, `cancel_shift_genesis` and `cancel_termination` each leave the entity's current timeline with no seam (two adjacent segments with the same values) and no zero-length row (`valid_from` equal to `valid_to`), whatever they found there. An `update!` that sets the values the next segment already has leaves a seam, and a `destroy` at a segment's exact start leaves a zero-length row. The operation merges or closes them anywhere in the timeline, so on such a timeline it writes to do that even when it otherwise changes nothing: shifting to the current genesis, terminating at the current end, reopening a timeline that isn't terminated, or a cancel with nothing to cancel.
 
 Segments whose range and values don't change keep their rows, so a cancel rewrites only the segments the operation it undoes changed. A zero-length row holds no version, so the operations look past it, and so do `terminated?` and `shifted_genesis?`: an entity whose only current rows are zero-length raises `ActiveRecord::RecordNotFound`, and reads as neither terminated nor shifted.
 
 ### The Record After an Operation
 
-`correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` leave the record you called them on as `reload` would: on the current version valid at the time the record was loaded at (now, unless it was loaded with `valid_at`/`find_at_time`), with every attribute fresh and nothing left to save. The model's own `reload` overrides run too. When no version is valid at that time (a timeline ended in the past, or starting in the future), the record takes the latest version starting before it, else the first one.
+`correct`, `shift_genesis`, `terminate`, `reopen`, `cancel_shift_genesis` and `cancel_termination` leave the record you called them on as `reload` would: on the current version valid at the time the record was loaded at (now, unless it was loaded with `valid_at`/`find_at_time`), with every attribute fresh and nothing left to save. The model's own `reload` overrides run too. When no version is valid at that time (a timeline ended in the past, or starting in the future), the record takes the latest version starting before it, else the first one.
 
 ```ruby
 employee = Employee.find(id)           # name: "B"
@@ -395,7 +396,7 @@ Like `reload`, an operation discards unsaved changes on the record. A call that 
 
 ### Blocks and Scopes Around an Operation
 
-`correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` always work on the entity's whole current timeline, as `update!` records at now. They read its rows unscoped, so a `transaction_at`, `valid_at` or `bitemporal_at` block around the call (with `!` or without), a `scoping` block, or the model's own `default_scope` hides none of them:
+`correct`, `shift_genesis`, `terminate`, `reopen`, `cancel_shift_genesis` and `cancel_termination` always work on the entity's whole current timeline, as `update!` records at now. They read its rows unscoped, so a `transaction_at`, `valid_at` or `bitemporal_at` block around the call (with `!` or without), a `scoping` block, or the model's own `default_scope` hides none of them:
 
 ```ruby
 ActiveRecord::Bitemporal.transaction_at(last_week) do
@@ -413,7 +414,7 @@ The history a cancel walks back through, and `terminated?` and `shifted_genesis?
 
 ### Validations and Callbacks During an Operation
 
-`correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` insert each new row with `save_without_bitemporal_callbacks!(validate: false)`, as upstream inserts the rows of an `update!` or `destroy`, and close each old row with `update_columns`.
+`correct`, `shift_genesis`, `terminate`, `reopen`, `cancel_shift_genesis` and `cancel_termination` insert each new row with `save_without_bitemporal_callbacks!(validate: false)`, as upstream inserts the rows of an `update!` or `destroy`, and close each old row with `update_columns`.
 
 #### Validations
 
@@ -428,7 +429,7 @@ employee.validate!                     # raises ActiveRecord::RecordInvalid if t
 employee.correct(valid_from: jan_1, **attributes)
 ```
 
-The gem doesn't validate the rows itself because `correct` is a patch: each segment in the span keeps its own values for the attributes you don't pass. Validating every row would hold your correction to data you never touched, such as an older value that a validation added later rejects. `terminate`, `shift_genesis` and the cancels write only values already stored.
+The gem doesn't validate the rows itself because `correct` is a patch: each segment in the span keeps its own values for the attributes you don't pass. Validating every row would hold your correction to data you never touched, such as an older value that a validation added later rejects. `terminate`, `shift_genesis`, `reopen` and the cancels write only values already stored.
 
 #### Callbacks
 
@@ -441,7 +442,7 @@ The gem doesn't validate the rows itself because `correct` is a patch: each segm
 
 The commit callbacks run once because upstream's `after_create` sets each inserted row's `id` to the entity's `bitemporal_id`. Every row the operation inserts then has the same class and `id`, and Rails runs commit callbacks on only one instance per class and `id` in a transaction (which one follows Rails' `run_commit_callbacks_on_first_saved_instances_in_transaction`). So an app can hang expensive work off `after_commit` without it running once per row.
 
-- Every row an operation inserts is a create, so create callbacks such as `after_create` and `after_create_commit` run for a correction, a termination or a cancel too, not only when the entity is first created.
+- Every row an operation inserts is a create, so create callbacks such as `after_create` and `after_create_commit` run for a correction, a termination, a reopen or a cancel too, not only when the entity is first created.
 - Callbacks run on the inserted rows, each a new copy of a version with its own valid range, not on the record you called the operation on.
 - On an inserted row, `saved_change_to_<attribute>?` is true for every column that holds a value, not only for the attributes the operation changed, because the row is a fresh copy. A `correct` of `name` reports `salary` as changed too.
 - A call that writes nothing (it changes nothing, and finds no seam or zero-length row to fix) runs no callback, `after_commit` included.
@@ -562,7 +563,7 @@ Employee.find_at_time(feb_1, employee.id)
 
 ### Canceling a Genesis Shift
 
-The `cancel_shift_genesis` method reverses a genesis shift by restoring the complete pre-shift timeline from transaction history:
+The `cancel_shift_genesis` method reverses a genesis shift by restoring, from transaction history, the complete timeline the entity had at its original genesis:
 
 ```ruby
 # Original: Timeline starts in March
@@ -573,7 +574,7 @@ employee.shift_genesis(new_valid_from: jan_1)
 employee.cancel_shift_genesis
 ```
 
-**Important:** `cancel_shift_genesis` is an **undo** — it restores the timeline exactly as it stood just before the most recent genesis shift. It never discards anything: if anything was recorded for the entity after that shift (a `correct`, an upstream `update!`, a `terminate`, ...), it **refuses**. It raises `ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError`, writes nothing, and leaves the record as it was. That error is a subclass of `PreShiftGenesisStateNotFoundError`, so a `rescue` of that class catches it too:
+**Important:** `cancel_shift_genesis` is an **undo** — it restores the most recent timeline that started at the original genesis, exactly as it stood just before the genesis moved off it, as `cancel_termination` restores the most recent timeline that wasn't terminated. It never discards anything: if anything was recorded for the entity after that shift (a `correct`, an upstream `update!`, a `terminate`, another `shift_genesis`, ...), it **refuses**. It raises `ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError`, writes nothing, and leaves the record as it was. That error is a subclass of `PreShiftGenesisStateNotFoundError`, so a `rescue` of that class catches it too:
 
 ```ruby
 employee.shift_genesis(new_valid_from: jan_1)
@@ -584,7 +585,17 @@ employee.cancel_shift_genesis
 #    (the correction would be discarded; nothing is written)
 ```
 
-Cancel is a no-op if the entity's genesis has never been shifted (returns `true`, writing only to merge seams or close zero-length rows left in the timeline, see [The Timeline After an Operation](#the-timeline-after-an-operation)).
+So a cancel undoes one shift. After two shifts it refuses, since the second was recorded after the first moved the genesis off the original:
+
+```ruby
+employee.shift_genesis(new_valid_from: feb_1)  # original genesis: January
+employee.shift_genesis(new_valid_from: apr_1)
+
+employee.cancel_shift_genesis
+# => ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError
+```
+
+Cancel is a no-op if the entity's genesis is its original one: never shifted, shifted back to it, or already canceled (returns `true`, writing only to merge seams or close zero-length rows left in the timeline, see [The Timeline After an Operation](#the-timeline-after-an-operation)). A `shift_genesis` back to the original genesis is not an undo, though: segments a forward shift removed stay removed, and the first segment left is extended back instead.
 
 ### Checking Genesis Shift Status
 
@@ -635,7 +646,7 @@ employee.terminate(termination_time: Date.new(2024, 3, 1))
 | **Time dimension** | Valid time (`valid_to`) | Transaction time (`transaction_to`) |
 | **Meaning** | "Entity stopped being valid at date X" | "We no longer know about this entity" |
 | **Historical queries** | ✅ `find_at_time` still works for dates before termination | ❌ Record is logically deleted |
-| **Reversible?** | ✅ `cancel_termination` restores the full pre-termination timeline, as long as nothing was recorded for the entity after the termination (otherwise it refuses) | Requires manual recreation |
+| **Reversible?** | ✅ `cancel_termination` restores the full pre-termination timeline, as long as nothing was recorded for the entity after the termination (otherwise it refuses). `reopen` lifts the end whatever was recorded since, without the removed segments | Requires manual recreation, except for the end a destroy of the last segment leaves, which `reopen` lifts |
 | **What changes** | Last segment's `valid_to` is set to termination date; segments after are removed | Record's `transaction_to` is set to deletion time |
 
 ### Basic Termination
@@ -693,6 +704,67 @@ employee.cancel_termination
 
 Cancel is a no-op if the entity is not currently terminated (returns `true`, writing only to merge seams or close zero-length rows left in the timeline, see [The Timeline After an Operation](#the-timeline-after-an-operation)).
 
+### Reopen
+
+`reopen` lifts the end of a terminated timeline: the last segment continues, with the values it already has, to infinity. It's the end-side mirror of a backward `shift_genesis`, which extends the first segment's values earlier.
+
+```ruby
+# Before (terminated):
+#   Alice           Bob
+#   |---------------|------|
+#   Jan            Mar    Apr
+
+employee.reopen
+
+# After (reopened):
+#   Alice           Bob
+#   |---------------|----------->
+#   Jan            Mar            ∞
+```
+
+Only Bob's row is rewritten; Alice keeps hers. Carol, whom the termination removed, stays removed.
+
+#### `cancel_termination` or `reopen`?
+
+`cancel_termination` is an **undo**: it reads transaction history and puts the timeline back as it stood before the termination, segments past the end included, and it refuses once anything has been recorded since. `reopen` is an **edit**, like `terminate` and `correct`: it changes the current timeline in valid time, never reads history, and works whatever was recorded since.
+
+| | `cancel_termination` | `reopen` |
+|---|---|---|
+| **What it does** | Restores the timeline from before the termination | Continues the last segment to infinity |
+| **Segments the termination removed** | ✅ Brought back | Stay removed |
+| **Something recorded after the termination** | Refuses (`RecordedSinceTerminationError`), writes nothing | ✅ Kept |
+| **Reads transaction history** | Yes | No |
+
+So a change scheduled past the end comes back with `cancel_termination`, not with `reopen`:
+
+```ruby
+# Alice (Jan) → Bob (Mar) → Carol (May), terminated at Apr
+employee.cancel_termination
+# Alice (Jan-Mar) → Bob (Mar-May) → Carol (May-∞)
+
+# whereas reopen gives:
+# Alice (Jan-Mar) → Bob (Mar-∞), and Carol stays removed
+```
+
+Once something has been recorded after the termination, only `reopen` lifts the end:
+
+```ruby
+employee.terminate(termination_time: may_1)
+employee.correct(valid_from: feb_1, valid_to: mar_1, name: "X")
+
+employee.cancel_termination
+# => ActiveRecord::Bitemporal::RecordedSinceTerminationError
+
+employee.reopen
+# Result: A (Jan-Feb) → X (Feb-Mar) → B (Mar-∞), the correction kept
+```
+
+An end in the past is lifted like one in the future, and so is the end a `destroy` of the last segment leaves: the destroyed segment continues, as `cancel_termination` would restore it. A `destroy` at the last segment's exact start leaves only a zero-length row there, which holds no version, so `reopen` continues the segment before it and closes that row.
+
+To move an end **later**, reopen and then terminate at the new end, in one transaction (see [Re-Termination](#re-termination)).
+
+Reopen is a no-op if the entity is not currently terminated (returns `true`, writing only to merge seams or close zero-length rows left in the timeline). An entity with no current-knowledge records raises `ActiveRecord::RecordNotFound`.
+
 ### Checking Termination Status
 
 The `terminated?` predicate checks whether the entity's last segment has a finite `valid_to`:
@@ -741,7 +813,7 @@ employee.correct(valid_from: may_1, name: "X")
 employee.terminate(termination_time: may_1)
 employee.correct(valid_from: feb_1, valid_to: jul_1, name: "X")
 # => ActiveRecord::Bitemporal::ValidDatetimeRangeError
-# (correction valid_to exceeds timeline end — cancel termination first)
+# (correction valid_to exceeds timeline end — reopen or cancel the termination first)
 ```
 
 ### Re-Termination
@@ -753,14 +825,16 @@ You can re-terminate at an **earlier** point without canceling first:
 employee.terminate(termination_time: mar_1)  # Further truncates to March
 ```
 
-To re-terminate at a **later** point, you must cancel first then re-terminate:
+To re-terminate at a **later** point, reopen first, then terminate at the new end. Wrap both in a transaction to make the move atomic:
 
 ```ruby
-employee.cancel_termination
-employee.terminate(termination_time: jul_1)
+Employee.transaction do
+  employee.reopen
+  employee.terminate(termination_time: jul_1)
+end
 ```
 
-That cancel refuses once anything has been recorded for the entity after the termination, including a re-termination at an earlier point. No timeline operation extends an ended timeline, so in that case the timeline can only be extended by hand.
+`reopen` continues the current last segment, so the segments the termination removed stay removed, and it works whatever was recorded since. To bring those segments back, undo the termination with `cancel_termination` before terminating at the new end instead. That cancel refuses once anything has been recorded for the entity after the termination, including a re-termination at an earlier point.
 
 ### Error Handling
 
@@ -769,7 +843,7 @@ That cancel refuses once anything has been recorded for the entity after the ter
 employee.terminate(termination_time: Date.new(1900, 1, 1))
 # => ArgumentError: termination_time must be greater than first valid_from
 
-# Cannot extend past current termination (use cancel_termination first)
+# Cannot extend past current termination (reopen first, or cancel_termination)
 employee.terminate(termination_time: later_date)
 # => ArgumentError: termination_time exceeds last segment's valid_to
 
@@ -804,7 +878,7 @@ Employee.find_at_time(may_1, employee.id)
 
 ## Concurrency
 
-`correct`, `shift_genesis`, `terminate`, `cancel_shift_genesis` and `cancel_termination` lock the entity's timeline before they read it, and hold the locks until the surrounding transaction ends. They need PostgreSQL: the locks use its advisory lock functions.
+`correct`, `shift_genesis`, `terminate`, `reopen`, `cancel_shift_genesis` and `cancel_termination` lock the entity's timeline before they read it, and hold the locks until the surrounding transaction ends. They need PostgreSQL: the locks use its advisory lock functions.
 
 Each operation takes, in this order:
 
@@ -1228,10 +1302,11 @@ position.valid_at(3.days.ago) { |p| p.update!(rate: 200) }  # Backdated change
 position.force_update { |p| p.update(rate: 200) }  # Correction (not temporal)
 position.correct(valid_from: feb_1, name: "X")    # Retroactive correction (preserves cascade)
 position.shift_genesis(new_valid_from: jan_1)      # Change when timeline begins
-position.cancel_shift_genesis                      # Undo the last genesis shift (refuses if anything was recorded since)
+position.cancel_shift_genesis                      # Undo to the original genesis (refuses if anything was recorded since)
 position.shifted_genesis?                          # Check if genesis differs from original
 position.terminate(termination_time: mar_1)        # End timeline at specific date
 position.cancel_termination                        # Undo termination (refuses if anything was recorded since)
+position.reopen                                    # Lift the end: last segment continues to ∞ (keeps what was recorded since)
 position.terminated?                               # Check if timeline has finite end
 
 # Queries

@@ -2,7 +2,7 @@
 
 require 'spec_helper'
 
-RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminated?)" do
+RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #reopen, #terminated?)" do
   # ==========================================================================
   # Test Helpers
   # ==========================================================================
@@ -42,6 +42,13 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
       .within_deleted
       .where(bitemporal_id: record.bitemporal_id)
       .order(:transaction_from, :valid_from)
+  end
+
+  # Every row of the entity, each with its own key and every column
+  def history(record)
+    all_records(record)
+      .map { |row| row.attributes.merge("swapped_id" => row.swapped_id) }
+      .sort_by { |row| row["swapped_id"] }
   end
 
   # Find an employee by bitemporal_id, even if terminated (ignores valid time scoping)
@@ -636,13 +643,6 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
 
       subject(:cancel) { Timecop.freeze("2020/10/06") { employee.cancel_termination } }
 
-      # Every row of the entity, each with its own key and every column
-      def history(record)
-        all_records(record)
-          .map { |row| row.attributes.merge("swapped_id" => row.swapped_id) }
-          .sort_by { |row| row["swapped_id"] }
-      end
-
       # Each write below happens on 10/03, between the termination and the cancel
       def record_after_termination(&block)
         Timecop.freeze("2020/10/03") { block.call(Employee.find_at_time(_01_01, employee_id)) }
@@ -653,6 +653,13 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
           expect { cancel }.to raise_error(
             ActiveRecord::Bitemporal::RecordedSinceTerminationError,
             /recorded .* after its termination; cancelling it would discard them/
+          )
+        end
+
+        it "points at reopen, which lifts the end and keeps them" do
+          expect { cancel }.to raise_error(
+            ActiveRecord::Bitemporal::RecordedSinceTerminationError,
+            /To lift the end and keep them, call reopen\z/
           )
         end
 
@@ -779,6 +786,201 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #terminat
             [_03_01, infinity, "B"],
           ]
         end
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Category 4b: Reopen
+  # ==========================================================================
+
+  # Reopen lifts the end of a terminated timeline: the last segment continues, with the
+  # values it has, to infinity. It's an edit, not an undo: it never reads history, so the
+  # segments a termination removed stay removed, and it works whatever was recorded after
+  # the termination.
+  describe "reopen" do
+    let(:_2021_01_01) { "2021/01/01".in_time_zone }
+    let(:reopened_at) { "2020/10/06".in_time_zone }
+
+    #   A |Jan, Mar)  B |Mar, May)  C |May, ∞)
+    let!(:employee_id) {
+      Timecop.freeze("2020/10/01") {
+        employee = ActiveRecord::Bitemporal.valid_at(_01_01) { Employee.create!(name: "A") }
+        ActiveRecord::Bitemporal.valid_at(_03_01) { employee.update!(name: "B") }
+        ActiveRecord::Bitemporal.valid_at(_05_01) { employee.update!(name: "C") }
+        employee.id
+      }
+    }
+    let(:employee) { Employee.find_at_time(_01_01, employee_id) }
+
+    subject(:reopen) { Timecop.freeze(reopened_at) { employee.reopen } }
+
+    def terminate_on(day, termination_time)
+      Timecop.freeze(day) { Employee.find_at_time(_01_01, employee_id).terminate(termination_time: termination_time) }
+    end
+
+    context "when terminated mid-segment" do
+      before { terminate_on("2020/10/02", _04_01) }
+
+      it "continues the last segment to infinity and leaves the removed segment out" do
+        expect(reopen).to be true
+        expect(current_timeline(employee)).to eq [
+          [_01_01, _03_01, "A"],
+          [_03_01, infinity, "B"],
+        ]
+      end
+
+      it "closes the last row and inserts its continuation, at the reopen time" do
+        reopen
+
+        expect(all_records(employee).where(transaction_to: reopened_at).pluck(:valid_from, :valid_to, :name)).to eq [
+          [_03_01, _04_01, "B"],
+        ]
+        expect(all_records(employee).where(transaction_from: reopened_at).pluck(:valid_from, :valid_to, :name, :transaction_to)).to eq [
+          [_03_01, infinity, "B", tt_infinity],
+        ]
+      end
+
+      it "leaves the timeline unterminated" do
+        reopen
+        expect(find_ignoring_valid_time(employee)).not_to be_terminated
+      end
+    end
+
+    context "when terminated at a segment boundary" do
+      before { terminate_on("2020/10/02", _05_01) }
+
+      it "continues the segment before the boundary" do
+        expect(reopen).to be true
+        expect(current_timeline(employee)).to eq [
+          [_01_01, _03_01, "A"],
+          [_03_01, infinity, "B"],
+        ]
+      end
+    end
+
+    context "when a correct was recorded after the termination" do
+      before {
+        terminate_on("2020/10/02", _04_01)
+        Timecop.freeze("2020/10/03") {
+          Employee.find_at_time(_01_01, employee_id).correct(valid_from: _02_01, valid_to: _03_01, name: "X")
+        }
+      }
+
+      it "is a timeline cancel_termination refuses" do
+        expect { Timecop.freeze(reopened_at) { employee.cancel_termination } }.to raise_error(
+          ActiveRecord::Bitemporal::RecordedSinceTerminationError
+        )
+      end
+
+      it "lifts the end and keeps the correction" do
+        expect(reopen).to be true
+        expect(current_timeline(employee)).to eq [
+          [_01_01, _02_01, "A"],
+          [_02_01, _03_01, "X"],
+          [_03_01, infinity, "B"],
+        ]
+      end
+    end
+
+    context "when re-terminated earlier" do
+      before {
+        terminate_on("2020/10/02", _04_01)
+        terminate_on("2020/10/03", _02_01)
+      }
+
+      it "continues the segment the last termination left" do
+        expect(reopen).to be true
+        expect(current_timeline(employee)).to eq [
+          [_01_01, infinity, "A"],
+        ]
+      end
+    end
+
+    context "when the end is after now" do
+      before { terminate_on("2020/10/02", _2021_01_01) }
+
+      it "lifts it as one in the past" do
+        expect(reopen).to be true
+        expect(current_timeline(employee)).to eq [
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"],
+          [_05_01, infinity, "C"],
+        ]
+      end
+    end
+
+    # An upstream destroy of the version valid at Jul ends C at Jul
+    context "when an upstream destroy ended the last segment" do
+      before {
+        Timecop.freeze("2020/10/02") { ActiveRecord::Bitemporal.valid_at(_07_01) { Employee.find(employee_id).destroy } }
+      }
+
+      it "continues the destroyed segment" do
+        expect(current_timeline(employee)).to eq [
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"],
+          [_05_01, _07_01, "C"],
+        ]
+
+        expect(reopen).to be true
+        expect(current_timeline(employee)).to eq [
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"],
+          [_05_01, infinity, "C"],
+        ]
+      end
+    end
+
+    # An upstream destroy at C's exact start leaves C |May, May), which holds no time
+    context "when an upstream destroy at the last segment's start left a zero-length row" do
+      before {
+        Timecop.freeze("2020/10/02") { ActiveRecord::Bitemporal.valid_at(_05_01) { Employee.find(employee_id).destroy } }
+      }
+
+      it "continues the segment before it and closes the zero-length row" do
+        expect(current_timeline(employee)).to eq [
+          [_01_01, _03_01, "A"],
+          [_03_01, _05_01, "B"],
+          [_05_01, _05_01, "C"],
+        ]
+
+        expect(reopen).to be true
+        expect(current_timeline(employee)).to eq [
+          [_01_01, _03_01, "A"],
+          [_03_01, infinity, "B"],
+        ]
+      end
+    end
+
+    context "when the timeline isn't terminated" do
+      it "writes nothing" do
+        history_before = history(employee)
+
+        expect(reopen).to be true
+        expect(history(employee)).to eq history_before
+      end
+    end
+
+    context "when reopened twice" do
+      before {
+        terminate_on("2020/10/02", _04_01)
+        Timecop.freeze("2020/10/03") { Employee.find_at_time(_01_01, employee_id).reopen }
+      }
+
+      it "writes nothing the second time" do
+        history_before = history(employee)
+
+        expect(reopen).to be true
+        expect(history(employee)).to eq history_before
+      end
+    end
+
+    context "when no current row exists" do
+      let(:employee) { Employee.new(name: "ghost", bitemporal_id: 99999) }
+
+      it "raises RecordNotFound" do
+        expect { reopen }.to raise_error(ActiveRecord::RecordNotFound)
       end
     end
   end
