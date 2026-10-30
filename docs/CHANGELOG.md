@@ -9,6 +9,7 @@ What this fork of [kufu/activerecord-bitemporal](https://github.com/kufu/activer
   - A bounded correction is a patch, like SQL:2011's `UPDATE ... FOR PORTION OF`: each segment in the span keeps its own values for the attributes not given, gaps stay gaps, and segments it wouldn't change keep their rows ([#12](https://github.com/marcus-deans/activerecord-bitemporal/pull/12)).
   - A bitemporal column, or an alias of one, among the attributes raises `ArgumentError` ([#12](https://github.com/marcus-deans/activerecord-bitemporal/pull/12)).
   - A `valid_to` past the timeline's end raises `ValidDatetimeRangeError` ([#6](https://github.com/marcus-deans/activerecord-bitemporal/pull/6)).
+  - `correcting?` is removed. It read `bitemporal_option[:correcting]`, which `correct` set while it ran and nothing else read; `correct` no longer sets it ([#27](https://github.com/marcus-deans/activerecord-bitemporal/pull/27)).
 - `shift_genesis(new_valid_from:)` moves the start of the timeline without changing any values: backward extends the first segment, forward removes and trims the segments before the new start ([#2](https://github.com/marcus-deans/activerecord-bitemporal/pull/2)).
 - `terminate(termination_time:)` ends the timeline, truncating the segment that spans the end and removing those after it. `cancel_termination` restores the timeline from before the termination, and `terminated?` says whether the timeline has a finite end ([#5](https://github.com/marcus-deans/activerecord-bitemporal/pull/5)).
 - `cancel_shift_genesis` restores the timeline from before a genesis shift, and `shifted_genesis?` says whether the genesis differs from the original one ([#7](https://github.com/marcus-deans/activerecord-bitemporal/pull/7)). It restores the most recent timeline at the original genesis, so it undoes one shift and never toggles between two shifted ones ([#22](https://github.com/marcus-deans/activerecord-bitemporal/pull/22)).
@@ -52,6 +53,7 @@ What this fork of [kufu/activerecord-bitemporal](https://github.com/kufu/activer
 ## Code Layout
 
 - Fork code lives in `lib/activerecord-bitemporal/fork.rb` and `timeline_operations.rb`. Upstream's files are unchanged, apart from the line that requires `fork.rb`, and the operations share one skeleton, `perform_timeline_operation` ([#10](https://github.com/marcus-deans/activerecord-bitemporal/pull/10)).
+- The operations share their guard, piece building and transaction-history walk, so each step is written once ([#27](https://github.com/marcus-deans/activerecord-bitemporal/pull/27)).
 - Merged upstream v7.0.2 and later ([#8](https://github.com/marcus-deans/activerecord-bitemporal/pull/8)).
 - Merged upstream master as of `8837a71`, which drops Rails 7.1 ([#24](https://github.com/marcus-deans/activerecord-bitemporal/pull/24)). Upstream syncs land as merge commits, so kufu's master stays an ancestor.
 
