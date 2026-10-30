@@ -63,16 +63,12 @@ module ForkProperty
           .distinct.pluck(:transaction_to)
           .sort
         change_points.each do |change_point|
-          state = timeline_rows
-            .where(table[:transaction_from].lt(change_point))
-            .where(table[:transaction_to].gteq(change_point))
-            .order(valid_from_key => :asc)
-            .to_a
-            .each { |row|
-              row.id = row.swapped_id
-              row.clear_changes_information
-            }
-            .reject { |row| zero_length?(row) }
+          state = load_segments(
+            timeline_rows
+              .where(table[:transaction_from].lt(change_point))
+              .where(table[:transaction_to].gteq(change_point))
+              .order(valid_from_key => :asc)
+          ).reject { |row| zero_length?(row) }
           next if state.empty?
           return [state, change_point] if yield(state)
         end

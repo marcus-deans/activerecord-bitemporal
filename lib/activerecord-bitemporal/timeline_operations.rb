@@ -599,14 +599,20 @@ module ActiveRecord
       end
 
       def find_all_current_knowledge_segments
-        current_knowledge_rows
-          # valid_to breaks ties, so a zero-length row comes before the segment it shares a start with
-          .order(valid_from_key => :asc, valid_to_key => :asc)
-          .to_a
-          .each { |record|
-            record.id = record.swapped_id
-            record.clear_changes_information
-          }
+        load_segments(
+          current_knowledge_rows
+            # valid_to breaks ties, so a zero-length row comes before the segment it shares a start with
+            .order(valid_from_key => :asc, valid_to_key => :asc)
+        )
+      end
+
+      # Loads relation's rows as segments: each with its own row's id, where loading puts the
+      # bitemporal_id (see swapped_id), so timeline_close updates that row; and no changes
+      def load_segments(relation)
+        relation.to_a.each { |record|
+          record.id = record.swapped_id
+          record.clear_changes_information
+        }
       end
 
       def build_genesis_backward_shift(genesis, new_valid_from, current_time)
@@ -759,16 +765,12 @@ module ActiveRecord
           .sort.reverse
 
         change_points.each do |cp|
-          state = timeline_rows
-            .where(self.class.arel_table[:transaction_from].lt(cp))
-            .where(self.class.arel_table[:transaction_to].gteq(cp))
-            .order(valid_from_key => :asc)
-            .to_a
-            .each { |r|
-              r.id = r.swapped_id
-              r.clear_changes_information
-            }
-            .reject { |r| zero_length?(r) }
+          state = load_segments(
+            timeline_rows
+              .where(self.class.arel_table[:transaction_from].lt(cp))
+              .where(self.class.arel_table[:transaction_to].gteq(cp))
+              .order(valid_from_key => :asc)
+          ).reject { |r| zero_length?(r) }
 
           next if state.empty?
           return [state, cp] if yield(state)
