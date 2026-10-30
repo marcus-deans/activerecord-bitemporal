@@ -255,6 +255,44 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #reopen, 
         ])
       end
     end
+
+    # Test 1.6: Inside a gap
+    #
+    # An upstream destroy at Mar ends only the segment valid at Mar, leaving a gap
+    # before C. The entity doesn't exist in the gap, so a termination there ends
+    # the timeline where the gap starts.
+    context "termination inside a gap" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          ActiveRecord::Bitemporal.valid_at(_01_01) { @employee = Employee.create!(name: "A") }
+          ActiveRecord::Bitemporal.valid_at(_05_01) { @employee.update!(name: "C") }
+        end
+        Timecop.freeze("2020/10/02") do
+          Employee.find_at_time(_03_01, @employee.id).destroy
+        end
+      end
+
+      # before: A                       C
+      #         |-------------|  (gap)  |----------->
+      #         Jan          Mar       May          ∞
+      #
+      # terminate(termination_time: Apr)
+      #                  ↓
+      # after:  A
+      #         |-------------|
+      #         Jan          Mar
+      it "ends the timeline at the gap's start, removing the segments after it" do
+        employee = Employee.find_at_time(_02_01, @employee.id)
+
+        Timecop.freeze("2020/10/06") do
+          employee.terminate(termination_time: _04_01)
+        end
+
+        expect(current_timeline(employee)).to eq([
+          [_01_01, _03_01, "A"]
+        ])
+      end
+    end
   end
 
   # ==========================================================================
@@ -618,6 +656,34 @@ RSpec.describe "Timeline Termination (#terminate, #cancel_termination, #reopen, 
           [_02_01, _03_01, "X"],
           [_03_01, _05_01, "B"]
         ])
+      end
+    end
+
+    # Test 4.6: Entity created with a finite end
+    #
+    # The timeline has ended since it was created, so history holds no timeline with an
+    # infinite end to restore.
+    context "entity created with a finite end" do
+      before do
+        Timecop.freeze("2020/10/01") do
+          @employee = Employee.create!(name: "A", valid_from: _01_01, valid_to: _03_01)
+        end
+      end
+
+      it "raises PreTerminationStateNotFoundError and writes nothing" do
+        employee = Employee.find_at_time(_02_01, @employee.id)
+        history_before = history(employee)
+
+        expect(employee.terminated?).to be true
+        expect {
+          Timecop.freeze("2020/10/06") do
+            employee.cancel_termination
+          end
+        }.to raise_error(
+          ActiveRecord::Bitemporal::PreTerminationStateNotFoundError,
+          /\ACannot determine pre-termination state/
+        )
+        expect(history(employee)).to eq history_before
       end
     end
 

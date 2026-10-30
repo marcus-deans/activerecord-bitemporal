@@ -255,7 +255,7 @@ INPUT: entity_id, correction_time, new_attributes
 2. IDENTIFY affected records:
    SELECT * FROM table
    WHERE entity_id = :entity_id
-     AND valid_from <= :correction_end
+     AND valid_from < :correction_end
      AND valid_to > :correction_start
      AND transaction_to = ∞
 
@@ -264,12 +264,12 @@ INPUT: entity_id, correction_time, new_attributes
    SET transaction_to = NOW
    WHERE record_id IN (affected_records)
 
-4. BUILD new timeline (CASCADE LOGIC):
-   FOR each affected period:
-     IF period overlaps correction:
-       Split and apply correction
-     ELSE:
-       Preserve existing values with cascade
+4. BUILD replacement records (CASCADE LOGIC):
+   FOR each affected record:
+     Split it at the correction's edges
+     Apply the correction to the part inside the correction period
+     Keep the parts outside it with their existing values
+   Records outside the correction period aren't affected: they keep their rows
 
 5. INSERT new records:
    All with transaction_from = NOW, transaction_to = ∞
@@ -322,17 +322,16 @@ After T2:
 ```
 Operation: RETROACTIVE UPDATE salary=55000 EFFECTIVE 2024-02-01
 
-Critical: Must close ALL affected records (ID=4, ID=5, ID=6) BEFORE inserting new timeline
+The correction runs to the next change (Mar 1), so only ID=4 is affected.
+Critical: Must close it BEFORE inserting the records that replace it.
 
 After T3:
   ID=1-3: [unchanged, already closed]
   ID=4: salary=50000, VT[2024-01-01, 2024-03-01), TT[T2, T3] -- closed
-  ID=5: salary=60000, VT[2024-03-01, 2024-05-01), TT[T2, T3] -- closed
-  ID=6: salary=70000, VT[2024-05-01, ∞), TT[T2, T3]          -- closed
-  ID=7: salary=50000, VT[2024-01-01, 2024-02-01), TT[T3, ∞)  -- new timeline
+  ID=5: salary=60000, VT[2024-03-01, 2024-05-01), TT[T2, ∞)  -- preserved (row kept)
+  ID=6: salary=70000, VT[2024-05-01, ∞), TT[T2, ∞)           -- preserved (row kept)
+  ID=7: salary=50000, VT[2024-01-01, 2024-02-01), TT[T3, ∞)  -- trimmed
   ID=8: salary=55000, VT[2024-02-01, 2024-03-01), TT[T3, ∞)  -- corrected period
-  ID=9: salary=60000, VT[2024-03-01, 2024-05-01), TT[T3, ∞)  -- preserved
-  ID=10: salary=70000, VT[2024-05-01, ∞), TT[T3, ∞)          -- preserved
 ```
 
 ### 5.6 Why Order Matters - Validation Timing
@@ -752,9 +751,9 @@ Mitigation strategies:
 
 ### 12.2 Incomplete Timeline Updates
 
-**Pitfall**: Only updating affected period, not entire timeline
-**Result**: Inconsistent state, orphaned periods
-**Solution**: Always rebuild complete timeline atomically
+**Pitfall**: Replacing only some of the records a change overlaps, or replacing them across several transactions
+**Result**: Inconsistent state, overlapping or orphaned periods
+**Solution**: Read the whole current timeline, then close and replace every record the change affects in one transaction. Records it doesn't affect keep their rows
 
 ### 12.3 Missing Temporal Indexes
 
@@ -809,23 +808,31 @@ Recommended:
 
 ### 13.3 API Design Principles
 
+Each kind of change gets its own operation. This gem's API:
+
 ```ruby
-# Clear operation separation
-class BitemporalRecord
-  # Temporal change - fact changes over time
-  def update_at(valid_time, attributes)
+# Temporal change - fact changes over time
+record.update!(attributes)                            # from now
+record.valid_at(time) { record.update!(attributes) }  # from a past or future time
 
-  # Data correction - fix incorrect data
-  def correct(attributes)
+# Data correction - fix the version the record holds, over its whole range
+record.force_update { record.update!(attributes) }
 
-  # Retroactive update - complex timeline change
-  def retroactive_update(valid_time, attributes)
+# Retroactive correction - patch a valid-time range, keeping later changes
+record.correct(valid_from:, valid_to: nil, **attributes)
 
-  # Query interfaces
-  def as_of(valid_time)
-  def as_of_transaction(transaction_time)
-  def history(from: nil, to: nil)
-end
+# Moving the timeline's edges
+record.shift_genesis(new_valid_from:)
+record.terminate(termination_time:)
+record.reopen
+record.cancel_shift_genesis
+record.cancel_termination
+
+# Query interfaces
+Model.valid_at(valid_time)
+Model.transaction_at(transaction_time)
+Model.find_at_time(valid_time, id)
+Model.ignore_valid_datetime.where(bitemporal_id: id)  # every version
 ```
 
 ## 14. Distinction: Operation Types
@@ -858,8 +865,8 @@ end
 
 - **What**: Complex correction affecting multiple periods
 - **Example**: "Rate was 55000 from Feb, not 50000, affecting all subsequent changes"
-- **Effect**: Rebuilds entire affected timeline
-- **Records**: Closes all affected, inserts complete new timeline
+- **Effect**: Patches each period in the corrected range, keeping the changes inside and after it
+- **Records**: Closes only the records the correction changes, and inserts their replacements; the rest keep their rows
 - **Use When**: Correcting cascading historical errors
 
 ## 15. Implementation Checklist
@@ -927,7 +934,7 @@ A correct bitemporal implementation requires:
 2. **Atomic timeline updates** - Close all affected records before inserting new ones
 3. **Proper validation timing** - Validate after updates, not before
 4. **Clear operation semantics** - Distinguish corrections from temporal changes
-5. **Complete cascade handling** - Update entire affected timeline atomically
+5. **Complete cascade handling** - Read the whole timeline, and replace every record a change affects in one transaction
 
 ### The Critical Insight
 
@@ -945,7 +952,7 @@ Correct Retroactive Update:
 2. Lock affected entity
 3. Find all affected current records
 4. Close transaction times (SET transaction_to = NOW)
-5. Build complete new timeline
+5. Build their replacements (unaffected records keep their rows)
 6. Insert new records (transaction_from = NOW)
 7. Validate temporal constraints
 8. COMMIT or ROLLBACK

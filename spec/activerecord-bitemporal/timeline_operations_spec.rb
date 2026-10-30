@@ -2314,6 +2314,12 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           include_examples examples
         end
 
+        context "in a valid_at block at a time only A covers" do
+          let(:callers_block) { ->(operation) { ActiveRecord::Bitemporal.valid_at(_02_01) { operation.call } } }
+
+          include_examples examples
+        end
+
         context "in a valid_at! block at a time only A covers" do
           let(:callers_block) { ->(operation) { ActiveRecord::Bitemporal.valid_at!(_02_01) { operation.call } } }
 
@@ -3046,6 +3052,44 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
           resume << true
           operation.join
         end
+      end
+
+      # The gap docs/README.md describes under "What the Locks Don't Cover". A caller closes
+      # it by holding the advisory lock around such a write, as the example above that
+      # waits for a caller holding the advisory lock does.
+      it "serializes with an upstream update! made without the advisory lock" do
+        pending "upstream's save! takes no advisory lock, and on this entity its row lock covers no row"
+
+        written = Queue.new
+        resume = Queue.new
+        record = Employee.find_at_time(start, employee.id)
+        # Holds the operation after it has written, before it validates and commits
+        allow(record).to receive(:validate_cascade_correction_timeline!).and_wrap_original { |original, *args|
+          written << true
+          resume.pop
+          original.call(*args)
+        }
+        operation = in_thread { record.correct(valid_from: start + 30.days, name: "X") }
+        written.pop
+
+        stale = Employee.find_at_time(start, employee.id)
+        writer = in_thread { stale.valid_at(start + 60.days) { stale.update!(name: "U") } }
+        begin
+          # Waits until the writer has read the timeline: blocked on a row the operation holds, or done
+          Timeout.timeout(10) {
+            sleep 0.01 until !writer.alive? || ActiveRecord::Base.connection.select_value("SELECT count(*) FROM pg_locks WHERE NOT granted").positive?
+          }
+        ensure
+          resume << true
+          operation.join
+        end
+        writer.join
+
+        expect(current_timeline(employee)).to eq [
+          [start, start + 30.days, "A"],
+          [start + 30.days, start + 60.days, "X"],
+          [start + 60.days, ActiveRecord::Bitemporal::DEFAULT_VALID_TO, "U"],
+        ]
       end
 
       context "when the row valid now is stored after a future row" do
