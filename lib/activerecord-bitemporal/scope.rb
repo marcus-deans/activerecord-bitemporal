@@ -29,10 +29,6 @@ module ActiveRecord::Bitemporal
   end
 
   module Relation
-    # see: https://github.com/rails/rails/pull/51492
-    NARY_NODE = ActiveRecord.gem_version >= Gem::Version.new("7.2.0") ? Arel::Nodes::Nary : Arel::Nodes::And
-    private_constant :NARY_NODE
-
     using Module.new {
       refine ActiveRecord::Relation::WhereClause do
         using Module.new {
@@ -62,7 +58,7 @@ module ActiveRecord::Bitemporal
                 case node
                 when Arel::Nodes::LessThan, Arel::Nodes::LessThanOrEqual, Arel::Nodes::GreaterThan, Arel::Nodes::GreaterThanOrEqual
                   y << node if node && node.left.respond_to?(:relation)
-                when NARY_NODE
+                when Arel::Nodes::Nary
                   each_operatable_node(node.children) { |node| y << node }
                 when Arel::Nodes::Binary
                   each_operatable_node(node.left) { |node| y << node }
@@ -172,14 +168,25 @@ module ActiveRecord::Bitemporal
   module Scope
     extend ActiveSupport::Concern
 
+    # Rails 8.2+ takes an Arel attribute instead of the column name
+    if ::ActiveRecord.version >= ::Gem::Version.new("8.2.0.a")
+      def self.build_bind_attribute(predicate_builder, table, attr_name, value)
+        predicate_builder.build_bind_attribute(table[attr_name], value)
+      end
+    else
+      def self.build_bind_attribute(predicate_builder, _table, attr_name, value)
+        predicate_builder.build_bind_attribute(attr_name, value)
+      end
+    end
+
     module ActiveRecordRelationScope
       refine ::ActiveRecord::Relation do
         def bitemporal_where_bind(attr_name, operator, value)
-          where(table[attr_name].public_send(operator, predicate_builder.build_bind_attribute(attr_name, value)))
+          where(table[attr_name].public_send(operator, ::ActiveRecord::Bitemporal::Scope.build_bind_attribute(predicate_builder, table, attr_name, value)))
         end
 
         def bitemporal_where_bind!(attr_name, operator, value)
-          where!(table[attr_name].public_send(operator, predicate_builder.build_bind_attribute(attr_name, value)))
+          where!(table[attr_name].public_send(operator, ::ActiveRecord::Bitemporal::Scope.build_bind_attribute(predicate_builder, table, attr_name, value)))
         end
 
         def with_valid_datetime
@@ -260,7 +267,7 @@ module ActiveRecord::Bitemporal
           using NodeBitemporalInclude
 
           def bitemporal_rewhere_bind(attr_name, operator, value, table = self.table)
-            rewhere(table[attr_name].public_send(operator, predicate_builder.build_bind_attribute(attr_name, value)))
+            rewhere(table[attr_name].public_send(operator, ::ActiveRecord::Bitemporal::Scope.build_bind_attribute(predicate_builder, table, attr_name, value)))
           end
 
           [
