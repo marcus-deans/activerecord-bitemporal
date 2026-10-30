@@ -9,14 +9,15 @@ This document covers the internal architecture and implementation details of the
 3. [Update Mechanism](#update-mechanism)
 4. [Correction Mechanism](#correction-mechanism)
 5. [Termination Mechanism](#termination-mechanism)
-6. [Time Arguments](#time-arguments)
-7. [Timeline After an Operation](#timeline-after-an-operation)
-8. [Self After an Operation](#self-after-an-operation)
-9. [Uniqueness Validation](#uniqueness-validation)
-10. [ID Swapping Mechanism](#id-swapping-mechanism)
-11. [Query Scoping](#query-scoping)
-12. [Performance Considerations](#performance-considerations)
-13. [Limitations](#limitations)
+6. [Shift Genesis Mechanism](#shift-genesis-mechanism)
+7. [Time Arguments](#time-arguments)
+8. [Timeline After an Operation](#timeline-after-an-operation)
+9. [Self After an Operation](#self-after-an-operation)
+10. [Uniqueness Validation](#uniqueness-validation)
+11. [ID Swapping Mechanism](#id-swapping-mechanism)
+12. [Query Scoping](#query-scoping)
+13. [Performance Considerations](#performance-considerations)
+14. [Limitations](#limitations)
 
 ---
 
@@ -52,6 +53,17 @@ ActiveRecord::Bitemporal
 | `_reopen_record` | `timeline_operations.rb` | Main reopen implementation |
 | `build_termination_records` | `timeline_operations.rb` | Builds truncated timeline for termination |
 | `find_pre_termination_state` | `timeline_operations.rb` | Searches transaction history for pre-termination state |
+| `terminated?` | `timeline_operations.rb` | Whether the last segment that holds a time has a finite `valid_to` |
+| `shift_genesis` | `timeline_operations.rb` | Public API for moving the timeline's start |
+| `_shift_genesis_record` | `timeline_operations.rb` | Main shift genesis implementation |
+| `build_genesis_backward_shift` | `timeline_operations.rb` | Builds the earlier-starting first segment for a backward shift |
+| `build_genesis_forward_shift` | `timeline_operations.rb` | Builds the removed and trimmed segments for a forward shift |
+| `cancel_shift_genesis` | `timeline_operations.rb` | Public API for genesis shift reversal |
+| `_cancel_shift_genesis_record` | `timeline_operations.rb` | Main cancel shift genesis implementation |
+| `find_original_genesis` | `timeline_operations.rb` | The `valid_from` of the entity's first recorded row |
+| `find_pre_shift_genesis_state` | `timeline_operations.rb` | Searches transaction history for the last timeline at the original genesis |
+| `shifted_genesis?` | `timeline_operations.rb` | Whether the first segment that holds a time starts off the original genesis |
+| `recorded_since?` | `timeline_operations.rb` | Whether anything was recorded for the entity after a change point (the cancels' refusal) |
 
 ### Bitemporal Invariant
 
@@ -160,7 +172,7 @@ After:
   ID=2: rate=200, VT[Jan-1, ∞), TT[now, ∞)          # New (same valid period)
 ```
 
-**Important**: `force_update` ignores `valid_at` context - it always uses the record's own `valid_from`.
+**Important**: `force_update` ignores `valid_at` context - it always uses the record's own `valid_from`. So it rewrites the one stored version the record holds, over that version's whole range, and every other version keeps its row. On a record loaded now that's the current version: to fix an earlier one, load it with `find_at_time` first.
 
 #### Scenario 3: Gap Filling
 
@@ -172,7 +184,7 @@ When updating at a time with no existing record, a new record fills the gap up t
 
 ### Overview
 
-The `#correct` method implements cascade correction - fixing historical data while preserving subsequent changes. This differs from `force_update` which overwrites without preserving future changes.
+The `#correct` method implements cascade correction - fixing historical data while preserving subsequent changes. It takes the valid-time span to fix, whichever version `self` holds. This differs from `force_update`, which rewrites only the version `self` holds, over that version's whole range (see Scenario 2): a correction can fix part of a version, or a span across several.
 
 ### Algorithm
 
@@ -275,7 +287,7 @@ When correcting with only some attributes, each corrected piece keeps the non-co
 
 ### Overview
 
-The `#terminate` method sets a finite end date on an entity's valid-time timeline. Unlike `destroy` (which closes `transaction_to` to say "we no longer know about this"), `terminate` modifies `valid_to` to say "this entity stopped being valid at this date." The `#cancel_termination` method reverses a termination by recovering the pre-termination state from transaction history, and refuses when anything was recorded for the entity after the termination. The `#reopen` method lifts the end instead: it continues the current last segment to infinity, never reads transaction history, and works whatever was recorded after the termination.
+The `#terminate` method sets a finite end date on an entity's valid-time timeline, to say "this entity stopped being valid at this date": the segment valid then ends there, and every segment after it is removed. Upstream's `destroy` also ends a version in valid time, but only the one valid at the record's time: it closes that version's row and inserts a copy ending at that time, and later versions stay current (see Terminate vs Destroy below). The `#cancel_termination` method reverses a termination by recovering the pre-termination state from transaction history, and refuses when anything was recorded for the entity after the termination. The `#reopen` method lifts the end instead: it continues the current last segment to infinity, never reads transaction history, and works whatever was recorded after the termination.
 
 All three methods are whole-timeline operations — they fetch all current-knowledge segments for the entity and operate on them atomically, similar to `_correct_record` and `_shift_genesis_record`.
 
@@ -303,6 +315,8 @@ All three methods are whole-timeline operations — they fetch all current-knowl
 13. RELOAD self (see Self After an Operation)
 14. COMMIT TRANSACTION
 ```
+
+A `termination_time` inside a gap falls in no segment, so step 8 truncates nothing: the segments after the gap are removed, and the timeline ends where the gap starts.
 
 ### Cancel Termination Algorithm
 
@@ -337,7 +351,7 @@ All three methods are whole-timeline operations — they fetch all current-knowl
 14. COMMIT TRANSACTION
 ```
 
-`cancel_shift_genesis` follows the same steps. Its no-op in step 5 is a genesis equal to the original one, the `valid_from` of the entity's first recorded row. Step 6 walks back to the most recent timeline that starts at that original genesis, passing over any timeline an earlier shift left at another genesis, and step 7 raises `RecordedSinceGenesisShiftError`. So it undoes one shift: after two shifts it refuses, since the second was recorded after the first moved the genesis off the original. Both refusals happen before any write, so the transaction writes nothing and `self` is not reloaded. Each subclasses its cancel's not-found error, so a `rescue` of that error catches it.
+The refusal in step 7 happens before any write, so the transaction writes nothing and `self` is not reloaded. `RecordedSinceTerminationError` subclasses `PreTerminationStateNotFoundError`, so a `rescue` of that error catches it. A timeline that has ended since it was created (a record created with a finite `valid_to`) has no snapshot with an infinite end, so step 6 raises `PreTerminationStateNotFoundError`; `reopen` lifts such an end. `cancel_shift_genesis` follows the same steps (see [Cancel Shift Genesis Algorithm](#cancel-shift-genesis-algorithm)).
 
 ### Reopen Algorithm
 
@@ -369,23 +383,25 @@ When recreating records from historical state during cancel, `dup` copies the `d
 ### Terminate vs Destroy — Time Dimensions
 
 ```
-destroy: operates on TRANSACTION TIME
-  Before: record with transaction_to = ∞
-  After:  record with transaction_to = now (logically deleted)
-          + new historical record with valid_to = now
+Before: A              B              C
+        |--------------|--------------|----------->
+        Jan           Mar            May            ∞
 
-terminate: operates on VALID TIME
-  Before: A              B              C
-          |--------------|--------------|----------->
-          Jan           Mar            May            ∞
+destroy, on the record loaded at Apr: ends ONE VERSION
+  After:  A              B             C
+          |--------------|------|      |----------->
+          Jan           Mar    Apr    May            ∞
+          (B's row is closed and a copy ending at Apr inserted;
+           C stays current, so the timeline has a gap, not an end)
 
-  terminate(termination_time: Apr)
-
+terminate(termination_time: Apr): ends THE TIMELINE
   After:  A              B
           |--------------|------|
           Jan           Mar    Apr
           (C is removed, B is truncated)
 ```
+
+Both are valid-time edits recorded in transaction time: each closes the rows it replaces (`transaction_to = now`) and inserts the new ones. Inside `force_update`, `destroy` closes the version's row without inserting a copy, so the version is gone over its whole range.
 
 ### Cancel — Full History Recovery
 
@@ -417,6 +433,102 @@ t2: correct(valid_from: Jan, ...)       rows inserted/closed at t2 > t1
 cancel_termination → pre-termination timeline found at change point t1
                    → rows written at t2 > t1 → RecordedSinceTerminationError
 ```
+
+---
+
+## Shift Genesis Mechanism
+
+### Overview
+
+The `#shift_genesis` method moves the start of an entity's valid-time timeline, its genesis, without changing any segment's values: the start-side counterpart of `#terminate`. A backward shift extends the first segment earlier. A forward shift removes the segments that end at or before the new start and trims the one spanning it. The `#cancel_shift_genesis` method restores, from transaction history, the most recent timeline that started at the original genesis, and refuses when anything was recorded for the entity after the genesis moved off it. `#shifted_genesis?` says whether the genesis differs from the original one.
+
+Like the termination methods, both operations are whole-timeline operations run by `perform_timeline_operation`.
+
+### Shift Genesis Algorithm
+
+```
+1. BEGIN TRANSACTION
+2. LOCK the timeline: advisory lock, then the row valid now, then every
+   current-knowledge row (see Locking Strategy)
+3. FETCH all current-knowledge segments, setting zero-length rows aside
+4. GUARD: Raise RecordNotFound if no segments exist
+5. NO-OP: Replace nothing if new_valid_from equals the first segment's valid_from
+6. GUARD: Raise ArgumentError if new_valid_from >= last segment's valid_to
+   (the shift would erase every segment)
+7. BUILD new timeline:
+   Backward (new_valid_from before the first segment's valid_from):
+     a. First segment → replace with a copy starting at new_valid_from
+     b. Every other segment → keep unchanged
+   Forward (new_valid_from after it):
+     a. Segments ending at or before new_valid_from → remove
+     b. Segment spanning new_valid_from → trim (set valid_from = new_valid_from)
+     c. Segments starting at or after new_valid_from → keep unchanged
+8. NORMALIZE the new timeline and diff it against the current rows (see Timeline
+   After an Operation). Nothing to write: return true
+9. CLOSE the rows the diff drops (set transaction_to = now)
+10. INSERT the pieces it adds
+11. VALIDATE no overlapping valid times
+12. RELOAD self (see Self After an Operation)
+13. COMMIT TRANSACTION
+```
+
+A forward shift to a segment's exact start, or to a time inside a gap, spans no segment, so it trims nothing and only closes rows. Inside a gap, the timeline then starts where the segment after the gap starts, not at `new_valid_from`.
+
+### Cancel Shift Genesis Algorithm
+
+```
+1. BEGIN TRANSACTION
+2. LOCK the timeline: advisory lock, then the row valid now, then every
+   current-knowledge row (see Locking Strategy)
+3. FETCH all current-knowledge segments, setting zero-length rows aside
+4. GUARD: Raise RecordNotFound if no segments exist
+5. NO-OP: Replace nothing if the first segment's valid_from is the original genesis
+6. FIND the pre-shift state:
+   a. Collect all distinct transaction_to values as change points
+   b. Walk backward through change points
+   c. At each point, query the timeline that was current just before that change,
+      leaving out its zero-length rows (a timeline of nothing else is skipped)
+   d. Return the first timeline whose first segment starts at the original genesis,
+      with its change point (when the genesis moved off it), passing over any
+      timeline an earlier shift left at another genesis
+   e. Raise PreShiftGenesisStateNotFoundError if none does
+7. GUARD: Raise RecordedSinceGenesisShiftError if any row of the entity, whatever
+   its valid time, was inserted or closed after that change point (as in Cancel
+   Termination Algorithm, step 7)
+8. REPLACE all current segments with copies of the pre-shift ones (dup)
+   - Clear deleted_at (see Key Implementation Detail: deleted_at Corruption)
+9. NORMALIZE the restored timeline and diff it against the current rows: a
+   restored segment with a current row's range and values keeps that row.
+   Nothing to write: return true
+10. CLOSE the rows the diff drops (set transaction_to = now)
+11. INSERT the pieces it adds
+12. VALIDATE no overlapping valid times
+13. RELOAD self (see Self After an Operation)
+14. COMMIT TRANSACTION
+```
+
+So a cancel undoes one shift. After two shifts it refuses, since the second was recorded after the first moved the genesis off the original:
+
+```
+Transaction time →
+t1: CREATE    |---A---|---B---|---C--->∞      genesis = Jan (original)
+t2: SHIFT →       |-A-|---B---|---C--->∞      genesis = Feb
+t3: SHIFT →           |---B---|---C--->∞      genesis = Mar
+
+cancel_shift_genesis → walks back from t3:
+  change point t3 → timeline before it starts at Feb: passed over
+  change point t2 → timeline before it starts at Jan: found
+                  → rows written at t3 > t2 → RecordedSinceGenesisShiftError
+```
+
+After the t2 shift alone, it restores the t1 timeline. Both refusals happen before any write, so the transaction writes nothing and `self` is not reloaded. `RecordedSinceGenesisShiftError` subclasses `PreShiftGenesisStateNotFoundError`, so a `rescue` of that error catches it.
+
+### The Original Genesis
+
+The original genesis is the `valid_from` of the entity's first recorded row: its rows ordered by `transaction_from`, then `valid_from`, read unscoped (`find_original_genesis`). Later writes never change it. `shifted_genesis?` compares it with the `valid_from` of the first current segment that holds a time, so anything that moves that start counts as a shift, not only `shift_genesis`:
+
+- An upstream `update!` at a valid time before the genesis inserts a version there and closes no row. `shifted_genesis?` is true, but the cancel has no shift to undo: with no earlier write that closed a row, step 6 finds no timeline at the original genesis and raises `PreShiftGenesisStateNotFoundError`; with one, it finds the timeline from before that write, and step 7 raises `RecordedSinceGenesisShiftError`, since the `update!` was recorded after it. `shift_genesis` to the original genesis moves the genesis back.
+- An upstream `destroy` at the first segment's exact start leaves a zero-length row there, which holds no version, so the genesis moves to the next segment's start. The destroy closed the first segment's row, so the cancel finds the timeline from before it and restores that.
 
 ---
 

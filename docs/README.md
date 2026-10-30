@@ -193,7 +193,7 @@ This creates:
 #### Conceptual Difference
 
 - **Regular update**: "The rate _changed_ on day X" → Splits the timeline at day X
-- **Force update**: "We _recorded it wrong_ - the rate was always Y" → Replaces without splitting
+- **Force update**: "We _recorded this version wrong_ - over its whole range the rate was Y" → Rewrites the version the record holds, over the same range, without splitting it. The entity's other versions keep their rows
 
 #### Usage
 
@@ -209,6 +209,7 @@ end
 - Creates a new record with the updated values
 - Does NOT create the "before" historical record
 - Preserves the original `valid_from` and `valid_to` (same validity period)
+- Changes only that one version. The record holds the version valid at the time it was loaded at, so on a record loaded now it's the current version, and to fix an earlier one you load it with `find_at_time` first
 
 **Result:**
 
@@ -223,11 +224,12 @@ end
 
 #### When to Use
 
-| Scenario         | Use                   | Example                                            |
-| ---------------- | --------------------- | -------------------------------------------------- |
-| Data correction  | `force_update`        | "We entered $15/hr but it should have been $18/hr" |
-| Temporal change  | regular `update`      | "Rate increased from $15/hr to $18/hr on March 1"  |
-| Backdated change | `valid_at { update }` | "Rate actually changed on Feb 15, not March 1"     |
+| Scenario                          | Use                   | Example                                                        |
+| --------------------------------- | --------------------- | -------------------------------------------------------------- |
+| Data correction of one version    | `force_update`        | "We entered $15/hr for this version but it should be $18/hr"   |
+| Data correction over a time range | `correct`             | "The rate was $18/hr from Feb 1 to Mar 15, not $15/hr"         |
+| Temporal change                   | regular `update`      | "Rate increased from $15/hr to $18/hr on March 1"              |
+| Backdated change                  | `valid_at { update }` | "Rate actually changed on Feb 15, not March 1"                 |
 
 #### Important Limitations
 
@@ -248,7 +250,7 @@ end
 
 ## Correcting Historical Data
 
-The `correct` method allows you to fix historical data while **preserving the cascade of subsequent changes**. This is the key difference from `force_update`, which overwrites without preserving future changes.
+The `correct` method allows you to fix historical data while **preserving the cascade of subsequent changes**. It takes the valid-time range to fix, whichever version the record holds. That's the key difference from `force_update`, which rewrites only the version the record holds, over that version's whole range: `correct` can fix part of a version, or a range across several.
 
 ### When to Use `correct`
 
@@ -324,7 +326,7 @@ This is the safest option when you only need to correct a specific error without
 | Method | Purpose | Preserves Future Changes | Changes Attributes | Undo Method |
 |--------|---------|--------------------------|-------------------|-------------|
 | `update` | Record a change happening now | N/A (operates at current time) | Yes | — |
-| `force_update` | Fix data error, overwrite timeline | ❌ No | Yes | — |
+| `force_update` | Fix a data error in one version | ✅ Yes (only the version the record holds changes, over its whole range) | Yes | — |
 | `correct` | Fix historical error | ✅ Yes (CASCADE) | Yes | — |
 | `shift_genesis` | Change when entity's timeline begins | ✅ Yes (untouched) | No (purely temporal) | `cancel_shift_genesis` |
 | `terminate` | End entity's timeline at a specific date | ✅ Yes (before termination point) | No (purely temporal) | `cancel_termination` |
@@ -339,11 +341,16 @@ This is the safest option when you only need to correct a specific error without
 # Current timeline:
 #   $50k (Jan-Mar) → $60k (Mar-∞)
 
-# With force_update - LOSES the March raise:
+# With force_update on the current record - rewrites the March version instead:
+employee = Employee.find(id)
 employee.force_update { |e| e.update!(salary: 55_000) }
-# Result: $55k (Jan-∞)  ← March raise is GONE!
+# Result: $50k (Jan-Mar) → $55k (Mar-∞)  ← the raise is overwritten, January is not fixed
 
-# With correct - PRESERVES the March raise:
+# force_update fixes January only on a record holding the January version:
+Employee.find_at_time(jan_1, id).force_update { |e| e.update!(salary: 55_000) }
+# Result: $55k (Jan-Mar) → $60k (Mar-∞)
+
+# With correct - takes the range to fix, whichever version the record holds:
 employee.correct(valid_from: jan_1, salary: 55_000)
 # Result: $55k (Jan-Mar) → $60k (Mar-∞)  ← March raise preserved!
 ```
@@ -392,7 +399,7 @@ employee.changed?                      # => false
 employee.update!(emp_code: "C2")       # builds on the correction
 ```
 
-Like `reload`, an operation discards unsaved changes on the record. A call that changes nothing writes nothing and leaves the record as it was. A frozen record raises `FrozenError`, as `update!` does.
+Like `reload`, an operation discards unsaved changes on the record. A call with nothing to write (it changes nothing, and finds no seam or zero-length row to fix) writes nothing and leaves the record as it was. A frozen record raises `FrozenError`, as `update!` does.
 
 ### Blocks and Scopes Around an Operation
 
@@ -514,7 +521,7 @@ employee.shift_genesis(new_valid_from: apr_1)
 #   Apr    May
 ```
 
-Segments entirely before the new start are removed. A segment that spans the new start date is trimmed. Segments after the new start are untouched.
+Segments entirely before the new start are removed. A segment that spans the new start date is trimmed. Segments after the new start are untouched. A new start inside a gap trims nothing, so the timeline then starts where the segment after the gap starts.
 
 ### Composing with `correct`
 
@@ -535,9 +542,9 @@ employee.correct(valid_from: jan_1, valid_to: feb_1, role: "Intern")
 # or close zero-length rows left in the timeline)
 employee.shift_genesis(new_valid_from: current_genesis_date)
 
-# Cannot erase the entire timeline
-employee.shift_genesis(new_valid_from: far_future_date)
-# => ArgumentError: shift_genesis would erase all segments
+# Cannot erase the entire timeline (here one terminated at May 1)
+employee.shift_genesis(new_valid_from: jul_1)
+# => ArgumentError: shift_genesis would erase all segments: new_valid_from (2024-07-01 00:00:00 UTC) >= last segment valid_to (2024-05-01 00:00:00 UTC)
 
 # Entity must have current-knowledge records
 employee.shift_genesis(new_valid_from: jan_1)
@@ -617,7 +624,7 @@ employee.shifted_genesis?
 
 This queries the full transaction history to find the original genesis — it's always accurate regardless of how many shifts have occurred.
 
-An upstream `update!` at a valid time before the genesis inserts a row there, so it moves the genesis too, and `shifted_genesis?` is true. It closes no row, though, so `cancel_shift_genesis` finds no timeline to go back to and raises `PreShiftGenesisStateNotFoundError`. Move the genesis back with `shift_genesis` instead:
+An upstream `update!` at a valid time before the genesis inserts a row there, so it moves the genesis too, and `shifted_genesis?` is true. `cancel_shift_genesis` can't undo it, though, and writes nothing. The `update!` closes no row, so history holds no timeline that it ended at the original genesis: the cancel raises `PreShiftGenesisStateNotFoundError`, or its subclass `RecordedSinceGenesisShiftError` when it finds an older timeline at the original genesis, from before an earlier write, since the `update!` was recorded after it. Move the genesis back with `shift_genesis` instead:
 
 ```ruby
 employee.valid_at(dec_1) { |e| e.update!(name: "X") }  # before the January 1 genesis
@@ -636,7 +643,7 @@ employee.shifted_genesis?
 
 ## Terminating a Timeline
 
-The `terminate` method sets a finite end date on an entity's valid-time timeline. Unlike `destroy` (which operates on **transaction time** to mark a record as "no longer current knowledge"), `terminate` operates on **valid time** to say "this entity stopped being valid at this date."
+The `terminate` method sets a finite end date on an entity's valid-time timeline, to say "this entity stopped being valid at this date": the version valid then ends there, and every version after it is removed. `destroy` works on valid time too, but on one version: it ends the version valid at the record's time (now, or the time the record was loaded at) there, and later versions stay current. On a timeline with a change after that time, it leaves a gap rather than an end (see [Deleting Records](#deleting-records)).
 
 ### When to Use `terminate`
 
@@ -644,26 +651,26 @@ Use `terminate` when an entity has a real-world end date, but you want to preser
 
 ```ruby
 # Scenario: An employee's contract ends on March 1.
-# Their timeline has: HR (Jan) → Engineering (Feb) → ...
+# Their timeline has: HR (Jan) → Engineering (Feb) → Management (Apr)
 #
-# destroy() would mark the record as deleted in transaction time,
-# losing the ability to query "what department were they in on Feb 15?"
+# destroy() on the record loaded at March 1 would end only Engineering,
+# at March 1, and Management would still start in April.
 #
-# terminate() preserves the full history up to the end date:
+# terminate() ends the timeline, keeping the history up to the end date:
 employee.terminate(termination_time: Date.new(2024, 3, 1))
 # Timeline is now: HR (Jan-Feb) → Engineering (Feb-Mar)
-# Queries for dates before March still work perfectly.
+# Queries for dates before March still work as before.
 ```
 
 ### Terminate vs Destroy
 
 | Aspect | `terminate` | `destroy` |
 |--------|------------|-----------|
-| **Time dimension** | Valid time (`valid_to`) | Transaction time (`transaction_to`) |
-| **Meaning** | "Entity stopped being valid at date X" | "We no longer know about this entity" |
-| **Historical queries** | ✅ `find_at_time` still works for dates before termination | ❌ Record is logically deleted |
+| **Time dimension** | Valid time (`valid_to`) | Valid time (`valid_to`), of one version |
+| **Meaning** | "Entity stopped being valid at date X" | "This version stopped being valid at date X" |
+| **Historical queries** | ✅ `find_at_time` still works for dates before termination | ✅ `find_at_time` still works for dates before the destroy, and for later versions |
 | **Reversible?** | ✅ `cancel_termination` restores the full pre-termination timeline, as long as nothing was recorded for the entity after the termination (otherwise it refuses). `reopen` lifts the end whatever was recorded since, without the removed segments | Requires manual recreation, except for the end a destroy of the last segment leaves, which `reopen` lifts |
-| **What changes** | Last segment's `valid_to` is set to termination date; segments after are removed | Record's `transaction_to` is set to deletion time |
+| **What changes** | Last segment's `valid_to` is set to termination date; segments after are removed | The version's row is closed (`transaction_to` set to now) and a copy ending at the destroy time inserted; later versions keep their rows |
 
 ### Basic Termination
 
@@ -686,6 +693,8 @@ employee.terminate(termination_time: apr_1)
 2. A segment spanning the termination point is **truncated** (Bob's `valid_to` set to Apr)
 3. Segments entirely after the termination point are **removed** (Carol)
 4. All changes are wrapped in a transaction that holds the entity's timeline locks (see [Concurrency](#concurrency))
+
+A termination point inside a gap truncates nothing: the segments after the gap are removed, so the timeline ends where the gap starts.
 
 ### Cancel Termination
 
@@ -719,6 +728,8 @@ employee.cancel_termination
 ```
 
 Cancel is a no-op if the entity is not currently terminated (returns `true`, writing only to merge seams or close zero-length rows left in the timeline, see [The Timeline After an Operation](#the-timeline-after-an-operation)).
+
+A timeline that has ended since it was created, such as a record created with a finite `valid_to`, has no open-ended timeline in its history to restore. `cancel_termination` then raises `ActiveRecord::Bitemporal::PreTerminationStateNotFoundError` and writes nothing; `reopen` lifts such an end.
 
 ### Reopen
 
@@ -828,8 +839,8 @@ employee.correct(valid_from: may_1, name: "X")
 # Bounded correction past termination (valid_to) — raises error:
 employee.terminate(termination_time: may_1)
 employee.correct(valid_from: feb_1, valid_to: jul_1, name: "X")
-# => ActiveRecord::Bitemporal::ValidDatetimeRangeError
-# (correction valid_to exceeds timeline end — reopen or cancel the termination first)
+# => ActiveRecord::Bitemporal::ValidDatetimeRangeError: correction valid_to (2024-07-01 00:00:00 UTC)
+#    exceeds timeline end (2024-05-01 00:00:00 UTC). Reopen the timeline or cancel its termination first to extend it.
 ```
 
 ### Re-Termination
@@ -859,11 +870,11 @@ After a move, `cancel_termination` undoes only the last `terminate`. It restores
 ```ruby
 # Termination time must be after the first segment's start
 employee.terminate(termination_time: Date.new(1900, 1, 1))
-# => ArgumentError: termination_time must be greater than first valid_from
+# => ArgumentError: termination_time (1900-01-01 00:00:00 UTC) must be greater than first segment valid_from (2024-01-01 00:00:00 UTC)
 
 # Cannot extend past current termination (reopen first, or cancel_termination)
-employee.terminate(termination_time: later_date)
-# => ArgumentError: termination_time exceeds last segment's valid_to
+employee.terminate(termination_time: jul_1)
+# => ArgumentError: termination_time (2024-07-01 00:00:00 UTC) exceeds last segment valid_to (2024-05-01 00:00:00 UTC)
 
 # Entity must have current-knowledge records
 Employee.new(bitemporal_id: 99999).terminate(termination_time: mar_1)
@@ -958,6 +969,31 @@ A clock frozen in tests (`freeze_time`, `Timecop.freeze`) gives every write the 
 
 ---
 
+## Errors
+
+`correct`, `shift_genesis`, `terminate`, `reopen`, `cancel_shift_genesis` and `cancel_termination` raise these errors. An operation that raises writes nothing: it rolls back to its own savepoint (see [Concurrency](#concurrency)), and the record you called it on isn't reloaded.
+
+| Error | Raised by | When |
+|-------|-----------|------|
+| `ArgumentError` | `correct` | `valid_to` isn't after `valid_from`, or the attributes name a bitemporal column or an alias of one |
+| | `terminate` | `termination_time` isn't after the first segment's `valid_from`, or is after the last segment's `valid_to` |
+| | `shift_genesis` | `new_valid_from` is at or after the last segment's `valid_to`, so the shift would erase every segment |
+| `ActiveRecord::RecordNotFound` | all six | The entity has no current-knowledge row that holds a time |
+| | `correct` | No segment contains `valid_from`: it's before the timeline, at or after its end, or in a gap |
+| `ActiveRecord::Bitemporal::ValidDatetimeRangeError` | `correct` | `valid_to` is after the timeline's end. Reopen the timeline or cancel its termination first |
+| `ActiveRecord::Bitemporal::PreTerminationStateNotFoundError` | `cancel_termination` | Transaction history holds no open-ended timeline to restore: the entity was created with a finite `valid_to`, or its writes were made at one frozen instant (see [Frozen Clocks](#frozen-clocks)) |
+| `ActiveRecord::Bitemporal::RecordedSinceTerminationError` | `cancel_termination` | Something was recorded for the entity after the termination. A subclass of `PreTerminationStateNotFoundError` |
+| `ActiveRecord::Bitemporal::PreShiftGenesisStateNotFoundError` | `cancel_shift_genesis` | Transaction history holds no timeline at the original genesis to restore, as after an upstream `update!` before the genesis, or writes made at one frozen instant |
+| `ActiveRecord::Bitemporal::RecordedSinceGenesisShiftError` | `cancel_shift_genesis` | Something was recorded for the entity after its genesis moved off the original one, a second shift included. A subclass of `PreShiftGenesisStateNotFoundError` |
+| `ActiveRecord::Bitemporal::TransactionTimeSkewError` | all six | A current row was recorded after this host's now (see [Clocks on Different Hosts](#clocks-on-different-hosts)) |
+| `ActiveRecord::RecordInvalid` | all six | The entity's current rows overlap once the operation has written its rows |
+| `ActiveRecord::RecordNotSaved` | all six | A callback aborted the save of a row the operation inserts (see [Callbacks](#callbacks)) |
+| `FrozenError` | all six | The record is frozen |
+
+An exception a callback raises is raised as it is.
+
+---
+
 ## Deleting Records
 
 Deletion works similarly to updates - it creates historical records:
@@ -974,6 +1010,8 @@ After destroy:
 - A new record is created showing the state up to deletion time
 
 The record is "logically deleted" but remains in the database for historical queries.
+
+`destroy` ends only the version valid at the record's time: now, or the time the record was loaded at with `valid_at` or `find_at_time`. Versions that start after it stay current, so on a timeline with a change after that time it leaves a gap, not an end. To end the whole timeline, use `terminate` (see [Terminating a Timeline](#terminating-a-timeline)). Inside `force_update`, `destroy` closes the version's row without inserting a copy, so the version is gone over its whole range.
 
 To permanently delete (use sparingly):
 
@@ -1278,11 +1316,12 @@ end
 # The valid_at context is IGNORED!
 ```
 
-**Why:** `force_update` always uses the record's own `valid_from` time. The combination doesn't make semantic sense - you can't "backdate a correction."
+**Why:** `force_update` always rewrites the version the record holds, at the record's own `valid_from`, over that version's whole range.
 
 **Solution:** Choose one:
 
-- For corrections: Use `force_update` alone
+- To fix one version over its whole range: load that version (`find_at_time`) and use `force_update` alone
+- To fix a valid-time range you choose: use `correct`
 - For backdated changes: Use `valid_at { update }` without force_update
 
 ---
@@ -1323,7 +1362,7 @@ Position.create(rate: 100, valid_from: 1.week.ago)  # Historical
 # Updates
 position.update(rate: 200)                    # Standard update (temporal change)
 position.valid_at(3.days.ago) { |p| p.update!(rate: 200) }  # Backdated change
-position.force_update { |p| p.update(rate: 200) }  # Correction (not temporal)
+position.force_update { |p| p.update(rate: 200) }  # Rewrite the version the record holds (no split)
 position.correct(valid_from: feb_1, name: "X")    # Retroactive correction (preserves cascade)
 position.shift_genesis(new_valid_from: jan_1)      # Change when timeline begins
 position.cancel_shift_genesis                      # Undo to the original genesis (refuses if anything was recorded since)
