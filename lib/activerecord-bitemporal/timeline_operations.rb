@@ -52,9 +52,7 @@ module ActiveRecord
           raise ArgumentError, "correct can't write bitemporal columns: #{rejected.join(', ')}"
         end
 
-        with_bitemporal_option(correcting: true) do
-          _correct_record(valid_from: valid_from, valid_to: valid_to, attributes: attributes)
-        end
+        _correct_record(valid_from: valid_from, valid_to: valid_to, attributes: attributes)
       end
 
       # Shift Genesis: Move when an entity's timeline begins (purely temporal)
@@ -205,10 +203,6 @@ module ActiveRecord
 
         original_genesis = find_original_genesis
         current_genesis != original_genesis
-      end
-
-      def correcting?
-        bitemporal_option[:correcting].present?
       end
 
       private
