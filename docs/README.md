@@ -626,7 +626,7 @@ employee.shifted_genesis?
 
 This queries the full transaction history to find the original genesis — it's always accurate regardless of how many shifts have occurred.
 
-An upstream `update!` at a valid time before the genesis inserts a row there, so it moves the genesis too, and `shifted_genesis?` is true. `cancel_shift_genesis` can't undo it, though, and writes nothing. The `update!` closes no row, so history holds no timeline that it ended at the original genesis: the cancel raises `PreShiftGenesisStateNotFoundError`, or its subclass `RecordedSinceGenesisShiftError` when it finds an older timeline at the original genesis, from before an earlier write, since the `update!` was recorded after it. Move the genesis back with `shift_genesis` instead:
+An upstream `update!` at a valid time before the genesis inserts a row there, so it moves the genesis too, and `shifted_genesis?` is true. `cancel_shift_genesis` can't undo it, though, and writes nothing. The `update!` closes no row, so history holds no timeline that it ended at the original genesis. The cancel raises `PreShiftGenesisStateNotFoundError`; or, when an earlier write left an older timeline at the original genesis, it finds that one and raises the subclass `RecordedSinceGenesisShiftError`, because the `update!` was recorded after it. Move the genesis back with `shift_genesis` instead:
 
 ```ruby
 employee.valid_at(dec_1) { |e| e.update!(name: "X") }  # before the January 1 genesis

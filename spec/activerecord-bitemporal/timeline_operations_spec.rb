@@ -3075,7 +3075,10 @@ RSpec.describe ActiveRecord::Bitemporal::TimelineOperations do
         stale = Employee.find_at_time(start, employee.id)
         writer = in_thread { stale.valid_at(start + 60.days) { stale.update!(name: "U") } }
         begin
-          writer.join(0.5)
+          # Waits until the writer has read the timeline: blocked on a row the operation holds, or done
+          Timeout.timeout(10) {
+            sleep 0.01 until !writer.alive? || ActiveRecord::Base.connection.select_value("SELECT count(*) FROM pg_locks WHERE NOT granted").positive?
+          }
         ensure
           resume << true
           operation.join

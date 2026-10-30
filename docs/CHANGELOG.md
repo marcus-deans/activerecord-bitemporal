@@ -53,6 +53,7 @@ What this fork of [kufu/activerecord-bitemporal](https://github.com/kufu/activer
 
 - Fork code lives in `lib/activerecord-bitemporal/fork.rb` and `timeline_operations.rb`. Upstream's files are unchanged, apart from the line that requires `fork.rb`, and the operations share one skeleton, `perform_timeline_operation` ([#10](https://github.com/marcus-deans/activerecord-bitemporal/pull/10)).
 - Merged upstream v7.0.2 and later ([#8](https://github.com/marcus-deans/activerecord-bitemporal/pull/8)).
+- Merged upstream master as of `8837a71`, which drops Rails 7.1 ([#24](https://github.com/marcus-deans/activerecord-bitemporal/pull/24)). Upstream syncs land as merge commits, so kufu's master stays an ancestor.
 
 ## Specs and Docs
 
