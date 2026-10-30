@@ -436,6 +436,18 @@ module ActiveRecord
           "transaction_from; the host that recorded it may have a clock running ahead"
       end
 
+      # Raises RecordNotFound when the entity has no segment: no current-knowledge row, or
+      # only zero-length ones. correct raises its own, naming the time no segment contains.
+      def refuse_empty_timeline!(segments)
+        return unless segments.empty?
+
+        raise ActiveRecord::RecordNotFound.new(
+          "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
+          "(no current-knowledge records)",
+          self.class, "bitemporal_id", bitemporal_id
+        )
+      end
+
       def zero_length?(record)
         record[valid_from_key] == record[valid_to_key]
       end
@@ -563,13 +575,7 @@ module ActiveRecord
       def _shift_genesis_record(new_valid_from:)
         perform_timeline_operation do |segments, current_time|
           # 1. Guard: entity must exist
-          if segments.empty?
-            raise ActiveRecord::RecordNotFound.new(
-              "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
-              "(no current-knowledge records)",
-              self.class, "bitemporal_id", bitemporal_id
-            )
-          end
+          refuse_empty_timeline!(segments)
 
           genesis = segments.first
 
@@ -646,13 +652,7 @@ module ActiveRecord
       def _terminate_record(termination_time:)
         perform_timeline_operation do |segments, current_time|
           # 1. Guard: entity must exist
-          if segments.empty?
-            raise ActiveRecord::RecordNotFound.new(
-              "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
-              "(no current-knowledge records)",
-              self.class, "bitemporal_id", bitemporal_id
-            )
-          end
+          refuse_empty_timeline!(segments)
 
           first_segment = segments.first
           last_segment = segments.last
@@ -683,13 +683,7 @@ module ActiveRecord
       def _cancel_termination_record
         perform_timeline_operation do |segments, current_time|
           # 1. Guard: entity must exist
-          if segments.empty?
-            raise ActiveRecord::RecordNotFound.new(
-              "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
-              "(no current-knowledge records)",
-              self.class, "bitemporal_id", bitemporal_id
-            )
-          end
+          refuse_empty_timeline!(segments)
 
           # 2. No-op: not terminated (last segment extends to infinity), nothing to replace
           next [[], []] if segments.last[valid_to_key] == ActiveRecord::Bitemporal::DEFAULT_VALID_TO
@@ -732,13 +726,7 @@ module ActiveRecord
       def _reopen_record
         perform_timeline_operation do |segments, current_time|
           # 1. Guard: entity must exist
-          if segments.empty?
-            raise ActiveRecord::RecordNotFound.new(
-              "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
-              "(no current-knowledge records)",
-              self.class, "bitemporal_id", bitemporal_id
-            )
-          end
+          refuse_empty_timeline!(segments)
 
           last_segment = segments.last
 
@@ -835,13 +823,7 @@ module ActiveRecord
       def _cancel_shift_genesis_record
         perform_timeline_operation do |segments, current_time|
           # 1. Guard: entity must exist
-          if segments.empty?
-            raise ActiveRecord::RecordNotFound.new(
-              "Couldn't find #{self.class} with 'bitemporal_id'=#{bitemporal_id} " \
-              "(no current-knowledge records)",
-              self.class, "bitemporal_id", bitemporal_id
-            )
-          end
+          refuse_empty_timeline!(segments)
 
           # 2. No-op: genesis matches original (never shifted, or already canceled), nothing to replace
           current_genesis = segments.first[valid_from_key]
