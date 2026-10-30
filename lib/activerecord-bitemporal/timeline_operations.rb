@@ -692,21 +692,8 @@ module ActiveRecord
               "keep them, call reopen"
           end
 
-          # 5. Replace ALL current segments with the pre-termination ones, as new records with
-          #    this op's transaction_from (the skeleton keeps the rows of those that come back
-          #    unchanged). Must clear deleted_at because historical records have it set (by
-          #    timeline_close or upstream's update_transaction_to), and
-          #    bitemporal_assign_initialize_value would use it to overwrite transaction_to during save.
-          new_records = pre_termination_state.map do |old_record|
-            new_record = timeline_dup(old_record)
-            new_record.id = nil
-            new_record.transaction_from = current_time
-            new_record.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
-            new_record.deleted_at = nil if new_record.class.column_names.include?("deleted_at")
-            new_record
-          end
-
-          [segments, new_records]
+          # 5. Replace ALL current segments with the pre-termination ones (see restored_pieces)
+          [segments, restored_pieces(pre_termination_state, current_time)]
         end
       end
 
@@ -795,6 +782,19 @@ module ActiveRecord
           .exists?
       end
 
+      # A cancel's new pieces: the snapshot's segments as new records with this op's
+      # transaction_from, to replace every current segment (the skeleton keeps the rows of those
+      # that come back unchanged). Must clear deleted_at because historical records have it set
+      # (by timeline_close or upstream's update_transaction_to), and
+      # bitemporal_assign_initialize_value would use it to overwrite transaction_to during save.
+      def restored_pieces(snapshot, current_time)
+        snapshot.map { |segment|
+          timeline_piece(segment, segment[valid_from_key], segment[valid_to_key], current_time).tap { |piece|
+            piece.deleted_at = nil if piece.class.column_names.include?("deleted_at")
+          }
+        }
+      end
+
       # Cancel Shift Genesis: Main implementation
       #
       # Algorithm mirrors _cancel_termination_record (perform_timeline_operation does
@@ -829,21 +829,8 @@ module ActiveRecord
               "back to #{original_genesis} and keep them, call shift_genesis with that time"
           end
 
-          # 5. Replace ALL current segments with the pre-shift ones, as new records with this
-          #    op's transaction_from (the skeleton keeps the rows of those that come back
-          #    unchanged). Must clear deleted_at because historical records have it set (by
-          #    timeline_close or upstream's update_transaction_to), and
-          #    bitemporal_assign_initialize_value would use it to overwrite transaction_to during save.
-          new_records = pre_shift_state.map do |old_record|
-            new_record = timeline_dup(old_record)
-            new_record.id = nil
-            new_record.transaction_from = current_time
-            new_record.transaction_to = ActiveRecord::Bitemporal::DEFAULT_TRANSACTION_TO
-            new_record.deleted_at = nil if new_record.class.column_names.include?("deleted_at")
-            new_record
-          end
-
-          [segments, new_records]
+          # 5. Replace ALL current segments with the pre-shift ones (see restored_pieces)
+          [segments, restored_pieces(pre_shift_state, current_time)]
         end
       end
 
