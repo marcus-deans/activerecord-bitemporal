@@ -107,11 +107,13 @@ Valid at TT=T1:
 ### Default Values
 
 ```ruby
-DEFAULT_VALID_FROM = Time.utc(1900, 1, 1)
-DEFAULT_VALID_TO = Time.utc(9999, 12, 31)
-DEFAULT_TRANSACTION_FROM = Time.utc(1900, 1, 1)
-DEFAULT_TRANSACTION_TO = Time.utc(9999, 12, 31)
+DEFAULT_VALID_FROM = Time.utc(1900, 12, 31).in_time_zone
+DEFAULT_VALID_TO = Time.utc(9999, 12, 31).in_time_zone
+DEFAULT_TRANSACTION_FROM = Time.utc(1900, 12, 31).in_time_zone
+DEFAULT_TRANSACTION_TO = Time.utc(9999, 12, 31).in_time_zone
 ```
+
+Upstream reads a row inserted with `valid_from` equal to `DEFAULT_VALID_FROM` as one whose start was never set, and gives it the `valid_at` time or now. The operations insert their pieces through the same path, so a timeline can't start exactly at `DEFAULT_VALID_FROM` (see [Common Pitfalls](./README.md#5-starting-a-timeline-at-default_valid_from)).
 
 ### Recommended Indexes
 

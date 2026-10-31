@@ -1326,6 +1326,30 @@ end
 - To fix a valid-time range you choose: use `correct`
 - For backdated changes: Use `valid_at { update }` without force_update
 
+### 5. Starting a Timeline at `DEFAULT_VALID_FROM`
+
+```ruby
+default = ActiveRecord::Bitemporal::DEFAULT_VALID_FROM  # 1900-12-31
+
+position = Position.create!(rate: 100, valid_from: default)
+position.valid_from  # => now, not 1900-12-31
+```
+
+**Why:** upstream reads a row inserted with `valid_from` equal to `DEFAULT_VALID_FROM` as one whose start was never set, and gives it the `valid_at` time or now. Every operation inserts its rows through that same path, so the start moves to now on any write that inserts a row starting there:
+
+- `correct(valid_from: default, ...)` on a timeline that starts at `DEFAULT_VALID_FROM` leaves one row from now on, and the history before now is gone. A bounded correction can write a row that ends before it starts.
+- Upstream's own `update!` and `shift_genesis(new_valid_from: default)` do the same.
+
+A row only starts there if something wrote it without upstream's insert, such as raw SQL, `insert_all` or `update_columns`.
+
+**Solution:** never start a timeline at `DEFAULT_VALID_FROM`. To mean "since forever", start it a second later:
+
+```ruby
+Position.create!(rate: 100, valid_from: ActiveRecord::Bitemporal::DEFAULT_VALID_FROM + 1.second)
+```
+
+Before relying on the operations for rows written outside upstream's insert, check that no current row starts at `DEFAULT_VALID_FROM`.
+
 ---
 
 ## When to Use This Gem
