@@ -103,6 +103,8 @@ Run the deep tier before merging a change to the operations or to the harness, a
 FORK_PROPERTY=deep FORK_PROPERTY_MODEL=Employee bundle exec rspec spec/fork/property
 ```
 
+The deep tier also runs on GitHub. In the Actions tab, choose **Fork property (deep)**, then **Run workflow**. The workflow, `.github/workflows/fork-property.yml`, runs one job per model, each with its own PostgreSQL, so the models run at once. Its inputs choose the Ruby version and the gemfile in `gemfiles/`; the defaults, Ruby `4.0` and `rails_8.1`, are the newest pair in the Test workflow's matrix. Each job uploads its model's reports as the artifact `fork-property-<model>` on the run's page, whether it passes or fails. Nothing else starts the workflow, except a pull request that changes the workflow file, which runs it with the defaults.
+
 ### ENV knobs
 
 | Variable | Effect |

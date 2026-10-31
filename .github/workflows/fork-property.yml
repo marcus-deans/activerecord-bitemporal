@@ -1,0 +1,93 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+# The fork's property harness, deep tier (docs/TESTING.md), one job per model. It runs from
+# "Run workflow" in the Actions tab, and on pull requests that change this file.
+name: Fork property (deep)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ruby-version:
+        description: Ruby version
+        type: string
+        default: '4.0'
+      gemfile:
+        description: Gemfile in gemfiles/
+        type: choice
+        options:
+          - rails_7.2
+          - rails_8.0
+          - rails_8.1
+        default: rails_8.1
+  pull_request:
+    paths:
+      - .github/workflows/fork-property.yml
+
+permissions:
+  contents: read
+
+env:
+  NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+  NPM_CONFIG_BEFORE: ''
+  PNPM_CONFIG_MINIMUM_RELEASE_AGE: '1440' # 1 day
+
+jobs:
+  deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        model:
+          - Employee
+          - Department
+          - CustomColumnRecord
+        # A pull_request run has no inputs, so these fall back to the inputs' defaults
+        ruby-version:
+          - ${{ inputs.ruby-version || '4.0' }}
+        gemfile:
+          - ${{ inputs.gemfile || 'rails_8.1' }}
+    # Each job has its own database, so the models run at once
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      BUNDLE_GEMFILE: gemfiles/${{ matrix.gemfile }}.gemfile
+    steps:
+      - name: Set NPM_CONFIG_BEFORE
+        run: |
+          echo "NPM_CONFIG_BEFORE=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1.329.0
+        with:
+          ruby-version: ${{ matrix.ruby-version }}
+          bundler-cache: true
+      - name: Run the deep tier
+        # Under the job's timeout, so the reports of the batches that finished still upload
+        timeout-minutes: 30
+        env:
+          FORK_PROPERTY: deep
+          FORK_PROPERTY_MODEL: ${{ matrix.model }}
+          FORK_PROPERTY_OUT: ${{ runner.temp }}/fork-property
+        run: bundle exec rspec spec/fork/property
+      - name: Upload the reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-property-${{ matrix.model }}
+          path: ${{ runner.temp }}/fork-property
+          if-no-files-found: error
+          # A re-run replaces its model's reports
+          overwrite: true
